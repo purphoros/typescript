@@ -1,9 +1,9 @@
 // Chat server - startup.
 //
 // The server still does not listen on a socket; that arrives in Chapter 5.
-// What it gains here is a type system: the domain is now described with
-// literal types, unions, and the ChatEvent discriminated union that the rest
-// of the server will be built around.
+// What it gains here is structure: interfaces describe the data that flows
+// through the server, and classes own the state that persists - rooms,
+// connections, and messages.
 
 // --- Configuration -------------------------------------------------------
 
@@ -23,21 +23,38 @@ type UserId = string;
 type RoomName = string;
 type Timestamp = number;
 
-type User = {
-  name: UserId;
-  port: Port;
-  isAdmin: boolean;
-};
-
-// An admin is a User whose isAdmin is the literal `true`, not merely a boolean.
-type AdminUser = {
-  name: UserId;
-  port: Port;
-  isAdmin: true;
-};
-
 // A connection is in exactly one of these three states - nothing else.
 type ConnectionState = "connecting" | "connected" | "disconnected";
+
+// Interfaces describe shape. `type` stays for unions, which interfaces cannot express.
+interface Identifiable {
+  readonly id: string;
+}
+
+interface Serializable {
+  serialize(): string;
+}
+
+interface User extends Identifiable {
+  name: string;
+  port: Port;
+  joinedAt: Timestamp;
+}
+
+// An admin IS-A user with more besides. Structural typing means an AdminUser
+// can be passed anywhere a User is expected, with no `implements` needed.
+interface AdminUser extends User {
+  adminLevel: number;
+  permissions: string[];
+}
+
+interface Message extends Identifiable {
+  sender: UserId;
+  text: string;
+  room: RoomName;
+  replyTo?: string;   // optional: string | undefined
+  editedAt?: Timestamp;
+}
 
 // Every event the server can emit. The `type` field is the discriminant:
 // switching on it tells the compiler which other fields exist.
@@ -46,6 +63,114 @@ type ChatEvent =
   | { type: "join"; user: UserId; room: RoomName; at: Timestamp }
   | { type: "leave"; user: UserId; room: RoomName; at: Timestamp }
   | { type: "system"; text: string; at: Timestamp };
+
+// --- Classes -------------------------------------------------------------
+
+// State plus behaviour: a room owns its membership and decides who may see it.
+class ChatRoom implements Serializable, Identifiable {
+  readonly id: string;
+  readonly createdAt: Timestamp;
+  private members: Set<UserId> = new Set();
+
+  constructor(public readonly name: RoomName) {
+    this.id = crypto.randomUUID();
+    this.createdAt = Date.now();
+  }
+
+  join(userId: UserId): void {
+    this.members.add(userId);
+  }
+
+  leave(userId: UserId): boolean {
+    return this.members.delete(userId);
+  }
+
+  hasMember(userId: UserId): boolean {
+    return this.members.has(userId);
+  }
+
+  // A getter exposes derived state without exposing the Set itself.
+  get memberCount(): number {
+    return this.members.size;
+  }
+
+  get memberList(): UserId[] {
+    return [...this.members];
+  }
+
+  serialize(): string {
+    return JSON.stringify({ id: this.id, name: this.name, members: this.memberList });
+  }
+}
+
+class ChatMessage implements Serializable, Identifiable {
+  readonly id: string;
+  readonly at: Timestamp;
+
+  constructor(
+    public sender: UserId,
+    public text: string,
+    public room: RoomName,
+    public readonly replyTo?: string,
+  ) {
+    this.id = crypto.randomUUID();
+    this.at = Date.now();
+  }
+
+  serialize(): string {
+    return JSON.stringify({
+      id: this.id,
+      sender: this.sender,
+      text: this.text,
+      room: this.room,
+      replyTo: this.replyTo,
+    });
+  }
+}
+
+// The constructor shorthand declares, scopes, and assigns each property in one
+// line. `socket` is `unknown` for now - Chapter 5 replaces it with a real one.
+class Connection {
+  constructor(
+    public readonly id: string,
+    private socket: unknown,
+    protected state: ConnectionState = "connecting",
+  ) {}
+
+  send(data: string): void {
+    console.log(`  [${this.id}] → ${data}`);
+  }
+
+  get status(): ConnectionState {
+    return this.state;
+  }
+
+  close(): void {
+    this.state = "disconnected";
+    this.resetSocket();
+  }
+
+  // private: this class only.
+  private resetSocket(): void {
+    this.socket = null;
+  }
+
+  // protected: this class and its subclasses, but not outside callers.
+  protected transitionTo(next: ConnectionState): void {
+    this.state = next;
+  }
+}
+
+// A subclass can reach `protected` members; outside code cannot.
+class AuthenticatedConnection extends Connection {
+  constructor(id: string, socket: unknown, public readonly user: User) {
+    super(id, socket);
+  }
+
+  authenticate(): void {
+    this.transitionTo("connected");
+  }
+}
 
 // --- Exhaustiveness ------------------------------------------------------
 
@@ -98,10 +223,10 @@ function describeState(state: ConnectionState): string {
   }
 }
 
-// A custom type guard. The `user is AdminUser` return type means a true result
-// narrows the argument, so callers see AdminUser inside the if-branch.
+// A custom type guard. AdminUser is the only variant carrying `adminLevel`, so
+// the `in` check is enough to narrow - no discriminant field required.
 function isAdmin(user: User): user is AdminUser {
-  return user.isAdmin;
+  return "adminLevel" in user;
 }
 
 // Data off the wire has no type. `unknown` forces us to narrow before use -
@@ -126,49 +251,82 @@ function formatEvent(event: ChatEvent): string {
   }
 }
 
+// Accepts a User; an AdminUser satisfies it structurally.
+function greet(user: User): string {
+  return `Hello, ${user.name}!`;
+}
+
 // --- Startup -------------------------------------------------------------
 
 const port = parsePort("3000");
 const host: Host = CONFIG.host;
 
 console.log(`Starting chat server on ${address(host, port)}`);
-console.log(`Rooms: ${CONFIG.rooms.join(", ")}`);
 
-const users: User[] = [
-  { name: "alice", port: 49152, isAdmin: true },
-  { name: "bob", port: 49153, isAdmin: false },
-];
+// One ChatRoom instance per configured room, keyed by name.
+const rooms = new Map<RoomName, ChatRoom>();
+for (const name of CONFIG.rooms) {
+  rooms.set(name, new ChatRoom(name));
+}
+console.log(`Rooms: ${[...rooms.keys()].join(", ")}`);
 
-console.log(`\n${users.length} user(s) seeded:`);
-for (const user of users) {
-  const role = isAdmin(user) ? "admin" : "member";
-  console.log(`  ${user.name.padEnd(8)} ${address(host, user.port)}  (${role})`);
+const alice: AdminUser = {
+  id: "u1",
+  name: "alice",
+  port: 49152,
+  joinedAt: Date.now(),
+  adminLevel: 2,
+  permissions: ["kick", "ban", "mute"],
+};
+
+const bob: User = {
+  id: "u2",
+  name: "bob",
+  port: 49153,
+  joinedAt: Date.now(),
+};
+
+console.log("\nUsers:");
+for (const user of [alice, bob]) {
+  const role = isAdmin(user) ? `admin(level ${user.adminLevel})` : "member";
+  console.log(`  ${greet(user).padEnd(16)} ${address(host, user.port)}  ${role}`);
 }
 
-const states: ConnectionState[] = ["connecting", "connected", "disconnected"];
-console.log("\nConnection states:");
-for (const state of states) {
-  console.log(`  ${state.padEnd(13)} - ${describeState(state)}`);
+const general = rooms.get("general");
+if (general !== undefined) {
+  general.join(alice.id);
+  general.join(bob.id);
+  general.leave(bob.id);
+
+  console.log(`\nRoom "${general.name}":`);
+  console.log(`  members:   ${general.memberCount}`);
+  console.log(`  has alice: ${general.hasMember(alice.id)}`);
+  console.log(`  has bob:   ${general.hasMember(bob.id)}`);
+  console.log(`  serialize: ${general.serialize()}`);
 }
 
-const at: Timestamp = Date.now();
+// A connection starts out unauthenticated, then transitions via its subclass.
+const conn = new AuthenticatedConnection("c1", null, alice);
+console.log(`\nConnection ${conn.id}: ${describeState(conn.status)}`);
+conn.authenticate();
+console.log(`Connection ${conn.id}: ${describeState(conn.status)}`);
+conn.send("welcome");
+conn.close();
+console.log(`Connection ${conn.id}: ${describeState(conn.status)}`);
+
+const message = new ChatMessage(alice.id, parseInput("  Hello!  "), "general");
+console.log(`\nMessage: ${message.serialize()}`);
+
 const events: ChatEvent[] = [
-  { type: "join", user: "alice", room: "general", at },
-  { type: "message", user: "alice", room: "general", text: "Hello!", at },
-  { type: "system", text: "Server restarting in 5 minutes", at },
-  { type: "leave", user: "alice", room: "general", at },
+  { type: "join", user: alice.name, room: "general", at: message.at },
+  { type: "message", user: alice.name, room: "general", text: message.text, at: message.at },
+  { type: "system", text: "Server restarting in 5 minutes", at: message.at },
+  { type: "leave", user: alice.name, room: "general", at: message.at },
 ];
 
 console.log("\nEvent log:");
 for (const event of events) {
   console.log(`  ${formatEvent(event)}`);
-}
-
-// Anything arriving from the network is `unknown` until it has been narrowed.
-const rawInputs: unknown[] = ["  hello  ", 42, true, null, undefined, { a: 1 }];
-console.log("\nRaw input, narrowed:");
-for (const raw of rawInputs) {
-  console.log(`  ${String(JSON.stringify(raw)).padEnd(10)} → "${parseInput(raw)}"`);
 }
 
 console.log(`\nReady. ${statusLine(200)}.`);
