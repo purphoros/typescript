@@ -1,0 +1,28 @@
+{
+  "name": "chat-server",
+  "version": "1.0.0",
+  "description": "A real-time chat server, built incrementally while learning TypeScript.",
+  "main": "dist/index.js",
+  "scripts": {
+    "dev": "tsx watch src/index.ts",
+    "build": "tsc",
+    "start": "node dist/index.js",
+    "typecheck": "tsc --noEmit"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/purphoros/typescript.git"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "bugs": {
+    "url": "https://github.com/purphoros/typescript/issues"
+  },
+  "homepage": "https://github.com/purphoros/typescript#readme",
+  "devDependencies": {
+    "@types/node": "^26.1.1",
+    "tsx": "^4.23.0",
+    "typescript": "^7.0.2"
+  }
+}
