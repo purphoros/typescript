@@ -55,6 +55,7 @@ export enum ErrorCode {
   UnknownRoom = "unknown_room",
   UnknownUser = "unknown_user",
   NotInRoom = "not_in_room",
+  NotIdentified = "not_identified",
   NoSuchTarget = "no_such_target",
   NotPermitted = "not_permitted",
   Timeout = "timeout",

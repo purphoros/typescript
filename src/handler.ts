@@ -101,11 +101,20 @@ export class MessageHandler {
   farewell(client: ChatClient): void {
     const room = client.room;
     if (room !== undefined) {
-      this.registry.rooms.get(room)?.leave(client.label);
+      // By id. A label is a nickname and a nickname changes; see ClientId.
+      this.registry.rooms.get(room)?.leave(client.id);
       this.bus.emit("leave", client, room);
+      this.reap(room);
     }
     this.registry.remove(client);
     this.bus.emit("disconnect", client, this.registry.clients.size);
+  }
+
+  // A room nobody is in stops existing - unless it is one of the permanent ones.
+  private reap(room: string): void {
+    if (this.registry.reapIfEmpty(room)) {
+      this.bus.emit("notice", `#${room} is empty and has been closed`);
+    }
   }
 
   // Show a client what it missed, from memory. Nobody waits for a disk to join a
@@ -133,9 +142,17 @@ export class MessageHandler {
         client.send({ type: "commands", commands: COMMANDS });
         return;
 
-      case "who":
-        client.send({ type: "userList", users: [...registry.clients.values()].map(describeClient) });
+      case "who": {
+        // In a room? Then "who" means who is in here with you - resolved through
+        // the registry, because the room only knows ids. Not in a room? Then it
+        // means everybody on the server.
+        const room = client.room !== undefined ? registry.rooms.get(client.room) : undefined;
+        const people = room !== undefined
+          ? registry.membersOf(room)
+          : [...registry.clients.values()];
+        client.send({ type: "userList", users: people.map(describeClient) });
         return;
+      }
 
       case "rooms":
         client.send({ type: "roomList", rooms: [...registry.rooms.values()].map(describeRoom) });
@@ -177,22 +194,46 @@ export class MessageHandler {
             ErrorCode.UnknownUser,
           );
         }
+        // Who they were a moment ago - before identifyAs overwrites it. A rename
+        // is only interesting if the name actually changed *and* somebody was
+        // there to see it.
+        const before = client.label;
+
         client.identifyAs(user);
+
         const role = isAdmin(user) ? ` You are an admin (level ${user.adminLevel}).` : "";
         client.send({ type: "system", text: `You are now ${user.name}.${role}` });
+
+        // The room membership does not have to be touched. It is keyed by id, and
+        // the id did not change - which is the entire point of Chapter 16, visible
+        // in the code that is *not* here.
+        if (client.room !== undefined && before !== user.name) {
+          bus.emit("rename", client, before, user.name);
+        }
         return;
       }
 
       case "join": {
-        const room = registry.requireRoomNamed(message.room);
+        // Rooms come into existence by being walked into. `getOrCreateRoom`
+        // rather than `requireRoomNamed` - the HTTP side still uses the latter,
+        // because asking *about* a room should never conjure one.
+        const room = registry.getOrCreateRoom(message.room);
+
         const previous = client.room;
         if (previous !== undefined) {
-          registry.rooms.get(previous)?.leave(client.label);
+          registry.rooms.get(previous)?.leave(client.id);
           client.exitRoom();
           bus.emit("leave", client, previous);
+          this.reap(previous);
         }
-        room.join(client.label);
+
+        // enterRoom throws if this client has not said who it is. That rule is in
+        // the state machine, not here: `chatting` carries a user, so a client in a
+        // room without a name is not a case we forgot to check - it is a value
+        // that cannot be constructed.
         client.enterRoom(room.name);
+        room.join(client.id);
+
         client.send({ type: "joined", user: client.label, room: room.name, members: room.memberCount });
         this.replay(client, room, HISTORY_ON_JOIN);
         bus.emit("join", client, room.name);
@@ -201,10 +242,11 @@ export class MessageHandler {
 
       case "leave": {
         const room = registry.requireRoom(client);
-        room.leave(client.label);
+        room.leave(client.id);
         client.exitRoom();
         client.send({ type: "left", user: client.label, room: room.name });
         bus.emit("leave", client, room.name);
+        this.reap(room.name);
         return;
       }
 

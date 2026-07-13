@@ -25,6 +25,7 @@ export type ChatEvent =
   | { type: "join"; user: UserId; room: RoomName; at: Timestamp }
   | { type: "leave"; user: UserId; room: RoomName; at: Timestamp }
   | { type: "kick"; by: UserId; target: UserId; reason: string; at: Timestamp }
+  | { type: "rename"; from: UserId; to: UserId; at: Timestamp }
   | { type: "system"; text: string; at: Timestamp };
 
 // The bus's contract: event name → the handler that listens for it. Every emit
@@ -39,6 +40,7 @@ export type ServerEvents = {
   connect: (client: ChatClient) => void;
   disconnect: (client: ChatClient, remaining: number) => void;
   join: (client: ChatClient, room: RoomName) => void;
+  rename: (client: ChatClient, from: UserId, to: UserId) => void;
   leave: (client: ChatClient, room: RoomName) => void;
   message: (message: ChatMessage) => void;
   whisper: (from: ChatClient, to: ChatClient, text: string) => void;
@@ -64,6 +66,7 @@ export function formatEvent(event: ChatEvent): string {
     case "join":    return `→ ${event.user} joined ${event.room}`;
     case "leave":   return `← ${event.user} left ${event.room}`;
     case "kick":    return `⚡ ${event.by} kicked ${event.target}: ${event.reason}`;
+    case "rename":  return `${event.from} is now known as ${event.to}`;
     case "system":  return `[SYSTEM] ${event.text}`;
     default:        return assertNever(event);
   }
@@ -113,6 +116,8 @@ export function createBus(registry: Registry, history: FileHistory): Bus {
     log({ type: "whisper", from: from.label, to: to.label, at: Date.now() }));
   bus.on("kick", (by, target, reason) =>
     log({ type: "kick", by: by.label, target: target.label, reason, at: Date.now() }));
+  bus.on("rename", (_client, from, to) =>
+    log({ type: "rename", from, to, at: Date.now() }));
   bus.on("request", (method, path, status) =>
     log({ type: "system", text: `${method} ${path} → ${status} ${statusLine(status)}`, at: Date.now() }));
   bus.on("upgrade", (id) =>
@@ -188,6 +193,13 @@ export function createBus(registry: Registry, history: FileHistory): Bus {
   });
   bus.on("leave", (client, room) => {
     registry.broadcast(room, { type: "left", user: client.label, room }, client);
+  });
+  // The room sees the new name; the client already got its own confirmation.
+  bus.on("rename", (client, from, to) => {
+    const room = client.room;
+    if (room !== undefined) {
+      registry.broadcast(room, { type: "system", text: `${from} is now known as ${to}` }, client);
+    }
   });
   bus.on("kick", (by, target, reason) => {
     const room = target.room;

@@ -9,6 +9,7 @@
 import type net from "node:net";
 import { WebSocket } from "ws";
 import {
+  CATALOG,
   ConnectionState,
   encodeServerMessage,
   type RoomName,
@@ -16,7 +17,9 @@ import {
   type Timestamp,
   type Transport,
 } from "./protocol.js";
-import type { ChatClient, PeerKind, User } from "./types.js";
+import { ErrorCode, StateError } from "./errors.js";
+import { clientId } from "./types.js";
+import type { ChatClient, ClientId, ClientState, PeerKind, User } from "./types.js";
 
 // How many bytes may be waiting to go out to one client before we give up on it.
 //
@@ -47,13 +50,17 @@ const MAX_INBOX_BYTES = 256 * 1024;
 // attached. The two transports differ only in how bytes leave and arrive.
 export abstract class BaseClient implements ChatClient {
   readonly connectedAt: Timestamp = Date.now();
-  protected identity?: User;
-  protected currentRoom?: RoomName;
+
+  // One field, not two. See ClientState in types.ts for the bug this closes.
+  protected presence: ClientState = { status: "anonymous" };
 
   constructor(
-    readonly id: string,
+    readonly id: ClientId,
     readonly transport: Transport,
-    protected state: ConnectionState,
+    // The *socket's* state. Deliberately a different field from `presence` above:
+    // one is about the wire, the other about the conversation, and conflating them
+    // is how you end up unable to say "connected, but has not spoken".
+    protected connection: ConnectionState,
   ) {}
 
   abstract send(message: ServerMessage): void;
@@ -91,51 +98,77 @@ export abstract class BaseClient implements ChatClient {
   }
 
   get status(): ConnectionState {
-    return this.state;
+    return this.connection;
   }
 
+  get state(): ClientState {
+    return this.presence;
+  }
+
+  // `user` and `room` are *derived*. They are not storage, so they cannot
+  // disagree with anything - the union already decided.
   get user(): User | undefined {
-    return this.identity;
+    return this.presence.status === "anonymous" ? undefined : this.presence.user;
   }
 
   get room(): RoomName | undefined {
-    return this.currentRoom;
+    return this.presence.status === "chatting" ? this.presence.room : undefined;
   }
 
-  // Who this client is, for logging: the chosen nick, else the connection id.
+  // What to *call* this client. Note that this changes when they pick a name -
+  // which is precisely why rooms must never key membership on it. `id` is
+  // immutable; `label` is a display name. Chapter 16 learned the difference the
+  // hard way.
   get label(): string {
-    return this.identity?.name ?? this.id;
+    return this.user?.name ?? this.id;
   }
 
   get uptime(): number {
     return Date.now() - this.connectedAt;
   }
 
+  // Legal from any state. Renaming while in a room keeps you in the room - you
+  // are the same connection, you just answer to something else now.
   identifyAs(user: User): void {
-    this.identity = user;
+    this.presence =
+      this.presence.status === "chatting"
+        ? { status: "chatting", user, room: this.presence.room }
+        : { status: "identified", user };
   }
 
+  // The one transition the state machine actually forbids. You cannot be in a
+  // room without being somebody, because `chatting` carries a `user` and there is
+  // no way to construct it without one.
   enterRoom(name: RoomName): void {
-    this.currentRoom = name;
+    if (this.presence.status === "anonymous") {
+      throw new StateError(
+        `Say who you are first, e.g. ${CATALOG.nick.example}`,
+        ErrorCode.NotIdentified,
+      );
+    }
+    this.presence = { status: "chatting", user: this.presence.user, room: name };
   }
 
   exitRoom(): void {
-    this.currentRoom = undefined;
+    if (this.presence.status !== "chatting") {
+      throw new StateError("You are not in a room.");
+    }
+    this.presence = { status: "identified", user: this.presence.user };
   }
 
   // The transitions the server can drive. A connection walks Connecting →
   // Connected → Closing → Disconnected and never goes back, which is why
   // ConnectionState has no "reconnecting": that is the client's business.
   markConnected(): void {
-    this.state = ConnectionState.Connected;
+    this.connection = ConnectionState.Connected;
   }
 
   markClosing(): void {
-    this.state = ConnectionState.Closing;
+    this.connection = ConnectionState.Closing;
   }
 
   markClosed(): void {
-    this.state = ConnectionState.Disconnected;
+    this.connection = ConnectionState.Disconnected;
   }
 }
 
@@ -160,7 +193,7 @@ export class TcpClient extends BaseClient {
 
   constructor(private readonly socket: net.Socket, sequence: number) {
     // Accepted, but we do not yet know whether this is curl or a person.
-    super(`c${sequence}`, "tcp", ConnectionState.Connecting);
+    super(clientId(`c${sequence}`), "tcp", ConnectionState.Connecting);
     this.address = `${socket.remoteAddress}:${socket.remotePort}`;
   }
 
@@ -259,7 +292,7 @@ export class WsClient extends BaseClient {
     readonly address: string,
   ) {
     // The handshake is already done by the time `ws` hands us the socket.
-    super(`w${sequence}`, "ws", ConnectionState.Connected);
+    super(clientId(`w${sequence}`), "ws", ConnectionState.Connected);
   }
 
   // `ws` keeps the same count under a different name. Same disease, same cure.

@@ -32,7 +32,7 @@ export { TypedEmitter, RingBuffer, pluck } from "./events.js";
 export { createBus, formatEvent, statusLine } from "./bus.js";
 export { configure, resolvePort, fromEnvironment, DEFAULTS } from "./config.js";
 export { Runtime } from "./runtime.js";
-export { isAdmin } from "./types.js";
+export { isAdmin, clientId } from "./types.js";
 export { chatPage } from "./page.js";
 export { Router } from "./router.js";
 export { ClientMessageSchema, PortSchema, EnvSchema } from "./schemas.js";
@@ -72,6 +72,8 @@ export type { HttpRequest, HttpResponse, HttpOutcome } from "./http.js";
 export type { PathParams, RouteHandler, HttpMethod } from "./router.js";
 export type {
   ChatClient,
+  ClientId,
+  ClientState,
   Identifiable,
   Serializable,
   User,

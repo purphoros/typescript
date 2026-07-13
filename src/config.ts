@@ -12,6 +12,9 @@ export type ServerConfig = Readonly<{
   rooms: readonly RoomName[];
   historyLimit: number;
   dataDir: string;
+  // Rooms are created on demand (Chapter 16), which means a stranger can create
+  // them. Chapter 15's rule applies: anything a stranger can grow, bound.
+  maxRooms: number;
 }>;
 
 // `as const` gives every field its literal type and makes the object readonly:
@@ -24,6 +27,7 @@ export const DEFAULTS = {
   // goes to disk - which is the whole reason Chapter 12 has anything to await.
   historyLimit: 50,
   dataDir: "data",
+  maxRooms: 100,
 } as const;
 
 // A client that connects and says nothing is assumed to be a human at a

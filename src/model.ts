@@ -7,7 +7,7 @@
 
 import { RingBuffer } from "./events.js";
 import type { MessageSummary, RoomName, Timestamp, UserId } from "./protocol.js";
-import type { Identifiable, Message, Serializable } from "./types.js";
+import type { ClientId, Identifiable, Message, Serializable } from "./types.js";
 
 // State plus behaviour: a room owns its membership and its history, and decides
 // what of either it will show.
@@ -15,7 +15,16 @@ export class ChatRoom implements Serializable, Identifiable {
   readonly id: string;
   readonly createdAt: Timestamp;
 
-  private members: Set<UserId> = new Set();
+  // Client *ids*, not labels. This is the whole bug fix of Chapter 16.
+  //
+  // A label is a nickname and a nickname changes. Membership stored under one is
+  // membership that leaks the moment somebody renames: join as `c1`, become
+  // `alice`, leave - and the room dutifully removes "alice" and keeps "c1"
+  // forever, reporting one member with nobody in it.
+  //
+  // An id is handed out once, at accept(), and never changes. Rooms hold ids.
+  // Anything that wants a name asks the registry, which knows who `c1` is *now*.
+  private members: Set<ClientId> = new Set();
   private history: RingBuffer<ChatMessage>;
 
   constructor(public readonly name: RoomName, historyLimit: number) {
@@ -24,16 +33,16 @@ export class ChatRoom implements Serializable, Identifiable {
     this.history = new RingBuffer<ChatMessage>(historyLimit);
   }
 
-  join(userId: UserId): void {
-    this.members.add(userId);
+  join(client: ClientId): void {
+    this.members.add(client);
   }
 
-  leave(userId: UserId): boolean {
-    return this.members.delete(userId);
+  leave(client: ClientId): boolean {
+    return this.members.delete(client);
   }
 
-  hasMember(userId: UserId): boolean {
-    return this.members.has(userId);
+  hasMember(client: ClientId): boolean {
+    return this.members.has(client);
   }
 
   remember(message: ChatMessage): void {
@@ -49,8 +58,12 @@ export class ChatRoom implements Serializable, Identifiable {
     return this.members.size;
   }
 
-  get memberList(): UserId[] {
+  get memberIds(): ClientId[] {
     return [...this.members];
+  }
+
+  get isEmpty(): boolean {
+    return this.members.size === 0;
   }
 
   get messageCount(): number {
@@ -58,7 +71,7 @@ export class ChatRoom implements Serializable, Identifiable {
   }
 
   serialize(): string {
-    return JSON.stringify({ id: this.id, name: this.name, members: this.memberList });
+    return JSON.stringify({ id: this.id, name: this.name, members: this.memberIds });
   }
 }
 

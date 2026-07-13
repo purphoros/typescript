@@ -16,14 +16,14 @@ import { CATALOG, type RoomName, type ServerMessage } from "./protocol.js";
 import { ChatRoom } from "./model.js";
 import { pluck } from "./events.js";
 import type { ServerConfig } from "./config.js";
-import type { AdminUser, ChatClient, User } from "./types.js";
+import type { AdminUser, ChatClient, ClientId, User } from "./types.js";
 
 export class Registry {
   readonly rooms = new Map<RoomName, ChatRoom>();
 
   // Every live chat client, TCP or WebSocket alike. HTTP requests come and go
   // within a single exchange and are never listed here.
-  readonly clients = new Map<string, ChatClient>();
+  readonly clients = new Map<ClientId, ChatClient>();
 
   // Users the server already knows about. Chapter 17 replaces this with real
   // authentication; for now a "nick" message simply claims an identity.
@@ -34,10 +34,16 @@ export class Registry {
 
   private sequence = 0;
 
-  constructor(config: ServerConfig) {
+  constructor(private readonly config: ServerConfig) {
     for (const name of config.rooms) {
       this.rooms.set(name, new ChatRoom(name, config.historyLimit));
     }
+  }
+
+  // The rooms that exist because the operator said so. They stay even when empty
+  // - `general` with nobody in it is still where people go to find each other.
+  private isPermanent(name: RoomName): boolean {
+    return this.config.rooms.includes(name);
   }
 
   // Connection ids are handed out from here because there is exactly one counter
@@ -76,7 +82,64 @@ export class Registry {
   // there is exactly one thing every caller would do with the undefined, and it
   // happens at the boundary. See Chapter 10.
 
-  // A room by name, or a 404 with the list of rooms that do exist.
+  // Join a room that does not exist and it comes into being. That is what a chat
+  // server is for, and it is also - unbounded - how somebody fills your heap with
+  // ten million empty rooms, so it is bounded.
+  //
+  // The name is already known to be safe: the schema (Chapter 14) allows only
+  // lowercase letters, digits and hyphens, up to 32 characters. Which is why this
+  // function can create a *file* named after it without a second thought.
+  getOrCreateRoom(name: RoomName): ChatRoom {
+    const existing = this.rooms.get(name);
+    if (existing !== undefined) {
+      return existing;
+    }
+    if (this.rooms.size >= this.config.maxRooms) {
+      throw new StateError(
+        `This server holds ${this.config.maxRooms} rooms and they are all taken.`,
+        ErrorCode.NotPermitted,
+      );
+    }
+    const room = new ChatRoom(name, this.config.historyLimit);
+    this.rooms.set(name, room);
+    return room;
+  }
+
+  // The last person out turns off the lights.
+  //
+  // Returns true if the room was actually removed, so the caller can say so. The
+  // permanent rooms survive: an empty `general` is not litter, it is a lobby.
+  //
+  // Note what is *not* deleted: the room's history file. Rooms are cheap and
+  // conversations are not. Walk back into #standup a week later and it is still
+  // there - the room object is a handle, not the archive.
+  reapIfEmpty(name: RoomName): boolean {
+    const room = this.rooms.get(name);
+    if (room === undefined || !room.isEmpty || this.isPermanent(name)) {
+      return false;
+    }
+    this.rooms.delete(name);
+    return true;
+  }
+
+  // Who is actually in a room, as clients rather than ids.
+  //
+  // The room holds ids because ids do not change. Anything that wants a *name*
+  // comes through here, and gets the name as it is right now - which is the whole
+  // reason the two are different types.
+  membersOf(room: ChatRoom): ChatClient[] {
+    const members: ChatClient[] = [];
+    for (const id of room.memberIds) {
+      const client = this.clients.get(id);
+      if (client !== undefined) {
+        members.push(client);
+      }
+    }
+    return members;
+  }
+
+  // A room by name, or a 404 with the list of rooms that do exist. Used by HTTP,
+  // where asking about a room must not conjure one.
   requireRoomNamed(name: RoomName): ChatRoom {
     const room = this.rooms.get(name);
     if (room === undefined) {
