@@ -144,6 +144,12 @@ export type ServerMessage =
   | { type: "results"; room: RoomName; query: string; messages: readonly MessageSummary[] }
   | { type: "commands"; commands: readonly CommandInfo[] }
   | { type: "kicked"; by: UserId; reason: string }
+  // "Are you still there?" A TCP client must answer with {"type":"pong"}; a
+  // WebSocket client never sees this, because `ws` pings at the frame level and
+  // the browser answers without asking anybody.
+  | { type: "ping" }
+  | { type: "typing"; user: UserId; room: RoomName; typing: boolean }
+  | { type: "presence"; user: UserId; room: RoomName; presence: "active" | "idle" | "away" }
   | { type: "error"; code: ErrorCode; message: string };
 
 export type ServerMessageType = ServerMessage["type"];
@@ -241,6 +247,16 @@ export const CATALOG: Record<ClientMessageType, CommandInfo> = {
     type: "kick",
     example: '{"type":"kick","target":"bob","reason":"spam"}',
     description: "Disconnect a user (admins only)",
+  },
+  typing: {
+    type: "typing",
+    example: '{"type":"typing","typing":true}',
+    description: "Tell the room you are typing (expires on its own)",
+  },
+  pong: {
+    type: "pong",
+    example: '{"type":"pong"}',
+    description: "Answer a ping. TCP clients must; WebSocket clients need not.",
   },
   status: {
     type: "status",

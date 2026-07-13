@@ -70,6 +70,12 @@ export const ClientMessageSchema = z.discriminatedUnion("type", [
   message({ type: z.literal("search"), query: z.string().min(1).max(200) }),
   message({ type: z.literal("kick"), target: nickname, reason: z.string().min(1).max(200) }),
   message({ type: z.literal("status") }),
+  // Ephemeral. Never archived, never persisted, and gone in four seconds whether
+  // or not anybody says so - see presence.ts.
+  message({ type: z.literal("typing"), typing: z.boolean() }),
+  // The answer to a {"type":"ping"}. Raw TCP has no ping frame; WebSocket does,
+  // and its clients answer it without any application code at all.
+  message({ type: z.literal("pong") }),
   message({ type: z.literal("help") }),
   message({ type: z.literal("quit") }),
 ]);

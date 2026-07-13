@@ -28,6 +28,7 @@ import { isAdmin, type ChatClient } from "./types.js";
 import { describeClient, describeRoom, summarize } from "./views.js";
 import type { Bus } from "./bus.js";
 import type { MessageStore } from "./store.js";
+import { PresenceTracker } from "./presence.js";
 import type { Registry } from "./state.js";
 
 function formatDuration(ms: number): string {
@@ -56,6 +57,7 @@ export class MessageHandler {
     private readonly accounts: Accounts,
     private readonly sessions: Sessions,
     private readonly config: ServerConfig,
+    private readonly presence: PresenceTracker = new PresenceTracker(),
   ) {
     // Order matters, and it is an argument about cost.
     //
@@ -87,6 +89,11 @@ export class MessageHandler {
   //                           repeat. If not, it is a bug: log the stack, and
   //                           tell them nothing.
   async handleLine(client: ChatClient, line: string): Promise<void> {
+    // Anything at all arriving is proof the socket works. Recorded before the
+    // message is even decoded - a client sending us garbage is still a client that
+    // is *there*, and evicting it for being wrong is a different decision.
+    this.presence.heard(client);
+
     try {
       const decoded = decodeClientMessage(line);
       if (!decoded.ok) {
@@ -313,6 +320,20 @@ export class MessageHandler {
 
       case "chat": {
         const room = registry.requireRoom(client);
+
+        // Cancel the typing indicator *first*, while there is still an indicator
+        // to cancel. See PresenceTracker.spoke - the first version of this had the
+        // two calls the other way round, and the "alice is typing…" stayed on
+        // screen after the message arrived.
+        if (this.presence.stoppedTyping(client)) {
+          registry.broadcast(room.name, { type: "typing", user: client.label, room: room.name, typing: false }, client);
+        }
+
+        // Saying something is the strongest possible evidence of presence.
+        const became = this.presence.spoke(client);
+        if (became !== undefined) {
+          registry.broadcast(room.name, { type: "presence", user: client.label, room: room.name, presence: became });
+        }
         // Announce it. The log, the room's history, and the broadcast are all
         // listeners in bus.ts - this method does not know they exist.
         bus.emit("message", new ChatMessage(client.label, message.text, room.name));
@@ -349,6 +370,36 @@ export class MessageHandler {
             `Server time ${new Date().toISOString()}.`,
         });
         return;
+
+      case "pong":
+        // Nothing to do. `handleLine` already recorded that we heard from them,
+        // which is the entire content of a pong. The case exists so that
+        // assertNever stays happy and so the protocol has a name for it.
+        return;
+
+      case "typing": {
+        // Ephemeral, and it never touches the archive. A typing indicator is not
+        // a message: it is not persisted, not replayed to a joiner, and not in
+        // anybody's history. It is a fact about *right now*, and in four seconds
+        // it will not even be that.
+        const room = registry.requireRoom(client);
+
+        // Debounced on the server. Clients send "typing" on every keystroke -
+        // every single one of them does - and you cannot ask the world to be
+        // well-behaved. You can only decline to repeat it.
+        const news = message.typing
+          ? this.presence.startedTyping(client)
+          : this.presence.stoppedTyping(client);
+
+        if (news) {
+          registry.broadcast(
+            room.name,
+            { type: "typing", user: client.label, room: room.name, typing: message.typing },
+            client,
+          );
+        }
+        return;
+      }
 
       case "quit":
         client.end({ type: "system", text: "Goodbye!" });

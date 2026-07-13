@@ -313,6 +313,20 @@ export class WsClient extends BaseClient {
     this.ws.terminate();
   }
 
+  // A protocol-level ping frame.
+  //
+  // This is not a message. It never reaches the application on the other end -
+  // the browser's WebSocket stack answers it itself, automatically, with a pong
+  // frame, and no JavaScript on the page is ever told it happened. Which is why
+  // this works on clients that have never heard of us.
+  //
+  // `ws` calls our "pong" listener when the answer arrives. See server.ts.
+  ping(): void {
+    if (this.ws.readyState === WebSocket.OPEN) {
+      this.ws.ping();
+    }
+  }
+
   // A client may be mid-disconnect: sending to a closing socket throws.
   send(message: ServerMessage): void {
     if (this.ws.readyState !== WebSocket.OPEN || !this.accepts()) {

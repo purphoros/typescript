@@ -32,10 +32,13 @@ import { Accounts, Sessions } from "./auth.js";
 import { Registry } from "./state.js";
 import { Metrics, Runtime } from "./runtime.js";
 import { Logger } from "./logger.js";
+import { PresenceTracker, HEARTBEAT_MS } from "./presence.js";
 import { TcpClient, WsClient } from "./clients.js";
 import type { PeerKind } from "./types.js";
 
 export class ChatServer {
+  readonly presence = new PresenceTracker();
+  private heartbeat: NodeJS.Timeout | undefined;
   readonly registry: Registry;
   readonly bus: Bus;
   readonly storage: Storage;
@@ -70,6 +73,7 @@ export class ChatServer {
       this.accounts,
       this.sessions,
       config,
+      this.presence,
     );
     const rest = new Rest({
       registry: this.registry,
@@ -143,7 +147,76 @@ export class ChatServer {
   }
 
   listen(onReady: () => void): void {
+    this.startHeartbeat();
     this.server.listen(this.config.port, this.config.host, onReady);
+  }
+
+  // The one loop that asks everybody, every few seconds, whether they are still
+  // there - and stops believing the ones that do not answer.
+  //
+  // One timer for the whole server, not one per client. A thousand clients is a
+  // thousand `setInterval`s otherwise, which is a thousand timers the event loop
+  // has to consider on every tick, to do a job one loop can do in a millisecond.
+  private startHeartbeat(): void {
+    this.heartbeat = setInterval(() => {
+      const now = Date.now();
+
+      for (const client of [...this.registry.clients.values()]) {
+        // 1. Reap. Two missed heartbeats is not a slow client, it is an absent one.
+        if (this.presence.isGone(client, now)) {
+          this.logger.info("reaping a client that stopped answering", {
+            client: client.id,
+            user: client.label,
+          });
+          // end() would try to *say* something first, down a socket whose defining
+          // property is that nobody is listening.
+          client.end({ type: "system", text: "No heartbeat. Closing." });
+          this.handler.farewell(client);
+          this.registry.remove(client);
+          continue;
+        }
+
+        // 2. Ask. WebSocket clients get a protocol-level ping frame, which their
+        //    browser answers without a line of application code. TCP has no such
+        //    frame, so they get a message and are expected to reply with a pong.
+        if (client instanceof WsClient) {
+          client.ping();
+        } else {
+          client.send({ type: "ping" });
+        }
+        this.presence.asked(client, now);
+
+        // 3. A typing indicator that expired without anyone cancelling it - which
+        //    is the common case, because clients forget.
+        const room = client.room;
+        if (room !== undefined && this.presence.expiredTyping(client, now)) {
+          this.registry.broadcast(
+            room,
+            { type: "typing", user: client.label, room, typing: false },
+            client,
+          );
+        }
+
+        // 4. Presence decays with silence. Only a *change* is broadcast, so this
+        //    loop is not a firehose of "alice is still idle" every five seconds.
+        if (room !== undefined) {
+          const became = this.presence.reassess(client, now);
+          if (became !== undefined) {
+            this.registry.broadcast(room, {
+              type: "presence",
+              user: client.label,
+              room,
+              presence: became,
+            });
+          }
+        }
+      }
+    }, HEARTBEAT_MS);
+
+    // Chapter 15's lesson, and it is exactly as true the second time: a timer
+    // holds the event loop open, and a server that will not exit is a server
+    // nobody can restart.
+    this.heartbeat.unref();
   }
 
   // Stop accepting connections, hang up on everyone, wait for the disk, then
@@ -158,6 +231,10 @@ export class ChatServer {
     this.bus.emit("notice", "Shutting down");
     for (const client of this.registry.clients.values()) {
       client.end({ type: "system", text: "Server shutting down." });
+    }
+
+    if (this.heartbeat !== undefined) {
+      clearInterval(this.heartbeat);
     }
 
     await new Promise<void>((resolve) => this.server.close(() => resolve()));
@@ -206,6 +283,14 @@ export class ChatServer {
         .catch((thrown: unknown) => this.bus.emit("failure", client.id, asError(thrown)));
     });
 
+    // The browser answered our ping frame, all by itself, with no application
+    // code on the page involved. This is the only place a WebSocket client's
+    // liveness is recorded, and it is why a browser tab sitting idle for an hour
+    // is not mistaken for a dead one.
+    ws.on("pong", () => {
+      this.presence.heard(client);
+    });
+
     ws.on("close", () => {
       client.markClosed();
       const dropped = client.dropReason;
@@ -236,6 +321,12 @@ export class ChatServer {
   // the event loop interleaves them all on a single thread.
   private acceptTcp(socket: net.Socket): void {
     const conn = new TcpClient(socket, this.registry.nextSequence());
+
+    // The OS's own keepalive. It costs nothing and it is not enough: the default
+    // idle time before the first probe is *two hours* on Linux, which is a
+    // perfectly reasonable number for a protocol designed in 1981 and a useless
+    // one for a chat room. It is belt and braces; presence.ts is the braces.
+    socket.setKeepAlive(true, 30_000);
 
     // Everything downstream of here can now await, and that turns out to be a
     // problem this connection has to solve for itself.

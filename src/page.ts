@@ -89,6 +89,11 @@ Also: /who, /rooms, /history, /w bob hello, /leave, /logout, /status, /help</sma
       case "commands": return "The server understands:\\n" + msg.commands
         .map((c) => "  " + c.type.padEnd(8) + " " + c.description + "\\n           " + c.example)
         .join("\\n");
+      case "ping":     return null;   // a browser answers frame-level pings itself
+      case "typing":   return msg.typing
+        ? "… " + msg.user + " is typing"
+        : null;                        // "stopped typing" is not worth a line
+      case "presence": return "· " + msg.user + " is " + msg.presence;
       case "kicked":   return "You were kicked by " + msg.by + ": " + msg.reason;
       case "error":    return "[error: " + msg.code + "] " + msg.message;
       default:         return "[unknown message] " + JSON.stringify(msg);
@@ -109,7 +114,8 @@ Also: /who, /rooms, /history, /w bob hello, /leave, /logout, /status, /help</sma
     ws.onmessage = (event) => {
       try {
         const msg = JSON.parse(event.data);
-        log(render(msg));
+        const line = render(msg);
+        if (line !== null) log(line);
         // A fresh token is immediately presented. login -> token -> auth, without
         // the human doing the second step.
         if (msg.type === "token") ws.send(JSON.stringify({ type: "auth", token: msg.token }));
@@ -127,6 +133,18 @@ Also: /who, /rooms, /history, /w bob hello, /leave, /logout, /status, /help</sma
   };
 
   connect();
+
+  // Tell the room we are typing - at most once every two seconds, no matter how
+  // fast anybody types. The server debounces too (it has to; it cannot trust us),
+  // but not flooding it in the first place is basic manners.
+  let lastTyping = 0;
+  document.getElementById("input").addEventListener("input", () => {
+    const now = Date.now();
+    if (state === "connected" && now - lastTyping > 2000) {
+      lastTyping = now;
+      ws.send(JSON.stringify({ type: "typing", typing: true }));
+    }
+  });
 
   document.getElementById("input").addEventListener("keydown", (event) => {
     if (event.key !== "Enter" || !event.target.value) return;
