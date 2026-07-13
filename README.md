@@ -25,7 +25,7 @@ cd chat-server
 npm init -y
 ```
 
-`npm init -y` creates a `package.json` with defaults. This is your project manifest - it tracks dependencies, scripts, and metadata. Think of it like Rust's `Cargo.toml`.
+`npm init -y` creates a `package.json` with defaults. This is your project manifest - it tracks dependencies, scripts, and metadata. Every npm command reads it.
 
 Install TypeScript and tsx as dev dependencies:
 
@@ -36,7 +36,7 @@ npm install --save-dev typescript tsx @types/node
 Three packages:
 
 - `typescript` - the compiler (`tsc`). Checks types and compiles `.ts` files to `.js`.
-- `tsx` - runs TypeScript directly. No compile step needed during development. Like `cargo run` for Rust.
+- `tsx` - runs TypeScript directly. No compile step needed during development: one command takes you from source to running program.
 - `@types/node` - type definitions for Node.js APIs (filesystem, networking, etc.). Without these, TypeScript doesn't know about `process`, `Buffer`, or any Node.js built-ins.
 
 > **Warning**
@@ -112,9 +112,9 @@ console.log(`Server: ${name} on port ${port}`);
 A few things to notice:
 
 - `const name: string` - a type annotation. The `: string` after the variable name declares its type. TypeScript checks that only strings are assigned to it.
-- `const port: number` - numbers in TypeScript are always 64-bit floats (like JavaScript). No `i32`, `u16` distinction like Rust.
-- ``Template ${literals}`` - backtick strings with `${expr}` interpolation. Like Rust's `format!` but built into the string syntax.
-- `console.log` - prints to stdout. The TypeScript equivalent of Rust's `println!`.
+- `const port: number` - numbers in TypeScript are always 64-bit floats, exactly as in JavaScript. There is one numeric type: no separate integer and float types, and no fixed widths to choose between.
+- ``Template ${literals}`` - backtick strings with `${expr}` interpolation. Any expression inside `${}` is evaluated and spliced into the string.
+- `console.log` - prints a line to stdout.
 
 ## Compiling and Running
 
@@ -126,7 +126,7 @@ There are two ways to run TypeScript: compile first then run the JavaScript, or 
 npx tsx src/index.ts
 ```
 
-`tsx` compiles and runs in one step. No `dist/` directory created. This is what you use during development - fast feedback, no build step. Like `cargo run`.
+`tsx` compiles and runs in one step. No `dist/` directory created. This is what you use during development - fast feedback, no build step.
 
 ### Option 2: tsc + node (production)
 
@@ -172,7 +172,7 @@ Runs the compiled JavaScript. For production - no TypeScript tooling needed at r
 
 ### npm run typecheck
 
-Type-checks without producing output (`--noEmit`). Fast way to verify your code has no type errors. Like `cargo check`.
+Type-checks without producing output (`--noEmit`). The fast way to verify your code has no type errors - ideal in CI or a pre-commit hook.
 
 ## Project Structure
 
@@ -180,8 +180,8 @@ Here's what your project looks like now:
 
 ```
 chat-server/
-├── package.json        ← project manifest (like Cargo.toml)
-├── package-lock.json   ← pinned dependency versions (like Cargo.lock)
+├── package.json        ← project manifest: dependencies and scripts
+├── package-lock.json   ← exact dependency versions, commit this
 ├── tsconfig.json       ← TypeScript compiler config
 ├── node_modules/       ← installed dependencies (auto-managed by npm)
 ├── src/
