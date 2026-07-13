@@ -1,6 +1,7 @@
 // Configuration, and the one decision it has to make out loud.
 
 import { parsePort, type RoomName } from "./protocol.js";
+import { EnvSchema } from "./schemas.js";
 import type { Host, Port } from "./types.js";
 
 // `Readonly<T>` marks every property immutable, so nothing can reassign the
@@ -54,4 +55,41 @@ export function resolvePort(argument: string | undefined): Port {
 
 export function address(host: Host, port: Port): string {
   return `${host}:${port}`;
+}
+
+// Where the settings actually come from, in order of who wins.
+//
+//   argv    what you typed just now, for this one run
+//   env     what this deployment always wants
+//   DEFAULTS what a laptop wants
+//
+// Specific beats general, and immediate beats standing. That order is not a
+// convention to memorise, it is the order of how *deliberate* each source is.
+//
+// A bad value in the environment is fatal, and that is on purpose. PORT=banana
+// is not a request to use the default - it is a mistake in a deployment, and a
+// server that silently binds to 8080 anyway will be found by somebody at 3am
+// wondering why the load balancer is unhappy. Fail at startup, loudly, where the
+// person who typed it is still watching.
+export function fromEnvironment(env: NodeJS.ProcessEnv, argv: readonly string[]): ServerConfig {
+  const parsed = EnvSchema.safeParse(env);
+  if (!parsed.success) {
+    const detail = parsed.error.issues
+      .map((issue) => `${issue.path.join(".")}: ${issue.message}`)
+      .join("; ");
+    console.error(`Bad environment - ${detail}`);
+    process.exit(1);
+  }
+
+  const e = parsed.data;
+
+  return configure(DEFAULTS, {
+    ...(e.HOST !== undefined ? { host: e.HOST } : {}),
+    ...(e.PORT !== undefined ? { port: e.PORT } : {}),
+    ...(e.DATA_DIR !== undefined ? { dataDir: e.DATA_DIR } : {}),
+    ...(e.HISTORY_LIMIT !== undefined ? { historyLimit: e.HISTORY_LIMIT } : {}),
+    ...(e.ROOMS !== undefined ? { rooms: e.ROOMS } : {}),
+    // argv last: it beats everything, because you typed it thirty seconds ago.
+    ...(argv[2] !== undefined ? { port: resolvePort(argv[2]) } : {}),
+  });
 }

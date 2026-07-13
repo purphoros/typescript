@@ -11,6 +11,7 @@ import { COMMANDS, type MessageSummary } from "./protocol.js";
 import { chatPage } from "./page.js";
 import { describeRoom, summarize } from "./views.js";
 import type { FileHistory } from "./history.js";
+import type { Runtime } from "./runtime.js";
 import type { Registry } from "./state.js";
 import { Router } from "./router.js";
 import type { TcpClient } from "./clients.js";
@@ -117,6 +118,7 @@ export class HttpService {
     private readonly registry: Registry,
     private readonly bus: Bus,
     private readonly history: FileHistory,
+    private readonly runtime: Runtime,
   ) {
     this.router = this.buildRoutes();
   }
@@ -133,7 +135,7 @@ export class HttpService {
   // These handlers may throw, and do: requireRoomNamed raises the very same
   // NotFoundError the chat side raises. The boundary below turns it into a 404.
   private buildRoutes(): Router {
-    const { registry, history } = this;
+    const { registry, history, runtime } = this;
 
     return new Router()
       .on("GET", "/", () => html(200, chatPage(registry.clients.size, registry.rooms.size)))
@@ -145,6 +147,22 @@ export class HttpService {
           clients: registry.clients.size,
           rooms: registry.rooms.size,
         }))
+
+      // What the process itself is doing. The interesting number is
+      // eventLoopMeanMs: Node runs one thread, so if that climbs, everything is
+      // slow for everyone and no amount of `async` will help.
+      .on("GET", "/api/health", () => {
+        const snapshot = runtime.snapshot();
+        runtime.reset();
+        return json(200, {
+          ...snapshot,
+          clients: registry.clients.size,
+          rooms: registry.rooms.size,
+          // The one number that says whether we are leaking a slow client's
+          // unsent mail into our own heap. See MAX_BACKLOG_BYTES in clients.ts.
+          backlogBytes: [...registry.clients.values()].reduce((sum, c) => sum + c.backlog, 0),
+        });
+      })
 
       // The protocol, served from the protocol. CATALOG is a Record keyed by
       // every ClientMessage variant, so this endpoint cannot describe a message

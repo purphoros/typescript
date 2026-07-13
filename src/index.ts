@@ -30,11 +30,12 @@ export { Serializer, withTimeout, delay } from "./async.js";
 export { BaseClient, TcpClient, WsClient } from "./clients.js";
 export { TypedEmitter, RingBuffer, pluck } from "./events.js";
 export { createBus, formatEvent, statusLine } from "./bus.js";
-export { configure, resolvePort, DEFAULTS } from "./config.js";
+export { configure, resolvePort, fromEnvironment, DEFAULTS } from "./config.js";
+export { Runtime } from "./runtime.js";
 export { isAdmin } from "./types.js";
 export { chatPage } from "./page.js";
 export { Router } from "./router.js";
-export { ClientMessageSchema, PortSchema } from "./schemas.js";
+export { ClientMessageSchema, PortSchema, EnvSchema } from "./schemas.js";
 
 export {
   ChatError,
@@ -65,6 +66,7 @@ export {
 
 export type { Result, SafeError } from "./errors.js";
 export type { ServerConfig } from "./config.js";
+export type { RuntimeSnapshot } from "./runtime.js";
 export type { Bus, ChatEvent, ServerEvents } from "./bus.js";
 export type { HttpRequest, HttpResponse, HttpOutcome } from "./http.js";
 export type { PathParams, RouteHandler, HttpMethod } from "./router.js";

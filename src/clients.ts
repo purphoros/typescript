@@ -18,6 +18,31 @@ import {
 } from "./protocol.js";
 import type { ChatClient, PeerKind, User } from "./types.js";
 
+// How many bytes may be waiting to go out to one client before we give up on it.
+//
+// This number exists because of a bug the server has had since Chapter 5.
+// `socket.write()` returns `false` when the kernel's send buffer is full - the
+// runtime telling you, plainly, that the client is not reading as fast as you are
+// writing. We have never once looked at that return value.
+//
+// Node does not drop the data. It queues it, in *our* process, forever. So one
+// laptop that suspends mid-conversation, in a busy room, is a memory leak with a
+// heartbeat: every broadcast appends to a buffer nobody is draining, and the
+// process grows until it dies. The client is fine. We are the casualty.
+//
+// A megabyte is roughly a thousand chat messages behind. A client that far behind
+// is not slow, it is gone, and the honest thing is to say so.
+const MAX_BACKLOG_BYTES = 1_000_000;
+
+// And how many bytes we will hold from a client before we have one complete
+// thing to act on.
+//
+// A chat message is capped at 1KB by the schema (Chapter 14). An HTTP head plus
+// a modest body is a few KB. 256KB is enormously generous for both - which is
+// the point: anything past it is not a large message, it is a client that has
+// stopped sending newlines, and we are the one paying for it.
+const MAX_INBOX_BYTES = 256 * 1024;
+
 // The identity and room bookkeeping every client needs, regardless of how it is
 // attached. The two transports differ only in how bytes leave and arrive.
 export abstract class BaseClient implements ChatClient {
@@ -33,6 +58,37 @@ export abstract class BaseClient implements ChatClient {
 
   abstract send(message: ServerMessage): void;
   abstract end(message: ServerMessage): void;
+
+  // Bytes written but not yet accepted by the far end. Each transport measures
+  // this differently; both of them can.
+  abstract get backlog(): number;
+
+  // Hang up, now, without trying to say anything first - there is already too
+  // much unsent.
+  protected abstract destroy(): void;
+
+  private dropped?: string;
+
+  // Called before every write. If the client is too far behind, we stop, because
+  // continuing means buffering their mail in our heap indefinitely.
+  protected accepts(): boolean {
+    if (this.dropped !== undefined) {
+      return false;
+    }
+    if (this.backlog > MAX_BACKLOG_BYTES) {
+      this.dropped = `not reading - ${Math.round(this.backlog / 1024)}KB unsent`;
+      this.markClosing();
+      this.destroy();
+      return false;
+    }
+    return true;
+  }
+
+  // Why this client was hung up on, if it was. The server reads this in its close
+  // handler, so a dropped slow client is a line in the log and not a mystery.
+  get dropReason(): string | undefined {
+    return this.dropped;
+  }
 
   get status(): ConnectionState {
     return this.state;
@@ -96,6 +152,10 @@ export class TcpClient extends BaseClient {
   readonly address: string;
 
   private peer: PeerKind = "unknown";
+
+  // Buffer is Node's type for raw bytes, and it lives *outside* the V8 heap -
+  // which is why an unbounded one shows up in `rss` while `heapUsed` looks
+  // perfectly calm. See MAX_INBOX_BYTES.
   private inbox: Buffer = Buffer.alloc(0);
 
   constructor(private readonly socket: net.Socket, sequence: number) {
@@ -117,8 +177,19 @@ export class TcpClient extends BaseClient {
     this.peer = peer;
   }
 
-  append(chunk: Buffer): void {
+  // Returns false when the client has sent more than we are willing to hold.
+  //
+  // The other bug of this chapter. `inbox` grew without limit: a client that
+  // opens a socket and sends 500MB with no newline in it was, until now, 500MB
+  // of Buffer in our process. We would dutifully hold all of it, waiting for a
+  // line ending that was never coming.
+  //
+  // The framing is what makes the bound possible. We only ever need enough bytes
+  // to hold one complete unit - one JSON line, or one HTTP head plus body - and
+  // anything past that is not a slow client, it is an attack or a bug.
+  append(chunk: Buffer): boolean {
     this.inbox = Buffer.concat([this.inbox, chunk]);
+    return this.inbox.length <= MAX_INBOX_BYTES;
   }
 
   // Drop the first `count` bytes - they have been dealt with.
@@ -139,14 +210,30 @@ export class TcpClient extends BaseClient {
     return lines;
   }
 
+  // Bytes handed to the kernel that the far end has not acknowledged. Node keeps
+  // the count for us; we have simply never asked.
+  get backlog(): number {
+    return this.socket.writableLength;
+  }
+
+  protected destroy(): void {
+    this.socket.destroy();
+  }
+
   // Newline-delimited JSON. The trailing \n is not decoration: it is the frame
   // marker the other end splits on.
   send(message: ServerMessage): void {
-    this.socket.write(`${encodeServerMessage(message)}\n`);
+    this.write(`${encodeServerMessage(message)}\n`);
   }
 
   // Raw write: HTTP builds its own bytes, headers and all.
+  //
+  // `socket.write()` returns false when the send buffer is full. We now believe
+  // it - see accepts() and MAX_BACKLOG_BYTES.
   write(raw: string): void {
+    if (!this.accepts()) {
+      return;
+    }
     this.socket.write(raw);
   }
 
@@ -175,11 +262,23 @@ export class WsClient extends BaseClient {
     super(`w${sequence}`, "ws", ConnectionState.Connected);
   }
 
+  // `ws` keeps the same count under a different name. Same disease, same cure.
+  get backlog(): number {
+    return this.ws.bufferedAmount;
+  }
+
+  protected destroy(): void {
+    // terminate(), not close(): close() is a polite handshake that a client
+    // which has stopped reading will never complete.
+    this.ws.terminate();
+  }
+
   // A client may be mid-disconnect: sending to a closing socket throws.
   send(message: ServerMessage): void {
-    if (this.ws.readyState === WebSocket.OPEN) {
-      this.ws.send(encodeServerMessage(message));
+    if (this.ws.readyState !== WebSocket.OPEN || !this.accepts()) {
+      return;
     }
+    this.ws.send(encodeServerMessage(message));
   }
 
   end(message: ServerMessage): void {

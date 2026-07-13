@@ -79,3 +79,28 @@ export const ClientMessageSchema = z.discriminatedUnion("type", [
 // which is the one place a coercion is honest - the value genuinely arrives as a
 // string and genuinely needs to be a number.
 export const PortSchema = z.coerce.number().int().min(1).max(65535);
+
+// The environment.
+//
+// `process.env` is `Record<string, string | undefined>` - every value a string,
+// every value possibly missing. It is untrusted input that happens to come from
+// a shell rather than a socket, and it deserves exactly the same treatment.
+//
+// Everything is optional: an unset variable is not an error, it is a default.
+// But a *set* one that is nonsense - PORT=banana, PORT=99999 - is an error, and
+// the server should say so at startup rather than binding to something surprising
+// and leaving you to find out later.
+export const EnvSchema = z.object({
+  HOST: z.string().min(1).optional(),
+  PORT: z.coerce.number().int().min(1).max(65535).optional(),
+  DATA_DIR: z.string().min(1).optional(),
+  HISTORY_LIMIT: z.coerce.number().int().positive().max(10_000).optional(),
+  // "general,random,dev" → ["general", "random", "dev"]. z.transform runs after
+  // validation, so what comes out is parsed, not merely checked.
+  ROOMS: z
+    .string()
+    .min(1)
+    .transform((value) => value.split(",").map((room) => room.trim()).filter(Boolean))
+    .pipe(z.array(z.string().regex(/^[a-z0-9-]+$/)).min(1))
+    .optional(),
+});

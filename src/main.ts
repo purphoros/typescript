@@ -7,11 +7,13 @@
 // waiting. It is a small thing that quietly justifies the whole `"type":
 // "module"` change.
 
-import { configure, DEFAULTS, resolvePort } from "./config.js";
+import { fromEnvironment } from "./config.js";
 import { describeThrown } from "./errors.js";
 import { ChatServer } from "./server.js";
 
-const config = configure(DEFAULTS, { port: resolvePort(process.argv[2]) });
+// argv beats env beats defaults. A bad value in the environment is fatal, on
+// purpose - see config.ts.
+const config = fromEnvironment(process.env, process.argv);
 const server = new ChatServer(config);
 
 // Read the archive back before accepting a single connection. A client that
@@ -35,20 +37,31 @@ process.on("unhandledRejection", (reason: unknown) => {
   process.exit(1);
 });
 
-// Ctrl-C. The handler is `async` and the exit waits for it: pending writes have
-// to reach the disk before the process is allowed to leave, or "durable" was a
-// word we were using loosely.
+// Two signals, one door.
 //
-// SIGINT can arrive twice - an impatient second Ctrl-C - and a second shutdown
-// while the first is draining would close an already-closing server. So the flag
-// is not defensive programming, it is the actual sequence of events on a bad day.
+// SIGINT is Ctrl-C: a person, at a terminal, watching. SIGTERM is what every
+// process supervisor in the world sends first - systemd, Docker, Kubernetes -
+// and then, after a grace period of about ten seconds, it sends SIGKILL, which
+// cannot be caught, handled, or negotiated with.
+//
+// A server that handles only SIGINT looks perfect on a laptop and loses data on
+// every single deploy: the container stops, SIGTERM arrives, nothing is
+// listening, the default action kills the process, and the writes still in the
+// queue simply never happen. Chapter 12 went to considerable trouble to flush
+// that queue, and handling only SIGINT would have been a way of doing all that
+// work for the one case that does not matter.
+//
+// The flag is not defensive programming. A second Ctrl-C from an impatient human
+// is an ordinary Tuesday, and closing an already-closing server is an error.
 let leaving = false;
-process.on("SIGINT", () => {
+
+const leave = (signal: NodeJS.Signals): void => {
   if (leaving) {
-    console.error("Still flushing. Press Ctrl-C once more to abandon the writes.");
+    console.error(`${signal} again - abandoning any writes still in the queue.`);
     process.exit(1);
   }
   leaving = true;
+  console.log(`${signal} received.`);
 
   void server
     .shutdown()
@@ -57,7 +70,10 @@ process.on("SIGINT", () => {
       console.error(`Shutdown failed: ${describeThrown(thrown)}`);
       process.exit(1);
     });
-});
+};
+
+process.on("SIGINT", () => leave("SIGINT"));
+process.on("SIGTERM", () => leave("SIGTERM"));
 
 server.listen(() => {
   for (const line of server.banner()) {

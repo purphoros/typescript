@@ -60,6 +60,10 @@ export interface ChatClient extends Identifiable {
   readonly status: ConnectionState;
   readonly user: User | undefined;
   readonly room: RoomName | undefined;
+  // Bytes written to this client that the far end has not taken yet. A number
+  // the runtime has always known and nobody ever asked for. See Chapter 15.
+  readonly backlog: number;
+  readonly dropReason: string | undefined;
   send(message: ServerMessage): void;
   end(message: ServerMessage): void;
   identifyAs(user: User): void;

@@ -16,14 +16,15 @@ import { IncomingMessage } from "node:http";
 import { WebSocketServer, WebSocket } from "ws";
 import { Serializer } from "./async.js";
 import { GREETING_DELAY_MS, address, type ServerConfig } from "./config.js";
-import { asError } from "./errors.js";
-import { assertNever, CATALOG } from "./protocol.js";
+import { asError, ErrorCode } from "./errors.js";
+import { assertNever, CATALOG, ConnectionState } from "./protocol.js";
 import { createBus, type Bus } from "./bus.js";
 import { FileHistory } from "./history.js";
 import { HttpService, HTTP_REQUEST_LINE } from "./http.js";
 import { MessageHandler } from "./handler.js";
 import { ChatMessage } from "./model.js";
 import { Registry } from "./state.js";
+import { Runtime } from "./runtime.js";
 import { TcpClient, WsClient } from "./clients.js";
 import type { PeerKind } from "./types.js";
 
@@ -31,6 +32,7 @@ export class ChatServer {
   readonly registry: Registry;
   readonly bus: Bus;
   readonly history: FileHistory;
+  readonly runtime = new Runtime();
 
   private readonly handler: MessageHandler;
   private readonly http: HttpService;
@@ -42,7 +44,7 @@ export class ChatServer {
     this.history = new FileHistory(config.dataDir);
     this.bus = createBus(this.registry, this.history);
     this.handler = new MessageHandler(this.registry, this.bus, this.history);
-    this.http = new HttpService(this.registry, this.bus, this.history);
+    this.http = new HttpService(this.registry, this.bus, this.history, this.runtime);
 
     // noServer: `ws` opens no port and does no listening. It only ever receives
     // sockets we have already accepted, parsed, and decided to upgrade.
@@ -118,6 +120,7 @@ export class ChatServer {
 
     await new Promise<void>((resolve) => this.server.close(() => resolve()));
     await this.history.flush();
+    this.runtime.stop();
     this.bus.emit("notice", "History flushed. Goodbye.");
   }
 
@@ -162,6 +165,10 @@ export class ChatServer {
 
     ws.on("close", () => {
       client.markClosed();
+      const dropped = client.dropReason;
+      if (dropped !== undefined) {
+        this.bus.emit("notice", `${client.label} dropped: ${dropped}`);
+      }
       this.handler.farewell(client);
     });
 
@@ -220,7 +227,25 @@ export class ChatServer {
     // Buffer first, synchronously - the bytes must be captured before anything
     // yields - then queue the work that may wait.
     const onData = (chunk: Buffer): void => {
-      conn.append(chunk);
+      // We may already have hung up on this client - and the socket will still
+      // deliver whatever was in flight when we did. Without this, a client that
+      // overran its buffer gets dropped once and *reported* every time another
+      // packet lands, which is how one bad client becomes fifty log lines.
+      if (conn.status === ConnectionState.Closing || conn.status === ConnectionState.Disconnected) {
+        return;
+      }
+
+      if (!conn.append(chunk)) {
+        // A quarter of a megabyte without a single newline. Whatever it is doing,
+        // it is not chatting, and we are the one holding the bytes.
+        this.bus.emit("notice", `${conn.id} dropped: sent 256KB with no complete message`);
+        conn.end({
+          type: "error",
+          code: ErrorCode.InvalidMessage,
+          message: "Message too large. One JSON object per line.",
+        });
+        return;
+      }
       void queue
         .run(() => this.process(conn, socket, greeting, detach))
         .catch((thrown: unknown) => this.bus.emit("failure", conn.id, asError(thrown)));
@@ -229,6 +254,13 @@ export class ChatServer {
     const onClose = (): void => {
       clearTimeout(greeting);
       conn.markClosed();
+      // If we hung up on them rather than the other way round, say why. A slow
+      // client that vanishes without explanation is how you spend an afternoon
+      // reading the wrong logs.
+      const dropped = conn.dropReason;
+      if (dropped !== undefined) {
+        this.bus.emit("notice", `${conn.label} dropped: ${dropped}`);
+      }
       if (conn.mode === "chat") {
         this.handler.farewell(conn);
       }
