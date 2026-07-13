@@ -1,217 +1,225 @@
-# Chapter 13 - Advanced Types
+# Chapter 14 - JSON & Validation
 
-Mapped types, conditional types, template literals, and `infer` - the type-level programming tools that power TypeScript's most sophisticated patterns.
+`JSON.parse` returns `any` - a type safety hole. Zod closes it with schemas that validate at runtime **and** generate TypeScript types at compile time.
 
-You have been using them since Chapter 9 without being told. This chapter names them, and then spends one route proving they earn their keep - and one dispatch table proving they sometimes cannot.
+Chapter 9 already refused the easy lie. It did not write `as ClientMessage`; it hand-checked every field of every variant and rebuilt the message from the parts it had proven. That was right, and it left a different problem behind - one this chapter finally deletes.
 
-## Mapped Types
-
-A mapped type transforms every property of an existing type. `{ [K in keyof T]: NewType }` iterates over the keys of `T` and produces a new type:
+## The JSON.parse Problem
 
 ```typescript
-// Make all properties optional (this is how Partial<T> works)
-type MyPartial<T> = {
-  [K in keyof T]?: T[K];
-};
+// DANGEROUS - no runtime validation
+const data = JSON.parse(raw) as ClientMessage;
+// If raw is {"type": 42}, data.type is a number.
+// TypeScript thinks it's a ClientMessage. It is not.
+```
 
-// Make all properties readonly (this is how Readonly<T> works)
-type MyReadonly<T> = {
-  readonly [K in keyof T]: T[K];
+> **Warning**
+>
+> `as Type` is a type **assertion**, not a type **check**. It tells the compiler "trust me" and does not look at the value. Never use it on data from a socket, a file, an API, or a user. Chapter 9 said this and it is worth saying twice, because it is the single most common way a "fully typed" codebase turns out to be lying.
+
+## The problem Chapter 9 left behind
+
+Here is the honest version we shipped instead - and the reason it could not stay:
+
+```typescript
+const DECODERS: DecoderMap = {
+  chat: (f) => (isString(f.text) ? { type: "chat", text: f.text } : null),
+  join: (f) => (isString(f.room) ? { type: "join", room: f.room } : null),
+  whisper: (f) =>
+    isString(f.to) && isString(f.text) ? { type: "whisper", to: f.to, text: f.text } : null,
+  // ...twelve of these
 };
 ```
 
-That is the whole mechanism, and you have already leaned on it twice. `CATALOG` in `protocol.ts` is a `Record<ClientMessageType, CommandInfo>` - a mapped type over the discriminants of a union - which is why forgetting to document a new message type is a compile error at the object literal rather than a gap in the help text. `DECODERS` is `{ [K in ClientMessageType]: Decoder<K> }`, which is the same trick with a twist: the *value* type depends on the key.
+And, separately, the type it was supposed to be checking:
+
+```typescript
+export type ClientMessage =
+  | { type: "chat"; text: string }
+  | { type: "join"; room: RoomName }
+  // ...twelve of these, again
+```
+
+**Two descriptions of the same thing.** Add a field to the type and the decoder still compiles. Add it to the decoder and the type still compiles. Neither knows the other exists. They agreed for five chapters because somebody remembered every single time - and "somebody remembered" is not a guarantee, it is a nice thing that has not stopped being true yet.
+
+There was a third gap too, and it was never in the type system at all: `text: string` says nothing whatsoever about a client sending ten megabytes of it.
+
+## Runtime Validation with Zod
+
+```bash
+npm install zod
+```
+
+```typescript
+import { z } from "zod";
+
+const UserSchema = z.object({
+  name: z.string().min(1).max(50),
+  age: z.number().int().positive(),
+});
+
+// Extract the TypeScript type FROM the schema
+type User = z.infer<typeof UserSchema>;
+// { name: string; age: number }
+
+// safeParse returns a discriminated union - no exceptions
+const result = UserSchema.safeParse(unknownData);
+if (result.success) {
+  result.data;          // User - validated, and a NEW object
+} else {
+  result.error.issues;  // what was wrong, and where
+}
+```
+
+> **Tip**
+>
+> `z.infer<typeof Schema>` is the whole chapter. The schema is written once; the runtime check and the compile-time type are both *derived from it*. They cannot disagree, because there is no longer a second thing to disagree with.
+>
+> And note `safeParse` returns a `{ success: true, data } | { success: false, error }` - a discriminated union, exactly like the `Result` from Chapter 10. Zod arrived at the same shape for the same reason.
+
+## The Protocol as a Schema
+
+```typescript
+const nickname = z.string().min(1).max(20).regex(/^[a-z0-9_-]+$/i, {
+  message: "must be 1-20 characters: letters, digits, _ or -",
+});
+
+const roomName = z.string().min(1).max(32).regex(/^[a-z0-9-]+$/, {
+  message: "must be lowercase letters, digits or hyphens",
+});
+
+// A megabyte of "a" is not a chat message, and `text: string`
+// was never going to be the thing that noticed.
+const chatText = z.string().min(1).max(1000);
+
+export const ClientMessageSchema = z.discriminatedUnion("type", [
+  message({ type: z.literal("chat"), text: chatText }),
+  message({ type: z.literal("whisper"), to: nickname, text: chatText }),
+  message({ type: z.literal("join"), room: roomName }),
+  // ...
+]);
+```
+
+And then, in `protocol.ts`, the twelve-arm hand-written union is replaced by one line:
+
+```typescript
+export type ClientMessage = z.infer<typeof ClientMessageSchema>;
+export type ClientMessageType = ClientMessage["type"];
+```
+
+It is still a real discriminated union. Everything built on it in Chapters 9-13 keeps working, untouched: the `switch` in `handleMessage` still narrows, `assertNever` still guards it, `Extract<ClientMessage, { type: "join" }>` still picks one variant, and `CATALOG` is still a `Record<ClientMessageType, CommandInfo>` that will not compile if you add a message and forget to document it.
+
+**124 lines came out of `protocol.ts`.** The decoder map, the `Fields` type, `isString`, `Decoder<K>`, `DecoderMap`, `KNOWN_TYPES`, and `validateNickname` are all gone, and nothing they did was lost.
 
 > **Note**
 >
-> This is how TypeScript's own utilities are built. `Partial<T>`, `Required<T>`, `Readonly<T>`, `Record<K, V>`, `Pick<T, K>` - all mapped types, none of them magic. You can read their definitions in `lib.es5.d.ts`, and they are each about three lines long.
+> `z.discriminatedUnion` is not just a union of objects. It reads the literal `type` on each member and builds a lookup - so an unknown discriminant fails **once**, immediately, naming the twelve it knows, rather than attempting all twelve schemas and reporting twelve separate failures about a message that was only ever going to be one of them. A plain `z.union` would do the latter, and the error would be unreadable.
 
-## Conditional Types and `infer`
+## Where the rules live now
+
+`validateNickname` used to be a regex in `protocol.ts`, called by the handler, three modules away from the type that described the field it constrained. Now the rule is *attached to the field*:
 
 ```typescript
-// T extends U ? X : Y - a ternary at the type level
-type IsString<T> = T extends string ? true : false;
-
-// `infer` is a capture: it names a type found inside a pattern
-type ElementOf<T> = T extends (infer E)[] ? E : never;
-
-type C = ElementOf<string[]>;   // string
-type D = ElementOf<boolean>;    // never (not an array)
-
-// This is how ReturnType<T> works
-type MyReturnType<T> = T extends (...args: never[]) => infer R ? R : never;
+message({ type: z.literal("nick"), name: nickname }),
 ```
 
-`infer R` says: *match this shape, and wherever `R` appears, remember what was actually there.* It is pattern matching, and like all pattern matching it either fits or it does not - the `: never` branch is what "does not fit" looks like.
-
-`never` in a union vanishes: `"a" | never` is just `"a"`. That is not a curiosity, it is the mechanism the next section runs on.
-
-## Template Literal Types
+Nothing can accept a nickname without also enforcing what a nickname is. That is the difference between a rule you apply and a rule that is true - and it is why the handler's `nick` case got shorter without getting weaker:
 
 ```typescript
-type HandlerName = `handle${Capitalize<"chat" | "join">}`;
-// "handleChat" | "handleJoin"
-
-type ApiRoute = `/api/${"rooms" | "status"}`;
-// "/api/rooms" | "/api/status"
-```
-
-Strings you can compute with. And, crucially, strings you can **take apart** - combine a template literal pattern with `infer` and you have a parser that runs in the type checker.
-
-## Applying It: A Router That Reads Its Own URLs
-
-Here is the code this chapter deletes. It is from `http.ts`, and it is the only route with a parameter in it:
-
-```typescript
-const named = /^\/api\/rooms\/([^/]+)$/.exec(req.path);
-if (named?.[1] !== undefined && req.method === "GET") {
-  const room = registry.requireRoomNamed(decodeURIComponent(named[1]));
+case "nick": {
+  // message.name is already a well-formed nickname. The schema said so before
+  // this function was called. What is left is the one question a schema cannot
+  // answer: is there a person by that name?
+  const user = registry.knownUsers.get(message.name);
+  if (user === undefined) {
+    throw new NotFoundError(`Unknown user "${message.name}". ...`, ErrorCode.UnknownUser);
+  }
   ...
 }
 ```
 
-Everything about `named[1]` is a promise the compiler cannot check. It is `string | undefined` regardless of what the regex actually contains. Add a second parameter, renumber the groups, mistype the index - the type system has nothing to say about any of it.
+## Keeping Chapter 10's line
 
-But the route pattern *already says* what its parameters are. `/api/rooms/:room` has one, and it is called `room`. So make the compiler read that sentence:
-
-```typescript
-// "/api/rooms/:room"  →  "" | "api" | "rooms" | ":room"
-type Segments<P extends string> = P extends `${infer Head}/${infer Tail}`
-  ? Head | Segments<Tail>
-  : P;
-
-// ":room" → "room";  "rooms" → never  (and never vanishes from the union)
-type ParamName<S extends string> = S extends `:${infer Name}` ? Name : never;
-
-// and the mapped type that turns the surviving names into an object
-export type PathParams<P extends string> = {
-  readonly [K in ParamName<Segments<P>>]: string;
-};
-```
-
-All three features, doing one job:
+A schema fails for two very different reasons, and collapsing them would throw away something Chapter 10 worked for. So `protocol.ts` reads Zod's issue codes and decides which happened:
 
 ```typescript
-PathParams<"/api/rooms/:room">                  // { readonly room: string }
-PathParams<"/api/rooms/:room/messages/:id">     // { readonly room: string; readonly id: string }
-PathParams<"/api/status">                       // {}
+const STRUCTURAL: ReadonlySet<string> = new Set([
+  "invalid_type",       // wrong primitive, or a field that is not there
+  "invalid_union",      // no variant matched - usually an unknown `type`
+  "invalid_value",
+  "invalid_key",
+  "unrecognized_keys",  // a field we have never heard of, e.g. "txet"
+]);
+
+const structural = error.issues.some((issue) => STRUCTURAL.has(issue.code));
+return structural ? new ProtocolError(message) : new ValidationError(message);
 ```
 
-The no-parameter case needed no special handling. A union of `never` *is* `never`, and mapping over `never` produces no keys. It falls out.
+| | means | code |
+|---|---|---|
+| **ProtocolError** | "I could not read you." The shape is wrong. | `invalid_message` |
+| **ValidationError** | "I read you, and no." The shape is right; the content is not. | `validation` |
 
-Now the route:
+That is not pedantry. One means the client's **code** is broken and a developer has to look at it. The other means the client's **user** typed something we will not take, and they can simply try again. Different audiences, different codes - which is the argument `ErrorCode` was invented for in the first place.
 
-```typescript
-.on("GET", "/api/rooms/:room", async (_req, params) => {
-  const room = registry.requireRoomNamed(params.room);
-  return json(200, { ...describeRoom(room), recent: await history.recent(room.name, 10) });
-})
-```
-
-`params.room` is a `string` because the *pattern* says so. And a typo is not a 3am `undefined`:
+Here is the whole matrix, run against the real decoder:
 
 ```
-error TS2551: Property 'rooom' does not exist on type
-  'PathParams<"/api/rooms/:room">'. Did you mean 'room'?
+  valid chat             OK               {"type":"chat","text":"hello"}
+  missing field          invalid_message  room: expected string, received undefined. Expected {"type":"join","room":"general"}
+  wrong type             invalid_message  text: expected string, received number. ...
+  unknown message type   invalid_message  type: Invalid discriminator value. Expected 'chat' | 'whisper' | 'join' | ...
+  typo'd key             invalid_message  text: expected string, received undefined; Unrecognized key: "txet". ...
+  not an object          invalid_message  Invalid input: expected object, received string.
+  empty text             validation       text: Too small: expected string to have >=1 characters. ...
+  text too long          validation       text: Too big: expected string to have <=1000 characters. ...
+  nick with a space      validation       name: must be 1-20 characters: letters, digits, _ or -. ...
+  UPPERCASE room         validation       room: must be lowercase letters, digits or hyphens. ...
+  negative limit         validation       limit: Too small: expected number to be >0. ...
 ```
 
-> **Tip**
->
-> `on<P extends string>(method, pattern: P, ...)` - the generic with no default is what makes TypeScript infer the *literal* `"/api/rooms/:room"` rather than widening it to `string`. Widen it and `PathParams<string>` is `{}`: the parameters silently vanish, everything still compiles, and the feature is gone. When a type-level trick "stops working for no reason", this is almost always why.
-
-### One assertion, and why it is honest
-
-Inside the router, the stored handler must accept `Record<string, string>` - the matcher is splitting a string that arrived over a socket, and it learns the keys as it goes. The handler demands `{ readonly room: string }`. Those do not line up, and I was surprised:
-
-```
-error TS2322: Type 'Record<string, string>' is missing the following
-  properties from type 'PathParams<"/api/rooms/:room">': room
-```
-
-Which is **correct**. An index signature says *if* a key is present its value is a string. It is not proof that `room` is present. TypeScript is refusing an unsound assignment, and it is right to.
-
-So `Router.on()` contains exactly one `as`, and it is safe for a reason you can state: **the same pattern string produces both sides.** `on()` computes the handler's parameter type from the literal; `match()` populates the params object from that same stored pattern, key for key. They cannot drift, because there is only one pattern and it is the source of both.
-
-That is the bargain a typed library makes. The unsafety is concentrated into one audited line *inside* the router, and every call site outside it is checked. The regex had the opposite arrangement: no assertion anywhere, and an unverified `named[1]` at every call site that touched it. **One assertion you can point at beats twenty you cannot.**
-
-## Where Mapped Types Cannot Help
-
-The chapter's own worked example is a handler map - dispatch the message to `handleChat`, `handleJoin`, and so on, each receiving its own narrowed variant. It is the obvious next move after the decoder map, and this server does not do it. Here is why, because the reason is the most useful thing in the chapter.
-
-Both maps look identical:
-
-```typescript
-// A - the decoder map, in protocol.ts today. Compiles.
-type Decoder<K extends ClientMessageType> = (f: Fields) => Extract<ClientMessage, { type: K }> | null;
-const DECODERS: { [K in ClientMessageType]: Decoder<K> } = { ... };
-
-// B - the handler map. Does not.
-type Handler<K extends ClientMessageType> = (msg: Extract<ClientMessage, { type: K }>) => void;
-const HANDLERS: { [K in ClientMessageType]: Handler<K> } = { ... };
-
-function dispatch(msg: ClientMessage) {
-  HANDLERS[msg.type](msg);
-}
-```
-
-```
-error TS2345: Argument of type 'ClientMessage' is not assignable to parameter of type 'never'.
-  The intersection '{ type: "chat"; ... } & { type: "join"; ... } & { type: "leave"; }'
-  was reduced to 'never' because property 'type' has conflicting types in some constituents.
-```
-
-Indexing with a *union* key gives a union of functions. To call it, TypeScript must find an argument acceptable to **all** of them - so it intersects the parameter types, and a chat message that is also a join message is nothing at all. `never`.
-
-The decoder map escapes this because **its parameter does not vary with the key.** Every decoder takes the same `Fields`; only the *return* changes. Returns are covariant, so widening on the way out is sound, and one honest annotation does it:
-
-```typescript
-const decode: (fields: Fields) => ClientMessage | null = DECODERS[type as ClientMessageType];
-```
-
-A handler's parameter *does* vary with the key, and parameters are contravariant. There is no sound widening. Every workaround is an assertion - and unlike the router's, this one buys nothing, because `handleMessage`'s `switch` is **already** exhaustive, already narrows correctly, and needs no `as` at all.
+Every error code from Chapter 10 still comes back, from a validator that is now a hundred lines shorter and cannot drift from its type.
 
 > **Warning**
 >
-> This is the trap of type-level programming: the tools are strong enough that you can force almost anything, and forcing it means asserting it. The question is never "can I express this in the type system?" It is "does expressing it this way remove more lies than it adds?" For the router: yes, decisively. For the dispatch table: no. So the `switch` stays, and `assertNever` keeps guarding it.
->
-> (The underlying limitation is real and long-standing - correlated union types, TypeScript issue #30581. You are not missing a trick.)
+> `.strict()` rejects unknown keys rather than silently dropping them, so `{"type":"chat","txet":"hi"}` names `txet` instead of quietly becoming a chat message with no text. That is a real trade, and worth making on purpose. The permissive rule - *ignore what you do not recognise* - is what lets a protocol evolve: an old server survives a new client sending a field it has never heard of. We give that up, and we can afford to, because **this server serves its own client** - `page.ts` is delivered over HTTP from the same port. They ship together and cannot skew. A protocol with clients you do not control should think much harder before choosing this.
+
+## Manual vs Zod
+
+| Approach | Pros | Cons |
+|---|---|---|
+| `as Type` | Zero code | No validation. Lies to the compiler. |
+| Manual checks | No dependency; explicit | Type and check are two things that must be kept in step by hand |
+| **Zod** | Schema **is** the type; constraints the type cannot express; errors with paths | A dependency; and a schema you can no longer read at a glance |
+
+The middle row is what we had, and it was not *wrong* - it was correct for five chapters. It was simply carrying an obligation that a schema does not have.
 
 ## Putting It Together
 
-The whole chapter earns one thing: a router that reads its own URL patterns. `src/router.ts` on the `chapter13` branch has the runtime matcher too; here is the type-level half.
+`src/schemas.ts` is new: the protocol as a schema. `src/protocol.ts` on the `chapter14` branch infers `ClientMessage` from it and decodes with `safeParse`.
 
-A type-level parser: `Segments` splits the path, `ParamName` keeps only the `:name` parts, and `PathParams` maps them to an object - all in the type checker:
+The protocol described once, as a Zod discriminated union. `z.infer` turns this into the `ClientMessage` type, and `safeParse` validates against it - one source of truth for both:
 
 ```typescript
-type Segments<P extends string> = P extends `${infer Head}/${infer Tail}`
-  ? Head | Segments<Tail>
-  : P;
-
-// A segment beginning with ":" is a parameter, and its name is the rest.
-// Everything else contributes `never`, which vanishes from a union - so the
-// literal segments simply fall away and only the names survive.
-//
-//   ParamName<":room">  =  "room"
-//   ParamName<"rooms">  =  never
-type ParamName<S extends string> = S extends `:${infer Name}` ? Name : never;
-
-// And the mapped type that turns those names into an object.
-//
-//   PathParams<"/api/rooms/:room">           =  { readonly room: string }
-//   PathParams<"/api/rooms/:room/msg/:id">   =  { readonly room: string; readonly id: string }
-//   PathParams<"/api/status">                =  {}
-//
-// A route with no parameters gets `{}`, because a union of `never` is `never`
-// and mapping over `never` produces no keys at all. Nothing had to special-case
-// it; it falls out.
-export type PathParams<P extends string> = {
-  readonly [K in ParamName<Segments<P>>]: string;
-};
+export const ClientMessageSchema = z.discriminatedUnion("type", [
+  message({ type: z.literal("chat"), text: chatText }),
+  message({ type: z.literal("whisper"), to: nickname, text: chatText }),
+  message({ type: z.literal("join"), room: roomName }),
+  message({ type: z.literal("leave") }),
+  message({ type: z.literal("nick"), name: nickname }),
+  message({ type: z.literal("who") }),
+  message({ type: z.literal("rooms") }),
+  message({ type: z.literal("history"), limit: z.number().int().positive().max(500).optional() }),
+  message({ type: z.literal("kick"), target: nickname, reason: z.string().min(1).max(200) }),
+  message({ type: z.literal("status") }),
+  message({ type: z.literal("help") }),
+  message({ type: z.literal("quit") }),
+]);
 ```
 
 > **Tip**
 >
-> The complete, runnable file is `src/router.ts` on the `chapter13` branch. You are not meant to paste it wholesale - build your own as you follow along, and use the reference to check yourself.
+> The complete, runnable file is `src/schemas.ts` on the `chapter14` branch. You are not meant to paste it wholesale - build your own as you follow along, and use the reference to check yourself.
 
 ## Try It
 
@@ -219,42 +227,46 @@ export type PathParams<P extends string> = {
 npm run build && npm start
 ```
 
-```bash
-curl -i http://127.0.0.1:8080/api/rooms/general    # 200 - params.room = "general"
-curl -i http://127.0.0.1:8080/api/rooms/nowhere    # 404 - the room, not the route
-curl -i "http://127.0.0.1:8080/api/rooms/a%20b"    # decoded once, in the router
-curl -i -X GET http://127.0.0.1:8080/api/echo      # 405, Allow: POST
-curl -i http://127.0.0.1:8080/api/nonsense         # 404
+The old errors, unchanged:
+
+```json
+{"type":"jion","room":"general"}
+{"type":"join"}
+```
+```json
+{"type":"error","code":"invalid_message","message":"type: Invalid discriminator value. Expected 'chat' | 'whisper' | 'join' | 'leave' | 'nick' | 'who' | 'rooms' | 'history' | 'kick' | 'status' | 'help' | 'quit'."}
+{"type":"error","code":"invalid_message","message":"room: Invalid input: expected string, received undefined. Expected {\"type\":\"join\",\"room\":\"general\"}"}
 ```
 
-That 405 is new, and nobody wrote it. The old code had a hand-rolled `if (req.method !== "POST") return json(405, ...)` inside the `/api/echo` branch - and nowhere else, because it was a rule living in a branch instead of in the structure. `methodsFor(path)` asks the table which verbs *would* have matched, and the difference between "no such path" and "no such verb on this path" stops being something you remember and starts being something you get.
+And the new ones - the constraints that were never expressible as types:
 
-Then break it on purpose, which is the only way to feel the point:
-
-```typescript
-.on("GET", "/api/rooms/:room", async (_req, params) => {
-  const room = registry.requireRoomNamed(params.rooom);   // one letter
+```json
+{"type":"chat","text":"<five thousand characters>"}
+{"type":"join","room":"General"}
+{"type":"chat","txet":"typo"}
+```
+```json
+{"type":"error","code":"validation","message":"text: Too big: expected string to have <=1000 characters. ..."}
+{"type":"error","code":"validation","message":"room: must be lowercase letters, digits or hyphens. ..."}
+{"type":"error","code":"invalid_message","message":"text: expected string, received undefined; Unrecognized key: \"txet\". ..."}
 ```
 
-```
-error TS2551: Property 'rooom' does not exist on type 'PathParams<"/api/rooms/:room">'.
-  Did you mean 'room'?
-```
+That last one is worth pausing on. Before this chapter, `{"type":"chat","txet":"typo"}` failed with `malformed "chat" message` - true, and useless. Now it names the key you fat-fingered.
 
 ## Exercise
 
-1. Add `.on("GET", "/api/rooms/:room/messages/:id", ...)`. You get `params.room` and `params.id` and you write no parsing code. Now ask for `params.messageId` and read the error.
-2. Change `on<P extends string>` to `on(method: HttpMethod, pattern: string, ...)`. Everything still compiles, and every `params.room` is now an error - or worse, `{}` silently. Explain what `P` was doing.
-3. Write `type Reverse<S extends string>` that reverses a string type using template literals and `infer`. Then stop and ask what it is for. (This is the exercise that teaches restraint.)
-4. Try to build the `HANDLERS` dispatch map from the section above. Get the `never` error. Now make it compile with an `as`, and write down what you have promised the compiler and who checks it.
-5. `PathParams<"/api/rooms/:room">` gives `{ readonly room: string }`. Every param is a `string`. Design (do not necessarily build) a `:id{number}` syntax where the parameter type is inferred as `number`. What has to change, and what would you have to validate at runtime that the types cannot?
+1. Add a `"topic"` message: `{ type: "topic", room, text }`, where the topic is at most 120 characters. Add it to `ClientMessageSchema` and run `npm run typecheck`. Count how many places the compiler sends you - and notice that the *validator* was not one of them.
+2. Delete `.strict()` from the `message()` helper. Send `{"type":"chat","text":"hi","admin":true}`. What happens, and what would have to be true of your clients for that to be the behaviour you want?
+3. Zod's regex message for a bad nickname is ours (`must be 1-20 characters...`); the message for a too-long one is Zod's (`Too big: expected string...`). Give `.max(20)` a custom message too. Which reads better to somebody who is not a programmer?
+4. Move the `STRUCTURAL` set into `errors.ts` and write a test for it: for each of the twelve error cases in this chapter, assert the code that comes back. This is the test that stops a Zod upgrade from silently reclassifying your errors.
+5. `z.coerce.number()` is used for the port, and coercion is usually a bad idea. Why is it defensible *there* and not for, say, `{"type":"history","limit":"10"}`?
 
 ## What's Next
 
-The compiler now reads route patterns. It reads message unions. It reads event maps. In each case the type is derived from one source of truth, and drift is a build error rather than a bug report.
+The protocol is described once. The type, the validator, the size limits, the naming rules and the error messages all come from that one description, and there is nothing left to keep in step by hand.
 
-But there is a hole in the middle of all of it, and Chapter 9 admitted to it at the time. `decodeClientMessage` hand-checks every field of every variant - `isString(f.text)`, `isString(f.room)` - one line per property, written by a human, kept in step with `ClientMessage` by nothing but diligence. The types and the validator agree today because someone made sure. Next: **JSON and validation**, where a schema becomes the single source of both.
+The server is now, in a real sense, finished as a *program*: it has a protocol, a boundary, persistence, modules, and a router. What it does not have is a clear-eyed account of the machine it runs on. Next: **the Node.js runtime** - the event loop, `EventEmitter`, Buffers, and process lifecycle. Much of it this server has been quietly relying on since Chapter 5, and it is time to say out loud what has actually been happening.
 
 ---
 
-Source: <https://purphoros.com/howto/typescript/advanced-types>
+Source: <https://purphoros.com/howto/typescript/json-validation>
