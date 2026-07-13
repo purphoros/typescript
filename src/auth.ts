@@ -14,7 +14,9 @@
 import { randomBytes, scrypt, timingSafeEqual } from "node:crypto";
 import { promisify } from "node:util";
 import { issue, verify, type JwtPayload } from "./jwt.js";
+import { timed, type Measured } from "./decorators.js";
 import { AuthError, ErrorCode, type ChatError, type Result } from "./errors.js";
+import type { Metrics } from "./runtime.js";
 import type { ClientId, User, AdminUser } from "./types.js";
 
 const scryptAsync = promisify(scrypt) as (
@@ -70,8 +72,10 @@ export interface Account {
   readonly passwordHash: string;
 }
 
-export class Accounts {
+export class Accounts implements Measured {
   private readonly byName = new Map<string, Account>();
+
+  constructor(readonly metrics: Metrics) {}
 
   // Seeding hashes takes real time - that is the whole point of scrypt - so it
   // happens once, at startup, and not on the first login while somebody waits.
@@ -106,6 +110,10 @@ export class Accounts {
   // server that distinguishes them is a free tool for enumerating who has an
   // account here - and knowing that alice exists is the first half of attacking
   // alice. The log may know the difference. The stranger at the door may not.
+  // The slowest thing this server does on purpose. Worth watching: if
+  // `accounts.login.meanMs` ever drops to near zero, somebody has "optimised" the
+  // password hash and the passwords are no longer safe.
+  @timed("accounts")
   async login(name: string, password: string): Promise<Result<Account, ChatError>> {
     const account = this.byName.get(name);
 

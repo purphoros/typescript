@@ -27,20 +27,28 @@
 import { appendFile, mkdir, readFile } from "node:fs/promises";
 import path from "node:path";
 import { Serializer, withTimeout } from "./async.js";
+import { timed, type Measured } from "./decorators.js";
 import { asError } from "./errors.js";
+import type { Metrics } from "./runtime.js";
 import type { MessageSummary, RoomName } from "./protocol.js";
 
 // A disk that has not answered in two seconds is a disk that has a problem, and
 // waiting longer will not fix it.
 const WRITE_TIMEOUT_MS = 2000;
 
-export class FileHistory {
+export class FileHistory implements Measured {
   // One queue per room, not one for the whole server. Writes to `general` must
   // not queue behind writes to `dev` - they are independent files, and making
   // them wait on each other would be inventing a bottleneck.
   private readonly queues = new Map<RoomName, Serializer>();
 
-  constructor(private readonly dir: string) {}
+  // `metrics` is public because @timed reads it off `this` - see Measured. The
+  // decorator runs at class-definition time and cannot be handed a dependency, so
+  // the instance carries it.
+  constructor(
+    private readonly dir: string,
+    readonly metrics: Metrics,
+  ) {}
 
   private file(room: RoomName): string {
     // A room name off the wire must never become `../../etc/passwd`. Rooms are
@@ -76,6 +84,7 @@ export class FileHistory {
   // The timeout is why a wedged disk cannot stop the chat. The write still keeps
   // trying - a Promise cannot be un-started - but we stop waiting, the queue
   // moves on, and someone gets told.
+  @timed("history")
   append(message: MessageSummary): Promise<void> {
     const line = `${JSON.stringify(message)}\n`;
     return this.queue(message.room).run(() =>
@@ -88,6 +97,7 @@ export class FileHistory {
   // A missing file is not an error - it is a room nobody has said anything in
   // yet. That distinction has to be made here, because to `readFile` they look
   // identical until you check the code.
+  @timed("history")
   async read(room: RoomName): Promise<MessageSummary[]> {
     let raw: string;
     try {

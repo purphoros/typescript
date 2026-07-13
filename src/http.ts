@@ -11,7 +11,7 @@ import { COMMANDS, type MessageSummary } from "./protocol.js";
 import { chatPage } from "./page.js";
 import { describeRoom, summarize } from "./views.js";
 import type { FileHistory } from "./history.js";
-import type { Runtime } from "./runtime.js";
+import type { Metrics, Runtime } from "./runtime.js";
 import type { Registry } from "./state.js";
 import { Router } from "./router.js";
 import type { TcpClient } from "./clients.js";
@@ -119,6 +119,7 @@ export class HttpService {
     private readonly bus: Bus,
     private readonly history: FileHistory,
     private readonly runtime: Runtime,
+    private readonly metrics: Metrics,
   ) {
     this.router = this.buildRoutes();
   }
@@ -135,7 +136,7 @@ export class HttpService {
   // These handlers may throw, and do: requireRoomNamed raises the very same
   // NotFoundError the chat side raises. The boundary below turns it into a 404.
   private buildRoutes(): Router {
-    const { registry, history, runtime } = this;
+    const { registry, history, runtime, metrics } = this;
 
     return new Router()
       .on("GET", "/", () => html(200, chatPage(registry.clients.size, registry.rooms.size)))
@@ -161,6 +162,9 @@ export class HttpService {
           // The one number that says whether we are leaking a slow client's
           // unsent mail into our own heap. See MAX_BACKLOG_BYTES in clients.ts.
           backlogBytes: [...registry.clients.values()].reduce((sum, c) => sum + c.backlog, 0),
+          // Gathered by @timed. Chapter 15 could tell you the loop was blocked;
+          // this tells you by what.
+          operations: metrics.snapshot(),
         });
       })
 

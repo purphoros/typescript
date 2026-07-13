@@ -6,6 +6,48 @@
 
 import { performance } from "node:perf_hooks";
 
+// What one kind of operation has cost us.
+export interface OperationStats {
+  readonly count: number;
+  readonly failures: number;
+  readonly meanMs: number;
+  readonly maxMs: number;
+}
+
+// Per-operation timings, gathered by the @timed decorator in decorators.ts.
+//
+// Chapter 15 could tell you the event loop was blocked. It could not tell you
+// *what* was blocking it. A mean and a max per operation is the difference
+// between "the server is slow" and "scrypt is slow, which is its job, and the
+// disk is slow, which is not".
+export class Metrics {
+  private readonly ops = new Map<string, { count: number; failures: number; totalMs: number; maxMs: number }>();
+
+  record(operation: string, ms: number, ok: boolean): void {
+    const stat = this.ops.get(operation) ?? { count: 0, failures: 0, totalMs: 0, maxMs: 0 };
+    stat.count += 1;
+    stat.totalMs += ms;
+    stat.maxMs = Math.max(stat.maxMs, ms);
+    if (!ok) {
+      stat.failures += 1;
+    }
+    this.ops.set(operation, stat);
+  }
+
+  snapshot(): Record<string, OperationStats> {
+    const out: Record<string, OperationStats> = {};
+    for (const [name, s] of this.ops) {
+      out[name] = {
+        count: s.count,
+        failures: s.failures,
+        meanMs: Math.round((s.totalMs / s.count) * 100) / 100,
+        maxMs: Math.round(s.maxMs * 100) / 100,
+      };
+    }
+    return out;
+  }
+}
+
 export interface RuntimeSnapshot {
   readonly pid: number;
   readonly node: string;

@@ -25,7 +25,7 @@ import { MessageHandler } from "./handler.js";
 import { ChatMessage } from "./model.js";
 import { Accounts, Sessions } from "./auth.js";
 import { Registry } from "./state.js";
-import { Runtime } from "./runtime.js";
+import { Metrics, Runtime } from "./runtime.js";
 import { TcpClient, WsClient } from "./clients.js";
 import type { PeerKind } from "./types.js";
 
@@ -35,10 +35,11 @@ export class ChatServer {
   readonly history: FileHistory;
   readonly runtime = new Runtime();
   readonly sessions = new Sessions();
+  readonly metrics = new Metrics();
 
   // Populated in load(), because hashing passwords is deliberately slow and a
   // constructor cannot await. See Accounts.seedDefaults.
-  readonly accounts = new Accounts();
+  readonly accounts = new Accounts(this.metrics);
   private readonly handler: MessageHandler;
   private readonly http: HttpService;
   private readonly wss: WebSocketServer;
@@ -46,7 +47,7 @@ export class ChatServer {
 
   constructor(readonly config: ServerConfig) {
     this.registry = new Registry(config);
-    this.history = new FileHistory(config.dataDir);
+    this.history = new FileHistory(config.dataDir, this.metrics);
     this.bus = createBus(this.registry, this.history);
     this.handler = new MessageHandler(
       this.registry,
@@ -56,7 +57,7 @@ export class ChatServer {
       this.sessions,
       config,
     );
-    this.http = new HttpService(this.registry, this.bus, this.history, this.runtime);
+    this.http = new HttpService(this.registry, this.bus, this.history, this.runtime, this.metrics);
 
     // noServer: `ws` opens no port and does no listening. It only ever receives
     // sockets we have already accepted, parsed, and decided to upgrade.
