@@ -45,7 +45,7 @@ Key concepts:
 
 ## The Event-Driven Model
 
-Node.js doesn't use threads for concurrency (like Rust's thread pool in Chapter 12). Instead, it uses an **event loop** - a single thread that listens for events and calls your callbacks when they fire.
+Node.js doesn't spawn a thread per connection. Instead, it uses an **event loop** - a single thread that waits for events and calls your callbacks when they fire. Your code never blocks waiting for a socket; you register a callback and the loop invokes it once the data has actually arrived.
 
 The `socket.on(event, callback)` pattern registers listeners for different events:
 
@@ -63,7 +63,7 @@ Fires on errors (connection reset, timeout, etc.). Always handle this - unhandle
 
 > **Note**
 >
-> Unlike Rust's Tokio (which multiplexes async tasks on a thread pool), Node.js runs *everything* on one thread. The event loop handles I/O without blocking - while waiting for one client's data, it processes other clients' events. This is why Node.js is great for I/O-heavy workloads (like chat servers) but not for CPU-heavy work.
+> Your JavaScript runs on *one* thread. The event loop handles I/O without blocking it - while one client's data is still in flight, the loop is free to process another client's events, so a thousand idle connections cost almost nothing. The catch is the flip side: because there is only one thread, any callback that does heavy CPU work holds the loop and stalls *every* other client until it returns. Node.js is superb for I/O-heavy workloads like chat servers, and a poor fit for CPU-heavy ones.
 
 ## Reading Data and Writing Responses
 
@@ -86,7 +86,7 @@ socket.on("data", (data: Buffer) => {
 
 Key details:
 
-- `data` is a `Buffer` - Node.js's type for binary data. Like Rust's `&[u8]`.
+- `data` is a `Buffer` - Node.js's type for raw binary data, a fixed-length sequence of bytes. It is not a string until you decode it.
 - `.toString()` converts bytes to a UTF-8 string.
 - `.trim()` removes whitespace and newlines from the ends (clients send `\r\n` or `\n` after each line).
 - `socket.end()` gracefully closes the connection - sends remaining data then closes.
