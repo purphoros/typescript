@@ -141,6 +141,7 @@ export type ServerMessage =
   | { type: "userList"; users: readonly UserSummary[] }
   | { type: "roomList"; rooms: readonly RoomSummary[] }
   | { type: "history"; room: RoomName; messages: readonly MessageSummary[] }
+  | { type: "results"; room: RoomName; query: string; messages: readonly MessageSummary[] }
   | { type: "commands"; commands: readonly CommandInfo[] }
   | { type: "kicked"; by: UserId; reason: string }
   | { type: "error"; code: ErrorCode; message: string };
@@ -225,6 +226,11 @@ export const CATALOG: Record<ClientMessageType, CommandInfo> = {
     type: "rooms",
     example: '{"type":"rooms"}',
     description: "List the rooms and how busy they are",
+  },
+  search: {
+    type: "search",
+    example: '{"type":"search","query":"deploy"}',
+    description: "Search this room's history",
   },
   history: {
     type: "history",

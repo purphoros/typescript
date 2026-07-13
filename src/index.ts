@@ -26,6 +26,8 @@ export { MessageHandler } from "./handler.js";
 export { HttpService } from "./http.js";
 export { ChatRoom, ChatMessage } from "./model.js";
 export { FileHistory } from "./history.js";
+export { SqliteStorage } from "./sqlite.js";
+export { MemoryAccounts } from "./store.js";
 export { Serializer, withTimeout, delay } from "./async.js";
 export { BaseClient, TcpClient, WsClient } from "./clients.js";
 export { TypedEmitter, RingBuffer, pluck } from "./events.js";
@@ -73,7 +75,8 @@ export {
 } from "./protocol.js";
 
 export type { Result, SafeError } from "./errors.js";
-export type { Account, Session } from "./auth.js";
+export type { Session } from "./auth.js";
+export type { Account, MessageStore, AccountStore, Storage } from "./store.js";
 export type { JwtPayload } from "./jwt.js";
 export type { Middleware } from "./middleware.js";
 export type { ServerConfig } from "./config.js";

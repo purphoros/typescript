@@ -10,7 +10,7 @@ import { statusLine, type Bus } from "./bus.js";
 import { COMMANDS, type MessageSummary } from "./protocol.js";
 import { chatPage } from "./page.js";
 import { describeRoom, summarize } from "./views.js";
-import type { FileHistory } from "./history.js";
+import type { MessageStore } from "./store.js";
 import type { Metrics, Runtime } from "./runtime.js";
 import type { Registry } from "./state.js";
 import { Router } from "./router.js";
@@ -117,7 +117,7 @@ export class HttpService {
   constructor(
     private readonly registry: Registry,
     private readonly bus: Bus,
-    private readonly history: FileHistory,
+    private readonly messages: MessageStore,
     private readonly runtime: Runtime,
     private readonly metrics: Metrics,
   ) {
@@ -136,7 +136,7 @@ export class HttpService {
   // These handlers may throw, and do: requireRoomNamed raises the very same
   // NotFoundError the chat side raises. The boundary below turns it into a 404.
   private buildRoutes(): Router {
-    const { registry, history, runtime, metrics } = this;
+    const { registry, messages: store, runtime, metrics } = this;
 
     return new Router()
       .on("GET", "/", () => html(200, chatPage(registry.clients.size, registry.rooms.size)))
@@ -184,7 +184,7 @@ export class HttpService {
       // compiling, which is exactly what should happen.
       .on("GET", "/api/rooms/:room", async (_req, params) => {
         const room = registry.requireRoomNamed(params.room);
-        return json(200, { ...describeRoom(room), recent: await history.recent(room.name, 10) });
+        return json(200, { ...describeRoom(room), recent: await store.recent(room.name, 10) });
       })
 
       // Every room's archive, read concurrently.
@@ -197,7 +197,7 @@ export class HttpService {
       // a smaller success, it is a wrong answer delivered confidently.
       .on("GET", "/api/history", async () => {
         const perRoom = await Promise.all(
-          [...registry.rooms.keys()].map((room) => history.recent(room, 10)),
+          [...registry.rooms.keys()].map((room) => store.recent(room, 10)),
         );
         const recent: MessageSummary[] = perRoom.flat();
         return json(200, recent);

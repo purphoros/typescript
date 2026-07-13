@@ -31,12 +31,16 @@ import { timed, type Measured } from "./decorators.js";
 import { asError } from "./errors.js";
 import type { Metrics } from "./runtime.js";
 import type { MessageSummary, RoomName } from "./protocol.js";
+import type { MessageStore } from "./store.js";
 
 // A disk that has not answered in two seconds is a disk that has a problem, and
 // waiting longer will not fix it.
 const WRITE_TIMEOUT_MS = 2000;
 
-export class FileHistory implements Measured {
+// FileHistory is still here, and that is the point of a port: it now *implements*
+// MessageStore, so it is one of two answers rather than the only one. Chapter 25
+// runs the tests against both, and neither knows the difference.
+export class FileHistory implements MessageStore, Measured {
   // One queue per room, not one for the whole server. Writes to `general` must
   // not queue behind writes to `dev` - they are independent files, and making
   // them wait on each other would be inventing a bottleneck.
@@ -128,9 +132,27 @@ export class FileHistory implements Measured {
   }
 
   // The last `limit` messages in a room.
+  //
+  // Read the whole file, parse every line, throw away all but the last ten. It is
+  // instant with a few thousand messages and it is O(everything) - which is the
+  // sentence Chapter 21 exists to say out loud. The SQLite implementation reads
+  // ten rows off the end of an index and stops.
   async recent(room: RoomName, limit: number): Promise<MessageSummary[]> {
     const all = await this.read(room);
     return all.slice(-limit);
+  }
+
+  // And this is where it stops being a difference of degree. A JSONL file has no
+  // way to find text except to look at all of it - there is no index, and there is
+  // nowhere to put one.
+  async search(room: RoomName, query: string, limit: number): Promise<MessageSummary[]> {
+    const needle = query.toLowerCase();
+    const all = await this.read(room);
+    return all.filter((m) => m.text.toLowerCase().includes(needle)).slice(-limit);
+  }
+
+  async close(): Promise<void> {
+    await this.flush();
   }
 
   // Everything written so far is actually on disk.

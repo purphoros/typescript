@@ -11,7 +11,7 @@ import { asError, describeThrown } from "./errors.js";
 import type { Fields, Logger } from "./logger.js";
 import { assertNever, type RoomName, type ServerMessage, type Timestamp, type UserId } from "./protocol.js";
 import { summarize } from "./views.js";
-import type { FileHistory } from "./history.js";
+import type { MessageStore } from "./store.js";
 import type { ChatMessage } from "./model.js";
 import type { Registry } from "./state.js";
 import type { ChatClient } from "./types.js";
@@ -97,7 +97,7 @@ export function statusLine(code: number): string {
 // Build a bus and subscribe everything that cares. The registry and the history
 // are parameters rather than imports, which is what lets Chapter 19 build a bus
 // over a throwaway registry and assert on what it broadcast.
-export function createBus(registry: Registry, history: FileHistory, logger: Logger): Bus {
+export function createBus(registry: Registry, messages: MessageStore, logger: Logger): Bus {
   const bus: Bus = new TypedEmitter<ServerEvents>();
 
   // Listener 1: the log.
@@ -178,7 +178,7 @@ export function createBus(registry: Registry, history: FileHistory, logger: Logg
   // delivered whether or not it was archived - but it is only legitimate when
   // the forgetting is *explicit*.
   bus.on("message", (message) => {
-    void history
+    void messages
       .append(summarize(message))
       .catch((thrown: unknown) => bus.emit("failure", `archive ${message.room}`, asError(thrown)));
   });

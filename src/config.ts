@@ -22,6 +22,10 @@ export type ServerConfig = Readonly<{
   tokenTtlSeconds: number;
   logLevel: LogLevel;
   logFormat: LogFormat;
+  // Two answers, neither wrong. See store.ts.
+  //   "sqlite" - an index, real search, O(log n) reads
+  //   "file"   - an append-only JSONL log you can read with `cat`
+  storage: "sqlite" | "file";
 }>;
 
 // `as const` gives every field its literal type and makes the object readonly:
@@ -42,6 +46,7 @@ export const DEFAULTS = {
   tokenTtlSeconds: 60 * 60 * 24,   // 24 hours
   logLevel: "info",
   logFormat: "pretty",
+  storage: "sqlite",
 } as const;
 
 // A client that connects and says nothing is assumed to be a human at a
@@ -128,6 +133,7 @@ export function resolveConfig(env: NodeJS.ProcessEnv, cli: CliOptions): ServerCo
     ...(e.TOKEN_TTL_SECONDS !== undefined ? { tokenTtlSeconds: e.TOKEN_TTL_SECONDS } : {}),
     ...(e.LOG_LEVEL !== undefined ? { logLevel: e.LOG_LEVEL } : {}),
     ...(e.LOG_FORMAT !== undefined ? { logFormat: e.LOG_FORMAT } : {}),
+    ...(e.STORAGE !== undefined ? { storage: e.STORAGE } : {}),
 
     // Command line last, so it beats everything. You typed it thirty seconds ago;
     // the environment was set by a deploy last March. Specific beats general, and
@@ -139,6 +145,7 @@ export function resolveConfig(env: NodeJS.ProcessEnv, cli: CliOptions): ServerCo
     ...(cli.dataDir !== undefined ? { dataDir: cli.dataDir } : {}),
     ...(cli.logLevel !== undefined ? { logLevel: cli.logLevel } : {}),
     ...(cli.logFormat !== undefined ? { logFormat: cli.logFormat } : {}),
+    ...(cli.storage !== undefined ? { storage: cli.storage } : {}),
   });
 }
 

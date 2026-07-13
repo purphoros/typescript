@@ -27,7 +27,7 @@ import { ChatMessage, type ChatRoom } from "./model.js";
 import { isAdmin, type ChatClient } from "./types.js";
 import { describeClient, describeRoom, summarize } from "./views.js";
 import type { Bus } from "./bus.js";
-import type { FileHistory } from "./history.js";
+import type { MessageStore } from "./store.js";
 import type { Registry } from "./state.js";
 
 function formatDuration(ms: number): string {
@@ -52,7 +52,7 @@ export class MessageHandler {
   constructor(
     private readonly registry: Registry,
     private readonly bus: Bus,
-    private readonly history: FileHistory,
+    private readonly messages: MessageStore,
     private readonly accounts: Accounts,
     private readonly sessions: Sessions,
     private readonly config: ServerConfig,
@@ -194,8 +194,18 @@ export class MessageHandler {
         // about the error path had to be rebuilt for async.
         const room = registry.requireRoom(client);
         const limit = message.limit ?? room.messageCount;
-        const messages = await this.history.recent(room.name, limit);
+        const messages = await this.messages.recent(room.name, limit);
         client.send({ type: "history", room: room.name, messages });
+        return;
+      }
+
+      case "search": {
+        // The query is free text a stranger typed, and it is about to be part of a
+        // database query. It goes down as a *bound parameter* - see sqlite.ts -
+        // which means it can never become syntax, no matter what is in it.
+        const room = registry.requireRoom(client);
+        const messages = await this.messages.search(room.name, message.query, 20);
+        client.send({ type: "results", room: room.name, query: message.query, messages });
         return;
       }
 
@@ -225,7 +235,7 @@ export class MessageHandler {
       }
 
       case "auth": {
-        const session = resume(this.accounts, message.token, this.config.jwtSecret);
+        const session = await resume(this.accounts, message.token, this.config.jwtSecret);
         if (!session.ok) {
           throw session.error;
         }

@@ -16,7 +16,7 @@ import { CATALOG, type RoomName, type ServerMessage } from "./protocol.js";
 import { ChatRoom } from "./model.js";
 import { pluck } from "./events.js";
 import type { ServerConfig } from "./config.js";
-import type { AdminUser, ChatClient, ClientId, User } from "./types.js";
+import type { ChatClient, ClientId } from "./types.js";
 
 export class Registry {
   readonly rooms = new Map<RoomName, ChatRoom>();
@@ -24,13 +24,6 @@ export class Registry {
   // Every live chat client, TCP or WebSocket alike. HTTP requests come and go
   // within a single exchange and are never listed here.
   readonly clients = new Map<ClientId, ChatClient>();
-
-  // Users the server already knows about. Chapter 17 replaces this with real
-  // authentication; for now a "nick" message simply claims an identity.
-  readonly knownUsers = new Map<string, User | AdminUser>([
-    ["alice", { id: "u1", name: "alice", joinedAt: Date.now(), adminLevel: 2, permissions: ["kick", "ban", "mute"] }],
-    ["bob", { id: "u2", name: "bob", joinedAt: Date.now() }],
-  ]);
 
   private sequence = 0;
 

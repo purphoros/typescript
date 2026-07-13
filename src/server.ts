@@ -19,7 +19,11 @@ import { GREETING_DELAY_MS, address, type ServerConfig } from "./config.js";
 import { asError, ErrorCode } from "./errors.js";
 import { assertNever, CATALOG, ConnectionState } from "./protocol.js";
 import { createBus, type Bus } from "./bus.js";
+import path from "node:path";
 import { FileHistory } from "./history.js";
+import { SqliteStorage } from "./sqlite.js";
+import type { MessageStore, Storage } from "./store.js";
+import { MemoryAccounts } from "./store.js";
 import { HttpService, HTTP_REQUEST_LINE } from "./http.js";
 import { MessageHandler } from "./handler.js";
 import { ChatMessage } from "./model.js";
@@ -33,14 +37,12 @@ import type { PeerKind } from "./types.js";
 export class ChatServer {
   readonly registry: Registry;
   readonly bus: Bus;
-  readonly history: FileHistory;
+  readonly storage: Storage;
+  readonly messages: MessageStore;
   readonly runtime = new Runtime();
   readonly sessions = new Sessions();
   readonly metrics = new Metrics();
-
-  // Populated in load(), because hashing passwords is deliberately slow and a
-  // constructor cannot await. See Accounts.seedDefaults.
-  readonly accounts = new Accounts(this.metrics);
+  readonly accounts: Accounts;
   private readonly handler: MessageHandler;
   private readonly http: HttpService;
   private readonly wss: WebSocketServer;
@@ -51,17 +53,24 @@ export class ChatServer {
     readonly logger: Logger = new Logger({ level: config.logLevel, format: config.logFormat }),
   ) {
     this.registry = new Registry(config);
-    this.history = new FileHistory(config.dataDir, this.metrics);
-    this.bus = createBus(this.registry, this.history, this.logger);
+
+    // The one place in the whole server that knows which storage it has.
+    // Everything below this line deals in MessageStore and AccountStore, and
+    // could not tell you whether it is talking to SQLite or a text file.
+    this.storage = buildStorage(config, this.metrics, this.logger);
+    this.messages = this.storage.messages;
+    this.accounts = new Accounts(this.storage.accounts, this.metrics);
+
+    this.bus = createBus(this.registry, this.messages, this.logger);
     this.handler = new MessageHandler(
       this.registry,
       this.bus,
-      this.history,
+      this.messages,
       this.accounts,
       this.sessions,
       config,
     );
-    this.http = new HttpService(this.registry, this.bus, this.history, this.runtime, this.metrics);
+    this.http = new HttpService(this.registry, this.bus, this.messages, this.runtime, this.metrics);
 
     // noServer: `ws` opens no port and does no listening. It only ever receives
     // sockets we have already accepted, parsed, and decided to upgrade.
@@ -91,7 +100,8 @@ export class ChatServer {
   // and do not editorialise" - it never rejects, so the caller has to look at
   // every result and decide. Which is exactly the decision being made here.
   async load(): Promise<void> {
-    await this.history.open();
+    await this.messages.open();
+    await this.storage.accounts.open();
 
     // Hashing passwords with scrypt costs real milliseconds - on purpose. Doing
     // it here, once, means no user ever waits for it during a login.
@@ -99,7 +109,7 @@ export class ChatServer {
 
     const rooms = [...this.registry.rooms.values()];
     const results = await Promise.allSettled(
-      rooms.map((room) => this.history.recent(room.name, this.config.historyLimit)),
+      rooms.map((room) => this.messages.recent(room.name, this.config.historyLimit)),
     );
 
     results.forEach((result, index) => {
@@ -140,7 +150,8 @@ export class ChatServer {
     }
 
     await new Promise<void>((resolve) => this.server.close(() => resolve()));
-    await this.history.flush();
+    await this.messages.flush();
+    await this.messages.close();
     this.runtime.stop();
     this.bus.emit("notice", "History flushed. Goodbye.");
   }
@@ -386,4 +397,16 @@ export class ChatServer {
       `WebSock: wscat -c ws://${this.url}`,
     ];
   }
+}
+
+// Which storage, and the only function that has to know.
+function buildStorage(config: ServerConfig, metrics: Metrics, logger: Logger): Storage {
+  if (config.storage === "file") {
+    const messages = new FileHistory(config.dataDir, metrics);
+    // A JSONL file has no accounts table and never did. Chapter 17's Map is what
+    // it always used, and pretending otherwise would be inventing a feature to
+    // make a symmetry look tidy.
+    return { messages, accounts: new MemoryAccounts() };
+  }
+  return new SqliteStorage(path.join(config.dataDir, "chat.db"), metrics, logger);
 }

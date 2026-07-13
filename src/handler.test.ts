@@ -5,35 +5,43 @@
 // registry - against a client whose only unusual property is that it writes to an
 // array instead of a wire.
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
-import { rm } from "node:fs/promises";
 import { MessageHandler } from "./handler.js";
 import { Registry } from "./state.js";
 import { createBus } from "./bus.js";
 import { Logger } from "./logger.js";
-import { FileHistory } from "./history.js";
+import { SqliteStorage } from "./sqlite.js";
 import { Accounts, Sessions } from "./auth.js";
 import { Metrics } from "./runtime.js";
 import { configure, DEFAULTS } from "./config.js";
 import { FakeClient } from "./testing.js";
 import { ErrorCode } from "./errors.js";
 
-const DATA = "data-test-handler";
-
 async function build() {
-  const config = configure(DEFAULTS, { dataDir: DATA, historyLimit: 10 });
+  const config = configure(DEFAULTS, { historyLimit: 10 });
   const registry = new Registry(config);
   const metrics = new Metrics();
-  const history = new FileHistory(config.dataDir, metrics);
-  await history.open();
-  const accounts = new Accounts(metrics);
-  await accounts.seedDefaults();
-  const sessions = new Sessions();
-  // A logger that writes nowhere. Tests should assert on behaviour, not on noise -
-  // and a test suite that prints 400 log lines is a test suite nobody reads.
+
+  // A logger that writes nowhere. A test suite that prints 400 log lines is a
+  // test suite nobody reads.
   const logger = new Logger({ level: "error", format: "json", write: () => {} });
-  const bus = createBus(registry, history, logger);
-  const handler = new MessageHandler(registry, bus, history, accounts, sessions, config);
-  return { handler, registry, sessions, config };
+
+  // ":memory:" - a real SQLite database, with the real migrations, the real
+  // prepared statements and the real SQL, and nothing on disk.
+  //
+  // Chapter 19 had to clean a directory up *before* as well as after, because an
+  // interrupted run left a file behind that poisoned the next one. There is no
+  // file now. The test cannot be poisoned by a previous run because a previous
+  // run left nothing behind - which is a better fix than remembering to tidy.
+  const storage = new SqliteStorage(":memory:", metrics, logger);
+  await storage.messages.open();
+
+  const accounts = new Accounts(storage.accounts, metrics);
+  await accounts.seedDefaults();
+
+  const sessions = new Sessions();
+  const bus = createBus(registry, storage.messages, logger);
+  const handler = new MessageHandler(registry, bus, storage.messages, accounts, sessions, config);
+  return { handler, registry, sessions, config, storage };
 }
 
 // Drive the client the way a socket would: one JSON line at a time.
@@ -60,18 +68,11 @@ async function loggedIn(h: MessageHandler, c: FakeClient, name: string, password
 describe("MessageHandler", () => {
   let ctx: Awaited<ReturnType<typeof build>>;
 
-  // Clean up *before* as well as after.
-  //
-  // afterEach alone is not enough, and this bit me: a previous run that was
-  // interrupted leaves data-test-handler/ on disk, the next run's first test
-  // reads a room with history already in it, and the failure has nothing to do
-  // with the change you just made. A test that depends on the last run having
-  // exited cleanly is a test that will fail on somebody else's machine.
-  beforeEach(async () => {
-    await rm(DATA, { recursive: true, force: true });
-    ctx = await build();
-  });
-  afterEach(async () => { await rm(DATA, { recursive: true, force: true }); });
+  // A fresh in-memory database per test. Chapter 19 had to clean a directory up
+  // before *and* after, because an interrupted run left a file behind that
+  // poisoned the next one. There is no file now.
+  beforeEach(async () => { ctx = await build(); });
+  afterEach(async () => { await ctx.storage.messages.close(); });
 
   it("refuses everything before you have proved who you are", async () => {
     const { handler } = ctx;

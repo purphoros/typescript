@@ -65,6 +65,9 @@ export const ClientMessageSchema = z.discriminatedUnion("type", [
   message({ type: z.literal("who") }),
   message({ type: z.literal("rooms") }),
   message({ type: z.literal("history"), limit: z.number().int().positive().max(500).optional() }),
+  // Free text from a stranger, headed for a database. See sqlite.ts - the schema
+  // bounds the length, and the bound parameter is what stops it being SQL.
+  message({ type: z.literal("search"), query: z.string().min(1).max(200) }),
   message({ type: z.literal("kick"), target: nickname, reason: z.string().min(1).max(200) }),
   message({ type: z.literal("status") }),
   message({ type: z.literal("help") }),
@@ -102,6 +105,7 @@ export const EnvSchema = z.object({
   NODE_ENV: z.enum(["development", "production", "test"]).optional(),
   LOG_LEVEL: z.enum(["debug", "info", "warn", "error"]).optional(),
   LOG_FORMAT: z.enum(["pretty", "json"]).optional(),
+  STORAGE: z.enum(["sqlite", "file"]).optional(),
   PORT: z.coerce.number().int().min(1).max(65535).optional(),
   DATA_DIR: z.string().min(1).optional(),
   HISTORY_LIMIT: z.coerce.number().int().positive().max(10_000).optional(),

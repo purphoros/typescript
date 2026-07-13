@@ -24,6 +24,7 @@ export interface CliOptions {
   readonly dataDir?: string;
   readonly logLevel?: LogLevel;
   readonly logFormat?: LogFormat;
+  readonly storage?: "sqlite" | "file";
 }
 
 // What `--help` prints. Kept next to the parser, because help text that lives
@@ -40,6 +41,7 @@ Options:
       --data-dir <path>   Where history is written     (default ./data)
       --log-level <lvl>   debug | info | warn | error  (default info)
       --log-format <fmt>  pretty | json                (default: pretty on a TTY, json otherwise)
+      --storage <kind>    sqlite | file                (default sqlite)
   -h, --help              Show this and exit
   -v, --version           Print the version and exit
 
@@ -75,6 +77,7 @@ export function parseCli(argv: readonly string[], version: string): CliResult {
         "data-dir": { type: "string" },
         "log-level": { type: "string" },
         "log-format": { type: "string" },
+        storage: { type: "string" },
         help: { type: "boolean", short: "h" },
         version: { type: "boolean", short: "v" },
       },
@@ -98,7 +101,7 @@ export function parseCli(argv: readonly string[], version: string): CliResult {
 
   const options: {
     host?: string; port?: number; rooms?: string[];
-    dataDir?: string; logLevel?: LogLevel; logFormat?: LogFormat;
+    dataDir?: string; logLevel?: LogLevel; logFormat?: LogFormat; storage?: "sqlite" | "file";
   } = {};
 
   if (typeof values.host === "string") {
@@ -138,6 +141,13 @@ export function parseCli(argv: readonly string[], version: string): CliResult {
       return { kind: "exit", message: `--log-format: expected pretty | json.`, code: 1 };
     }
     options.logFormat = format;
+  }
+
+  if (typeof values.storage === "string") {
+    if (values.storage !== "sqlite" && values.storage !== "file") {
+      return { kind: "exit", message: `--storage: expected sqlite | file.`, code: 1 };
+    }
+    options.storage = values.storage;
   }
 
   return { kind: "run", options };

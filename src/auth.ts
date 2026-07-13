@@ -17,6 +17,7 @@ import { issue, verify, type JwtPayload } from "./jwt.js";
 import { timed, type Measured } from "./decorators.js";
 import { AuthError, ErrorCode, type ChatError, type Result } from "./errors.js";
 import type { Metrics } from "./runtime.js";
+import type { Account, AccountStore } from "./store.js";
 import type { ClientId, User, AdminUser } from "./types.js";
 
 const scryptAsync = promisify(scrypt) as (
@@ -66,16 +67,17 @@ export async function checkPassword(password: string, stored: string): Promise<b
 }
 
 // --- Accounts ------------------------------------------------------------
-
-export interface Account {
-  readonly user: User | AdminUser;
-  readonly passwordHash: string;
-}
+//
+// `Account` moved to store.ts, because it is a storage shape. What is left here is
+// the *policy*: how a login is checked, what is said when it fails, and how long
+// the wrong answer is made to take. That is not a database's business, and now it
+// is not in the database's file.
 
 export class Accounts implements Measured {
-  private readonly byName = new Map<string, Account>();
-
-  constructor(readonly metrics: Metrics) {}
+  constructor(
+    private readonly store: AccountStore,
+    readonly metrics: Metrics,
+  ) {}
 
   // Seeding hashes takes real time - that is the whole point of scrypt - so it
   // happens once, at startup, and not on the first login while somebody waits.
@@ -84,6 +86,12 @@ export class Accounts implements Measured {
   // hands back an Account with a hash in it, and nothing above this line knows
   // whether that came from a Map or from Postgres.
   async seedDefaults(): Promise<void> {
+    // Only if there is nobody. A seed that runs on every boot would reset alice's
+    // password back to the one printed in a book every time you restarted the
+    // server, which is a memorable way to learn what "idempotent" means.
+    if ((await this.store.names()).length > 0) {
+      return;
+    }
     await this.add(
       { id: "u1", name: "alice", joinedAt: Date.now(), adminLevel: 2, permissions: ["kick", "ban", "mute"] },
       "correct-horse",
@@ -92,15 +100,15 @@ export class Accounts implements Measured {
   }
 
   async add(user: User | AdminUser, password: string): Promise<void> {
-    this.byName.set(user.name, { user, passwordHash: await hashPassword(password) });
+    await this.store.save({ user, passwordHash: await hashPassword(password) });
   }
 
-  get names(): string[] {
-    return [...this.byName.keys()];
+  async names(): Promise<string[]> {
+    return this.store.names();
   }
 
-  find(name: string): Account | undefined {
-    return this.byName.get(name);
+  async find(name: string): Promise<Account | undefined> {
+    return this.store.find(name);
   }
 
   // A login attempt. Note what the two failure paths have in common: nothing the
@@ -115,7 +123,7 @@ export class Accounts implements Measured {
   // password hash and the passwords are no longer safe.
   @timed("accounts")
   async login(name: string, password: string): Promise<Result<Account, ChatError>> {
-    const account = this.byName.get(name);
+    const account = await this.store.find(name);
 
     if (account === undefined) {
       // Hash anyway, against a throwaway. Otherwise "unknown user" returns in a
@@ -208,11 +216,11 @@ export async function authenticate(
 
 // Token in, session out. This is the door every reconnect comes through, and it
 // never sees a password.
-export function resume(
+export async function resume(
   accounts: Accounts,
   token: string,
   secret: string,
-): Result<Session, ChatError> {
+): Promise<Result<Session, ChatError>> {
   const claims: Result<JwtPayload, ChatError> = verify(token, secret);
   if (!claims.ok) {
     return claims;
@@ -235,7 +243,7 @@ export function resume(
   // for its entire lifetime and cannot be recalled, so an account deleted five
   // minutes ago still has a perfectly good token in somebody's hands. Looking it
   // up here is what makes a token a *claim* rather than an authority.
-  const account = accounts.find(claims.value.name);
+  const account = await accounts.find(claims.value.name);
   if (account === undefined) {
     return { ok: false, error: new AuthError("That account no longer exists.", ErrorCode.BadToken) };
   }
