@@ -1,12 +1,13 @@
-// Chat server - a real TCP server.
+// Chat server - TCP, now speaking HTTP as well.
 //
-// Chapters 1-4 built the vocabulary: types for the domain, interfaces for the
-// data, classes for the state. This chapter gives it a socket. `net` accepts
-// connections, the event loop interleaves them, and a single thread serves
-// every client at once.
+// HTTP is just text over TCP: a request line, headers, a blank line, a body.
+// So the same listener can serve both protocols. We read the first line and
+// decide: `GET / HTTP/1.1` is a browser or curl, anything else is a person at
+// a terminal typing chat commands.
 //
-// Messages are still echoed back to their sender - broadcasting to a room is
-// Chapter 16.
+// That sniffing is not a party trick - it is exactly what Chapter 7 needs. A
+// WebSocket connection *begins* as an HTTP request carrying `Upgrade:
+// websocket`, on this very port.
 
 import net from "node:net";
 
@@ -20,6 +21,10 @@ const CONFIG = {
   rooms: ["general", "random", "dev"],
 } as const;
 
+// A client that connects and says nothing is assumed to be a human at a
+// terminal, and gets greeted. curl and browsers send their request at once.
+const GREETING_DELAY_MS = 200;
+
 // --- Domain types --------------------------------------------------------
 
 type Host = string;
@@ -30,6 +35,9 @@ type Timestamp = number;
 
 // A connection is in exactly one of these three states - nothing else.
 type ConnectionState = "connecting" | "connected" | "disconnected";
+
+// What the peer turned out to be. "unknown" until the first line arrives.
+type Protocol = "unknown" | "chat" | "http";
 
 // Interfaces describe shape. `type` stays for unions, which interfaces cannot express.
 interface Identifiable {
@@ -58,6 +66,24 @@ interface Message extends Identifiable {
   room: RoomName;
   replyTo?: string;   // optional: string | undefined
   editedAt?: Timestamp;
+}
+
+// One parsed HTTP request. Header names are lowercased: HTTP header names are
+// case-insensitive, so `Content-Length` and `content-length` must not differ.
+interface HttpRequest {
+  method: string;
+  path: string;
+  version: string;
+  headers: Map<string, string>;
+  body: string | undefined;
+}
+
+// The reason phrase is not stored: it is derived from the status code by
+// statusLine(), so the two can never disagree.
+interface HttpResponse {
+  status: number;
+  headers: Record<string, string>;
+  body: string;
 }
 
 // Every event the server can emit. The `type` field is the discriminant:
@@ -134,12 +160,19 @@ class ChatMessage implements Message, Serializable {
 
 // One Connection wraps one TCP socket. The socket stays private: callers speak
 // to the client through send()/end(), never by touching the stream directly.
+//
+// TCP is a byte stream, not a sequence of messages. What arrives in one "data"
+// event is whatever happened to be in flight - half a line, three lines, the
+// headers of a request but not its body. So bytes are buffered here until a
+// whole unit is present, and only then handed on.
 class Connection implements Identifiable {
   readonly id: string;
   readonly address: string;
   readonly connectedAt: Timestamp;
 
   private state: ConnectionState = "connecting";
+  private protocol: Protocol = "unknown";
+  private inbox: Buffer = Buffer.alloc(0);
   private identity?: User;
   private currentRoom?: RoomName;
 
@@ -152,6 +185,10 @@ class Connection implements Identifiable {
 
   get status(): ConnectionState {
     return this.state;
+  }
+
+  get mode(): Protocol {
+    return this.protocol;
   }
 
   get user(): User | undefined {
@@ -172,8 +209,44 @@ class Connection implements Identifiable {
     return Date.now() - this.connectedAt;
   }
 
+  // Bytes received but not yet consumed.
+  get pending(): Buffer {
+    return this.inbox;
+  }
+
+  becomes(protocol: Protocol): void {
+    this.protocol = protocol;
+  }
+
+  append(chunk: Buffer): void {
+    this.inbox = Buffer.concat([this.inbox, chunk]);
+  }
+
+  // Drop the first `count` bytes - they have been dealt with.
+  consume(count: number): void {
+    this.inbox = this.inbox.subarray(count);
+  }
+
+  // Every *complete* line in the buffer. A trailing partial line stays put
+  // until the rest of it arrives.
+  takeLines(): string[] {
+    const lines: string[] = [];
+    let newline = this.inbox.indexOf(0x0a);
+    while (newline !== -1) {
+      lines.push(this.inbox.subarray(0, newline).toString("utf8").replace(/\r$/, ""));
+      this.inbox = this.inbox.subarray(newline + 1);
+      newline = this.inbox.indexOf(0x0a);
+    }
+    return lines;
+  }
+
   send(line: string): void {
     this.socket.write(`${line}\n`);
+  }
+
+  // Raw write: HTTP builds its own bytes, newlines and all.
+  write(raw: string): void {
+    this.socket.write(raw);
   }
 
   identifyAs(user: User): void {
@@ -191,6 +264,10 @@ class Connection implements Identifiable {
   // Flush what is queued, then close politely.
   end(line: string): void {
     this.send(line);
+    this.socket.end();
+  }
+
+  close(): void {
     this.socket.end();
   }
 
@@ -225,8 +302,8 @@ function address(host: Host, port?: Port): string {
   return `${host}:${port ?? CONFIG.port}`;
 }
 
-// The reason phrase for an HTTP status code. The chat server speaks HTTP before
-// it upgrades to a WebSocket (Chapter 7), so it needs these.
+// The reason phrase for an HTTP status code - the text after the number on the
+// response's first line.
 function statusLine(code: number): string {
   switch (code) {
     case 200: return "OK";
@@ -237,6 +314,7 @@ function statusLine(code: number): string {
     case 401: return "Unauthorized";
     case 403: return "Forbidden";
     case 404: return "Not Found";
+    case 405: return "Method Not Allowed";
     case 500: return "Internal Server Error";
     default:  return "Unknown";
   }
@@ -290,6 +368,151 @@ function formatDuration(ms: number): string {
   return minutes > 0 ? `${minutes}m ${seconds % 60}s` : `${seconds}s`;
 }
 
+// --- HTTP ----------------------------------------------------------------
+
+// `GET /path HTTP/1.1` - the shape of an HTTP request's first line. Anything
+// else on the wire is a chat client.
+const HTTP_REQUEST_LINE = /^(GET|HEAD|POST|PUT|PATCH|DELETE|OPTIONS) \S+ HTTP\/1\.[01]$/;
+
+const CRLF = "\r\n";
+const HEADERS_END = "\r\n\r\n";
+
+// Split the head of a request into a method, a path, and headers. Returns null
+// if the request line is malformed - a 400, not a crash.
+function parseRequest(head: string, body: string | undefined): HttpRequest | null {
+  const lines = head.split(CRLF);
+  const requestLine = lines[0] ?? "";
+  const [method, path, version] = requestLine.split(" ");
+
+  if (method === undefined || path === undefined || version === undefined) {
+    return null;
+  }
+
+  const headers = new Map<string, string>();
+  for (const line of lines.slice(1)) {
+    const colon = line.indexOf(":");
+    if (colon > 0) {
+      // Header names are case-insensitive; normalise so lookups always hit.
+      headers.set(line.slice(0, colon).trim().toLowerCase(), line.slice(colon + 1).trim());
+    }
+  }
+
+  return { method, path, version, headers, body };
+}
+
+// Content-Length counts BYTES, not characters. One emoji is a single character
+// but four bytes in UTF-8; get this wrong and the client hangs waiting for the
+// rest of a body that already arrived.
+function serializeResponse(res: HttpResponse): string {
+  const headers: Record<string, string> = {
+    "Content-Length": String(Buffer.byteLength(res.body)),
+    Connection: "close",
+    ...res.headers,
+  };
+
+  let out = `HTTP/1.1 ${res.status} ${statusLine(res.status)}${CRLF}`;
+  for (const [name, value] of Object.entries(headers)) {
+    out += `${name}: ${value}${CRLF}`;
+  }
+  return out + CRLF + res.body;
+}
+
+function json(status: number, payload: unknown): HttpResponse {
+  return {
+    status,
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload, null, 2),
+  };
+}
+
+function html(status: number, body: string): HttpResponse {
+  return { status, headers: { "Content-Type": "text/html; charset=utf-8" }, body };
+}
+
+// The server's own state, served over HTTP. The chat rooms and the web page are
+// the same rooms - one process, two protocols.
+function handleRequest(req: HttpRequest): HttpResponse {
+  if (req.path === "/" && req.method === "GET") {
+    const roomRows = [...rooms.values()]
+      .map((room) => `<li>${room.name} - ${room.memberCount} member(s)</li>`)
+      .join("");
+    return html(
+      200,
+      `<h1>Chat server</h1>
+<p>${clients.size} chat client(s) connected.</p>
+<ul>${roomRows}</ul>
+<p>Talk to it: <code>nc ${CONFIG.host} ${port}</code></p>`,
+    );
+  }
+
+  if (req.path === "/api/status" && req.method === "GET") {
+    return json(200, {
+      status: "running",
+      uptime: process.uptime(),
+      clients: clients.size,
+      rooms: rooms.size,
+    });
+  }
+
+  if (req.path === "/api/rooms" && req.method === "GET") {
+    return json(200, [...rooms.values()].map((room) => ({
+      name: room.name,
+      members: room.memberList,
+      memberCount: room.memberCount,
+    })));
+  }
+
+  if (req.path === "/api/echo") {
+    if (req.method !== "POST") {
+      return json(405, { error: "Use POST" });
+    }
+    return json(200, { echo: req.body ?? "", bytes: Buffer.byteLength(req.body ?? "") });
+  }
+
+  return json(404, { error: "Not Found", path: req.path });
+}
+
+// Consume as much of the buffer as forms a complete request, answer it, hang
+// up. Returns without doing anything if the request is still arriving.
+function drainHttp(conn: Connection): void {
+  const buffered = conn.pending;
+  const headerEnd = buffered.indexOf(HEADERS_END);
+  if (headerEnd === -1) {
+    return; // headers still in flight
+  }
+
+  const head = buffered.subarray(0, headerEnd).toString("utf8");
+  const bodyStart = headerEnd + HEADERS_END.length;
+
+  // Peek at Content-Length before parsing properly: we may not have the body.
+  const lengthHeader = /^content-length:\s*(\d+)/im.exec(head);
+  const contentLength = lengthHeader?.[1] !== undefined ? parseInt(lengthHeader[1], 10) : 0;
+
+  if (buffered.length < bodyStart + contentLength) {
+    return; // body still in flight
+  }
+
+  const body = contentLength > 0
+    ? buffered.subarray(bodyStart, bodyStart + contentLength).toString("utf8")
+    : undefined;
+
+  conn.consume(bodyStart + contentLength);
+
+  const request = parseRequest(head, body);
+  const response = request === null
+    ? json(400, { error: "Bad Request" })
+    : handleRequest(request);
+
+  emit({
+    type: "system",
+    text: `${request?.method ?? "?"} ${request?.path ?? "?"} → ${response.status} ${statusLine(response.status)}`,
+    at: Date.now(),
+  });
+
+  conn.write(serializeResponse(response));
+  conn.close(); // we said Connection: close, so honour it
+}
+
 // --- Server state --------------------------------------------------------
 
 const rooms = new Map<RoomName, ChatRoom>();
@@ -304,7 +527,8 @@ const knownUsers = new Map<string, User | AdminUser>([
   ["bob", { id: "u2", name: "bob", joinedAt: Date.now() }],
 ]);
 
-// Every live connection, keyed by its id. The Map is the server's client list.
+// Every live *chat* connection, keyed by its id. HTTP clients come and go
+// within a single request and are never listed here.
 const clients = new Map<string, Connection>();
 let sequence = 0;
 
@@ -433,34 +657,82 @@ function handleLine(conn: Connection, line: string): void {
   conn.send(`Echo: ${message.text}`);
 }
 
+// --- Protocol detection --------------------------------------------------
+
+// Look at the first complete line. Undefined means it has not arrived yet.
+function sniff(conn: Connection): Protocol | undefined {
+  const newline = conn.pending.indexOf(0x0a);
+  if (newline === -1) {
+    return undefined;
+  }
+  const firstLine = conn.pending.subarray(0, newline).toString("utf8").replace(/\r$/, "");
+  return HTTP_REQUEST_LINE.test(firstLine) ? "http" : "chat";
+}
+
+function startChat(conn: Connection): void {
+  conn.becomes("chat");
+  clients.set(conn.id, conn);
+  conn.send(`Welcome! You are ${conn.id}. Type /help for commands.`);
+}
+
 // --- The server ----------------------------------------------------------
 
 // The callback runs once per connection. Everything inside it belongs to that
 // one client; the event loop interleaves them all on a single thread.
 const server = net.createServer((socket) => {
   const conn = new Connection(socket, ++sequence);
-  clients.set(conn.id, conn);
-
   emit({ type: "system", text: `${conn.id} connected from ${conn.address}`, at: Date.now() });
-  conn.send(`Welcome! You are ${conn.id}. Type /help for commands.`);
 
-  // `data` is a Buffer - raw bytes. A single chunk may hold several lines, or
-  // half of one; splitting on newline is enough until Chapter 15 does framing.
-  socket.on("data", (data: Buffer) => {
-    for (const raw of data.toString().split("\n")) {
-      const line = parseInput(raw);
-      if (line.length > 0) {
-        handleLine(conn, line);
+  // A browser or curl sends its request immediately, so we can read it and
+  // know. A person at a terminal sends nothing until they type - so if the
+  // line never comes, assume a human and greet them.
+  const greeting = setTimeout(() => {
+    if (conn.mode === "unknown") {
+      startChat(conn);
+    }
+  }, GREETING_DELAY_MS);
+
+  socket.on("data", (chunk: Buffer) => {
+    conn.append(chunk);
+
+    if (conn.mode === "unknown") {
+      const detected = sniff(conn);
+      if (detected === undefined) {
+        return; // not even one line yet
+      }
+      clearTimeout(greeting);
+      if (detected === "http") {
+        conn.becomes("http");
+      } else {
+        startChat(conn);
+      }
+    }
+
+    if (conn.mode === "http") {
+      drainHttp(conn);
+      return;
+    }
+
+    for (const line of conn.takeLines()) {
+      const text = parseInput(line);
+      if (text.length > 0) {
+        handleLine(conn, text);
       }
     }
   });
 
   socket.on("close", () => {
+    clearTimeout(greeting);
+    conn.markClosed();
+
+    if (conn.mode !== "chat") {
+      return; // an HTTP request, already answered and logged
+    }
+
     const room = conn.room;
     if (room !== undefined) {
       rooms.get(room)?.leave(conn.label);
     }
-    conn.markClosed();
     clients.delete(conn.id);
     emit({ type: "system", text: `${conn.label} disconnected (${clients.size} remaining)`, at: Date.now() });
   });
@@ -494,5 +766,6 @@ const host: Host = CONFIG.host;
 server.listen(port, host, () => {
   console.log(`Chat server listening on ${address(host, port)}`);
   console.log(`Rooms: ${[...rooms.keys()].join(", ")}`);
-  console.log(`Connect with: nc ${host} ${port}`);
+  console.log(`Chat: nc ${host} ${port}`);
+  console.log(`HTTP: curl http://${address(host, port)}/`);
 });
