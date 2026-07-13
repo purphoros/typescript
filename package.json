@@ -4,9 +4,9 @@
   "description": "A real-time chat server, built incrementally while learning TypeScript.",
   "main": "dist/index.js",
   "scripts": {
-    "dev": "tsx watch src/index.ts",
+    "dev": "tsx watch src/main.ts",
     "build": "tsc",
-    "start": "node dist/index.js",
+    "start": "node dist/main.js",
     "typecheck": "tsc --noEmit"
   },
   "repository": {
@@ -28,5 +28,16 @@
   },
   "dependencies": {
     "ws": "^8.21.0"
+  },
+  "type": "module",
+  "types": "dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    }
+  },
+  "bin": {
+    "chat-server": "dist/main.js"
   }
 }

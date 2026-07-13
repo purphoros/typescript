@@ -24,7 +24,7 @@ import {
   type ChatError,
   type ErrorCode,
   type Result,
-} from "./errors";
+} from "./errors.js";
 
 // --- Shared vocabulary ---------------------------------------------------
 
@@ -44,7 +44,7 @@ export type Transport = "tcp" | "ws";
 // These are the four states a connection *on this server* actually passes
 // through. Note what is missing: "reconnecting". A server never reconnects - it
 // is sat still, being connected *to*. Reconnection is something the far end
-// does, and you can watch the browser page in index.ts do exactly that. Putting
+// does, and you can watch the browser page in page.ts do exactly that. Putting
 // a state in this enum that no server-side connection can ever be in would mean
 // every exhaustive switch below has to handle a case that cannot happen.
 export enum ConnectionState {
@@ -60,8 +60,8 @@ export enum ConnectionState {
 // `ErrorCode` used to live here. Chapter 10 moved it into errors.ts, where the
 // error classes that carry it live: protocol.ts imports errors.ts, and if
 // errors.ts imported back the two modules would take turns being half-loaded.
-// Dependencies point one way - errors ← protocol ← index - and that is not an
-// accident, it is the only arrangement that works.
+// Dependencies point one way, and Chapter 11 made that the organising principle
+// of the whole tree: errors ← protocol ← types ← model ← state ← handler.
 
 // > A `const enum` is inlined at compile time: `Direction.Up` becomes the string
 // > "UP" and no object is emitted at all. It is tempting, and it is a trap in a
@@ -109,7 +109,7 @@ export interface RoomSummary {
   readonly messages: number;
 }
 
-// A message as it appears on the wire. The ChatMessage class in index.ts has an
+// A message as it appears on the wire. The ChatMessage class in model.ts has an
 // id, a replyTo and a serialize() method; none of that is anyone else's
 // business, so the wire shape is its own type rather than the class.
 export interface MessageSummary {
