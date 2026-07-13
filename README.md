@@ -1,216 +1,272 @@
-# Chapter 17 - Authentication & Sessions
+# Chapter 18 - Decorators & Metadata
 
-Since Chapter 4, this server has had a comment in it promising that Chapter 17 would deal with something:
+Add behaviour to classes and methods declaratively. Decorators are TypeScript's metaprogramming tool - the machinery behind NestJS, Angular and TypeORM.
 
-```typescript
-const knownUsers = new Map([["alice", { adminLevel: 2, permissions: ["kick", "ban"] }]]);
-// Chapter 17 replaces this with real authentication; for now a "nick" message
-// simply claims an identity.
-```
+This chapter's own advice, further down, is that our chat server wants **middleware**, not decorators. That advice is correct, and this chapter takes it: the Chapter 17 chain stays exactly where it is. What follows is decorators used for the one thing they are genuinely better at - and an honest account of what they cost.
 
-`{"type":"nick","name":"alice"}` made you an admin **because you said so**.
+## Standard decorators, not the ones in most tutorials
 
-Thirteen chapters of type safety, a validated protocol, a bounded runtime, a branded id that cannot be confused with a nickname - all of it guarding a door that was propped open the entire time. It is worth sitting with that for a second, because it is the most important thing in the chapter: **types cannot tell you whether somebody is lying. They can only make sure the lie is well-formed.**
-
-## The Shape of It
-
-`nick` is gone. Two messages replace it, and the split is the design:
-
-```json
-{"type":"login","name":"alice","password":"correct-horse"}   → {"type":"token","token":"eyJhbGci..."}
-{"type":"auth","token":"eyJhbGci..."}                        → {"type":"authenticated","user":"alice","admin":true}
-```
-
-The password is seen **once**, by one function, and then forgotten. Everything afterwards - including reconnecting tomorrow morning - happens with a token that expires on its own. The browser page does the second step for you and keeps the token, so a page reload does not mean typing a password again.
-
-## JWT, built by hand
-
-> **Warning**
->
-> **Use a library in production.** `jose` and `jsonwebtoken` are audited, and they handle key rotation, JWKS, the other algorithms, and the mistakes you have not thought of yet. `src/jwt.ts` exists so that when you *do* import one, you know exactly what it is doing on your behalf - and so the two attacks below stop being trivia and become things you have personally defended against.
-
-A JWT is three base64url strings joined by dots:
-
-```
-eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9 . eyJzdWIiOiJ1MSIsIm5hbWUi... . 4x8KfQ...
-└──────── header ─────────────────┘   └──────── payload ──────┘   └ signature ┘
-```
-
-Decode the first two from a real token this server just issued:
-
-```json
-{"alg":"HS256","typ":"JWT"}
-{"sub":"u1","name":"alice","admin":true,"iat":1783925502,"exp":1784011902}
-```
-
-**That is not encrypted. It is merely encoded.** Anyone holding the token can read every claim in it. Base64 is an envelope, not a lock - the signature proves the postcard was not *altered*, and does precisely nothing to stop it being *read*. Never put anything in a JWT you would not write on a postcard.
-
-### Attack one: `alg: "none"`
-
-The header is supplied by whoever sent the token. Early JWT libraries did the obvious, catastrophic thing: they read `alg` out of the header and used *that* algorithm to verify. So you send:
-
-```json
-{"alg":"none","typ":"JWT"}
-{"sub":"u1","name":"alice","admin":true,"exp":9999999999}
-```
-
-...with an empty signature, and a library that trusts the header agrees the unsigned token is valid. You have just minted yourself an admin.
-
-**The header must never decide how the header is checked.** We know what we issued:
+Nearly every decorator tutorial - including this chapter's first listing - shows you this:
 
 ```typescript
-if (algorithm !== "HS256") {
-  return err(new AuthError("Unsupported token algorithm.", ErrorCode.BadToken));
+function log(target: any, key: string, descriptor: PropertyDescriptor) {
+  const original = descriptor.value;
+  descriptor.value = function (...args: any[]) { ... };
 }
 ```
 
-```
---- ATTACK: alg:none - forge an admin token with no signature ---
-  mallory <- {"type":"error","code":"bad_token","message":"Unsupported token algorithm."}
-```
+That is the **legacy** decorator. It requires `"experimentalDecorators": true`, it is built on a TC39 proposal that was **abandoned**, and it has `any` in it twice - which Chapter 3 had opinions about.
 
-### Attack two: the timing side channel
+TypeScript 5.0 ships the **standard** decorator: Stage 3, on its way into JavaScript itself, **no compiler flag**, and properly typed.
 
 ```typescript
-if (signature === expected) { ... }    // NO
-```
+function logged<T, A extends unknown[], R>(
+  original: (this: T, ...args: A) => R,
+  context: ClassMethodDecoratorContext<T, (this: T, ...args: A) => R>,
+): (this: T, ...args: A) => R {
+  return function (this: T, ...args: A): R {
+    console.log(`-> ${String(context.name)}(${args.join(", ")})`);
+    const result = original.apply(this, args);
+    console.log(`<- ${String(context.name)} returned ${String(result)}`);
+    return result;
+  };
+}
 
-`===` on strings short-circuits at the first differing character. An attacker who can measure how long the comparison took learns whether the first byte was right, then the second, and can walk a valid signature out of you one byte at a time. It sounds far-fetched over a network. It has been done.
-
-```typescript
-function equalsConstantTime(a: string, b: string): boolean {
-  const left = Buffer.from(a, "utf8");
-  const right = Buffer.from(b, "utf8");
-  if (left.length !== right.length) return false;
-  return timingSafeEqual(left, right);   // always compares every byte
+class Calculator {
+  @logged
+  add(a: number, b: number): number { return a + b; }
 }
 ```
 
-The separate length check is fine here: an HMAC-SHA256 signature is always exactly 43 base64url characters, so its length tells an attacker nothing they did not know.
-
-```
---- ATTACK: tamper with the payload, reuse the signature ---
-  mallory <- {"type":"error","code":"bad_token","message":"Bad token signature."}
-```
+A decorator is just a **function that receives the method and returns a replacement**. No `descriptor`, no mutation, no `any` - and the compiler now checks that the decorator is applied to a method whose shape it can actually handle.
 
 > **Note**
 >
-> The signature is checked **before the payload is parsed**, and then the payload is run through a Zod schema anyway. Both matter. A good signature means *we* wrote this token - it does not mean the token is the shape this version of the server expects. A token issued by last month's build, signed with the same secret, is perfectly authentic and may be missing a field. Chapter 14's rule does not stop applying just because the data is signed.
-
-## Passwords
-
-```typescript
-export async function hashPassword(password: string): Promise<string> {
-  const salt = randomBytes(16);
-  const key = await scryptAsync(password, salt, KEY_LENGTH);
-  return `scrypt$${salt.toString("base64url")}$${key.toString("base64url")}`;
-}
-```
-
-**scrypt, not SHA-256.** A password hash must be *slow* - deliberately, expensively slow - because the attacker holding your leaked database is not going to guess once, they are going to guess ten billion times on a rented GPU. SHA-256 is fast, which is exactly the property you want in a checksum and exactly the one that gets your users' passwords cracked. scrypt is slow and, more importantly, **memory-hard**: each guess needs real RAM, which is what stops a GPU running fifty thousand of them in parallel.
-
-The salt is random and per-user. Without it, two people who chose the same bad password get the same hash - crack one, crack both - and an attacker can precompute the ten million most common passwords **once** and reuse the answer against every database in the world.
-
-The stored string carries its parameters (`scrypt$salt$key`) because you will change them one day, when computers get faster, and you will need to read the old ones.
-
-### The two failures that must look identical
-
-```typescript
-const account = this.byName.get(name);
-
-if (account === undefined) {
-  // Hash anyway, against a throwaway.
-  await checkPassword(password, DUMMY_HASH);
-  return err(new AuthError("Wrong name or password.", ErrorCode.BadCredentials));
-}
-```
-
-"No such user" and "wrong password" must be the **same answer**, because a server that distinguishes them is a free tool for enumerating who has an account here - and knowing that `alice` exists is the first half of attacking `alice`.
-
-And it is not enough to say the same words. If "unknown user" returns in a microsecond while "wrong password" takes 100ms of scrypt, **the timing says what the message would not**. So the unknown-user path does the work anyway, against a dummy hash of a value nobody knows.
-
-```
---- wrong password, and a user who does not exist ---
-  alice <- {"type":"error","code":"bad_credentials","message":"Wrong name or password."}
-  alice <- {"type":"error","code":"bad_credentials","message":"Wrong name or password."}
-```
-
-The log knows which was which. The stranger at the door does not.
-
-## The line where privilege escalation lives
-
-The token says `admin: true`. We signed it. It is authentic. **Do not read it.**
-
-```typescript
-const account = accounts.find(claims.value.name);
-if (account === undefined) {
-  return err(new AuthError("That account no longer exists.", ErrorCode.BadToken));
-}
-
-return ok({
-  user: account.user,   // from the account. Never from the token.
-  ...
-});
-```
-
-A signed `admin: true` is still a permission flag **in the client's pocket**, and the whole discipline of authorization is: never ask the client what it is allowed to do. The `admin` claim is informational - the browser may use it to decide whether to draw a Kick button - and the server uses the account.
-
-Re-reading the account also closes the revocation window. A token is valid for its entire lifetime and **cannot be recalled**, so an account deleted five minutes ago still has a perfectly good token in somebody's hands. Looking it up on every `auth` is what makes a token a *claim* rather than an authority.
-
-## The Middleware Pattern
-
-The switch in `handler.ts` answers *what does this message mean*. It should not also answer *is this person allowed to say it* and *have they said it forty times this second* - those are true of every message, and a rule that applies to everything belongs somewhere it is written once.
-
-```typescript
-export type Middleware = (
-  client: ChatClient,
-  message: ClientMessage,
-  next: () => Promise<void>,
-) => Promise<void>;
-```
-
-```typescript
-this.pipeline = chain(rateLimit(20, 10), requireAuth(this.sessions));
-```
-
-**Order is an argument about cost.** `rateLimit` first, because it is the cheapest check in the building - one subtraction - and refusing a flood should not require doing the expensive thing first. Put auth first and a flood of unauthenticated messages makes the server do a map lookup per message before declining. Put rate-limiting first and it does arithmetic.
-
-A middleware that refuses simply **throws** - and the `catch` in `handleLine`, unchanged since Chapter 10, turns it into an error message without knowing that middleware exists:
-
-```typescript
-const message = decoded.value;
-await this.pipeline(client, message, () => this.handleMessage(client, message));
-```
-
-The gate list is typed:
-
-```typescript
-const OPEN: ReadonlySet<ClientMessageType> = new Set<ClientMessageType>([
-  "login", "auth", "help", "quit",
-]);
-```
-
-`Set<ClientMessageType>`, not `Set<string>`. Rename a message in `schemas.ts` and this stops compiling. **A door that quietly stops being locked because somebody renamed the thing behind it** is exactly the bug worth making impossible.
-
-> **Warning**
+> `context.name` is the method's own name, supplied by the runtime. That is the whole "metadata" story for our purposes, and it matters more than it looks: rename the method and the metric renames itself. No stringly-typed duplication to drift.
 >
-> The `chain` function guards against a middleware calling `next()` twice. That is not paranoia: awaiting `next()` twice runs the entire rest of the chain twice - including the handler, including the broadcast - and the symptom is messages being delivered in duplicate, intermittently. Fail loudly instead.
+> This project's `tsconfig.json` has **no** `experimentalDecorators`, and both `tsc` and `tsx` (esbuild) run the above as written. Verify it yourself before you take my word for it - esbuild's support for standard decorators is newer than its support for the legacy ones, and a tutorial from 2022 will tell you it does not work.
 
-## The secret
+## Where they actually earn their keep here
+
+Chapter 15 gave the server the ability to notice that it was slow. It gave it **no way at all to notice what was slow.**
+
+That is a cross-cutting concern attached to specific methods - which is precisely the criterion this chapter names for reaching for a decorator. So:
 
 ```typescript
-if (e.NODE_ENV === "production" && e.JWT_SECRET === undefined) {
-  console.error("JWT_SECRET is required in production. Refusing to start with a public default.");
-  process.exit(1);
-}
-if (e.JWT_SECRET === undefined) {
-  console.warn("⚠  JWT_SECRET is not set. Using the development default - do not deploy this.");
+@timed("history")
+append(message: MessageSummary): Promise<void> { ... }
+
+@timed("history")
+async read(room: RoomName): Promise<MessageSummary[]> { ... }
+
+@timed("accounts")
+async login(name: string, password: string): Promise<Result<Account, ChatError>> { ... }
+```
+
+Three lines. Nothing inside `FileHistory` or `Accounts` learned what a metric is, and `/api/health` grew a section:
+
+```json
+"operations": {
+  "history.read":   { "count": 4, "failures": 0, "meanMs": 0.25,  "maxMs": 0.39 },
+  "history.append": { "count": 5, "failures": 0, "meanMs": 1.36,  "maxMs": 1.42 },
+  "accounts.login": { "count": 2, "failures": 0, "meanMs": 28.46, "maxMs": 28.85 }
 }
 ```
 
-**A signing secret with a default is not a default, it is a published private key.** Every deployment that forgets to set it shares one, and anyone who has read this file can mint an admin token for any of them.
+That `28.46ms` is scrypt being slow **on purpose**. Which means this number is now a security tripwire: if `accounts.login.meanMs` ever drops toward zero, somebody has "optimised" the password hash and the passwords are no longer safe.
 
-So in production its absence is fatal. In development it falls back, loudly - and the noise is the *feature*. A warning you see every single time you start the server is one you will eventually act on. A silent fallback is one you will ship.
+## The bug in almost every hand-rolled @timed
+
+```typescript
+const started = performance.now();
+const result = original.apply(this, args);
+this.metrics.record(label, performance.now() - started, true);   // WRONG
+return result;
+```
+
+If the method is `async`, **it has not finished**. It has handed back a Promise, and that subtraction measures how long it took to *start* - which is approximately zero and completely useless. This is the single most common bug in decorators people write themselves, and its symptom is beautiful sub-millisecond timings for operations that take a second.
+
+So: if you got a Promise, measure when it **settles**.
+
+```typescript
+if (result instanceof Promise) {
+  const measured = result.then(
+    (value: unknown) => { this.metrics.record(label, elapsed(), true);  return value; },
+    (thrown: unknown) => { this.metrics.record(label, elapsed(), false); throw thrown; },
+  );
+  return measured as R;
+}
+```
+
+The `as R` is the one assertion in the file. Inside that branch we have *proved* `R` is a Promise - but TypeScript cannot narrow a generic type **parameter** from an `instanceof` on its value; `R` is still `R`. The cast restates what the branch just established. (Chapter 13's bargain, one more time: one line you can point at.)
+
+## The awkward truth nobody mentions
+
+**A decorator runs at class-definition time, when no instance exists.** It cannot be handed a dependency.
+
+That leaves three options: reach for a global (and Chapter 11 spent a chapter arguing against exactly that), take the dependency as an argument (at which point it is not really a decorator), or **require the instance to carry it**.
+
+We require the instance to carry it, and we make the compiler enforce it:
+
+```typescript
+export interface Measured {
+  readonly metrics: Metrics;
+}
+
+export function timed<T extends Measured, A extends unknown[], R>(subject: string) { ... }
+```
+
+Put `@timed` on a class with no `metrics` field and it does not compile. The dependency is still injected - `new FileHistory(config.dataDir, this.metrics)` - the decorator simply reads it off `this`.
+
+That is a real constraint, and it is worth saying plainly: **a decorator is coupled to the shape of the thing it decorates.** Middleware is not. That is most of the argument between them.
+
+## The failure a decorator cannot see
+
+Look again at the output above:
+
+```
+"accounts.login": { "count": 2, "failures": 0, ... }
+```
+
+**One of those two logins was wrong.** The password was `"wrong"`, the server refused it, and the decorator recorded a success.
+
+It is not a bug in the decorator. `login()` returns a `Result<Account, ChatError>` - Chapter 10's whole point was that an *expected* failure is a **value**, not an exception. So the method returned normally, carrying a failure inside it, and `@timed` - which watches for throws - saw a function that worked.
+
+Two good decisions, meeting, and producing a wrong number.
+
+This is what cross-cutting abstractions cost: `@timed` knows about *methods*, and it does not know about *your* idea of failure. To count those, it would have to be taught what a `Result` is - and now it is not a general-purpose decorator any more, it is a `Result`-aware decorator, and the seam has leaked. There is no clever fix. There is only knowing.
+
+## Decorators vs Middleware
+
+| | Decorators | Middleware |
+|---|---|---|
+| Attached to | a specific method, at definition time | a pipeline, at runtime |
+| Order | fixed by source position | a list you can reorder |
+| Dependencies | must come off `this` or a global | passed in, ordinarily |
+| Composes over | one class's methods | anything with the same signature |
+| Knows about | the method's shape | the message's shape |
+
+The Chapter 17 chain - `rateLimit → requireAuth → handler` - stays. It processes a **stream of messages**, its behaviour is independent of any class, and the order is an argument we wanted to be able to have at runtime. Rewriting it as decorators would fix its order at source position, couple every check to the handler class, and buy nothing.
+
+`@timed` goes on methods, because it is *about* methods.
+
+> **Tip**
+>
+> The honest test: **can this behaviour be reordered, or turned off, at runtime?** If yes, it is middleware. If it is inherent to the method - "this method is the one that touches the disk, and touching the disk is worth timing" - it is a decorator. If you find yourself building a registry so that decorators can be composed and reordered, you have written middleware with worse error messages.
+
+## Putting It Together
+
+`src/decorators.ts`
+
+```typescript
+// Decorators, and an honest account of where they belong.
+//
+// This chapter's own advice - and it is right - is that our chat server wants
+// *middleware*, not decorators. Chapter 17 built a chain, `rateLimit →
+// requireAuth → handler`, and it is the correct shape: we process a stream of
+// messages, the behaviour is independent of any class, and the order has to be
+// changeable at runtime. None of that is what a decorator is for, and rewriting
+// it as one would be a downgrade with better branding.
+//
+// So this file does not replace the middleware. It does the thing decorators are
+// genuinely good at, which the chapter names precisely: **cross-cutting behaviour
+// attached to a specific method**.
+//
+// Chapter 15 gave the server the ability to notice it was slow. It gave it no
+// way at all to notice *what* was slow. `@timed` wraps the handful of operations
+// that can actually take time - scrypt, by design; the disk, by nature - and
+// nothing about FileHistory or Accounts had to learn what a metric is.
+
+import { performance } from "node:perf_hooks";
+import type { Metrics } from "./runtime.js";
+
+// --- Standard decorators, not legacy ones --------------------------------
+//
+// Nearly every decorator tutorial you will find - including this chapter's own
+// first listing - shows you this:
+//
+//     function log(target: any, key: string, descriptor: PropertyDescriptor)
+//
+// That is the **legacy** decorator, it requires `"experimentalDecorators": true`
+// in tsconfig, and it is built on a TC39 proposal that was abandoned. It also
+// has `any` in it twice, which Chapter 3 had opinions about.
+//
+// TypeScript 5.0 ships the **standard** decorator - Stage 3, on its way into
+// JavaScript itself, no compiler flag required, and properly typed. That is what
+// this file uses. It reads a little stranger and it is worth it: the signature
+// below has no `any` anywhere, and the compiler checks that a decorator is
+// applied to a method whose shape it can actually handle.
+
+// What a class must provide before it may be @timed.
+//
+// This is the awkward truth about decorators, and the chapter does not mention
+// it: a decorator runs at *class definition* time, when no instance exists, so it
+// cannot be handed a dependency. It has three options - reach for a global, take
+// the dependency as an argument (and then it is not really a decorator), or
+// require the instance to carry it.
+//
+// We require the instance to carry it. `T extends Measured` is the compiler
+// enforcing that: put `@timed` on a class with no `metrics` field and it does not
+// compile. The dependency is still injected - Chapter 11's rule holds, no
+// singletons - the decorator simply reads it off `this`.
+export interface Measured {
+  readonly metrics: Metrics;
+}
+
+export function timed<T extends Measured, A extends unknown[], R>(subject: string) {
+  return function decorate(
+    original: (this: T, ...args: A) => R,
+    context: ClassMethodDecoratorContext<T, (this: T, ...args: A) => R>,
+  ): (this: T, ...args: A) => R {
+    // `context.name` is the method's own name, supplied by the runtime. No
+    // stringly-typed duplication: rename the method and the metric renames itself.
+    const label = `${subject}.${String(context.name)}`;
+
+    return function timedMethod(this: T, ...args: A): R {
+      const started = performance.now();
+      const elapsed = (): number => performance.now() - started;
+
+      let result: R;
+      try {
+        result = original.apply(this, args);
+      } catch (thrown: unknown) {
+        // Threw synchronously.
+        this.metrics.record(label, elapsed(), false);
+        throw thrown;
+      }
+
+      // And here is the part every decorator tutorial quietly skips.
+      //
+      // If the method is `async`, it has not finished - it has handed back a
+      // Promise, and `elapsed()` right now would measure how long it took to
+      // *start*, which is approximately zero and completely useless. Almost every
+      // hand-rolled @timed decorator in the wild has this bug, and it reports
+      // beautiful sub-millisecond timings for operations that take a second.
+      //
+      // So: if we got a Promise, measure when it settles.
+      if (result instanceof Promise) {
+        const measured = result.then(
+          (value: unknown) => {
+            this.metrics.record(label, elapsed(), true);
+            return value;
+          },
+          (thrown: unknown) => {
+            this.metrics.record(label, elapsed(), false);
+            throw thrown;
+          },
+        );
+        // The one assertion. `R` is known to be a Promise inside this branch, but
+        // TypeScript cannot narrow a *generic* type parameter by an instanceof on
+        // its value - R is still R. The cast restates what the branch just proved.
+        return measured as R;
+      }
+
+      this.metrics.record(label, elapsed(), true);
+      return result;
+    };
+  };
+}
+```
 
 ## Try It
 
@@ -218,73 +274,35 @@ So in production its absence is fatal. In development it falls back, loudly - an
 npm run build && npm start
 ```
 
-```
-⚠  JWT_SECRET is not set. Using the development default - do not deploy this.
-```
-
-```json
-{"type":"join","room":"general"}
-```
-```json
-{"type":"error","code":"unauthenticated","message":"Log in first, e.g. {\"type\":\"login\",\"name\":\"alice\",\"password\":\"correct-horse\"}"}
-```
-
 ```json
 {"type":"login","name":"alice","password":"correct-horse"}
-{"type":"auth","token":"<the token you just got>"}
+{"type":"auth","token":"..."}
 {"type":"join","room":"general"}
+{"type":"chat","text":"hello"}
 ```
-
-Now try to break in. Forge an admin token with no signature:
 
 ```bash
-node -e 'const b=o=>Buffer.from(JSON.stringify(o)).toString("base64url");
-console.log(b({alg:"none",typ:"JWT"})+"."+b({sub:"u1",name:"alice",admin:true,exp:9999999999})+".")'
+curl -s http://127.0.0.1:8080/api/health | jq .operations
 ```
 
-```json
-{"type":"error","code":"bad_token","message":"Unsupported token algorithm."}
-```
+Then break the decorator on purpose. Delete the `instanceof Promise` branch, restart, and watch `history.append` report `0.01ms` for a disk write. That is the number you would have shipped, and the dashboard would have looked wonderful.
 
-And in production, without a secret:
-
-```bash
-NODE_ENV=production npm start
-# JWT_SECRET is required in production. Refusing to start with a public default.
-# exit 1
-```
-
-## Putting It Together
-
-`src/jwt.ts`, `src/auth.ts` and `src/middleware.ts` are on the `chapter17` branch. The single most important line is the algorithm check.
-
-The `alg:none` defence: the header must never decide how the header is checked. We know what we issued:
-
-```typescript
-    return err(new AuthError("Malformed token.", ErrorCode.BadToken));
-  }
-  if (algorithm !== "HS256") {
-    return err(new AuthError("Unsupported token algorithm.", ErrorCode.BadToken));
-  }
-```
-
-> **Tip**
->
-> The full files show scrypt password hashing, constant-time comparison, and the rule that the admin flag comes from the account, never from the token. Use `jose` or `jsonwebtoken` in production - this is built by hand to show what they do for you.
 ## Exercise
 
-1. Delete the `algorithm !== "HS256"` check and re-run the `alg:none` forgery. You are now an admin. Put it back, and never take it out of anything again.
-2. Replace `equalsConstantTime` with `===`. Everything still works, every test passes, and you have introduced a vulnerability that no test you are likely to write will ever catch. What does that tell you about the limits of testing?
-3. The browser page keeps the token in `localStorage`, which any script on the page can read - one XSS and the token is gone. An `httpOnly` cookie cannot be read by script. Why is a cookie awkward for a WebSocket, and what would you do about it?
-4. Add a `revoked` set of token IDs (a `jti` claim) so a stolen token can be killed before it expires. Notice you have just reinvented a session table, and ask what the JWT was buying you.
-5. `rateLimit(20, 10)` is per connection. Open forty connections. Now rate-limit per *account* instead - and then ask what happens to a user behind a corporate NAT if you rate-limit per IP.
+1. Delete the `result instanceof Promise` branch and compare `/api/health` before and after. Which of the two numbers would you have believed?
+2. `@timed` reports `failures: 0` for a rejected login, because `login()` returns a `Result`. Fix it. Now ask whether `@timed` is still a general-purpose decorator, and what you gave up.
+3. Write `@retry(3)` for `FileHistory.append`. Then work out how it interacts with the `Serializer` (Chapter 12) that guarantees ordering - does a retried write still land in the right place?
+4. Put `@timed` on a class with no `metrics` field. Read the error. That is `T extends Measured` doing its job.
+5. Reimplement `requireAuth` from Chapter 17 as a decorator on `handleMessage`. You will need the session store - which is on the instance, so it works. Now try to reorder it relative to `rateLimit` without editing the source. That is the whole chapter in one exercise.
 
 ## What's Next
 
-The door is shut. Passwords are hashed with something slow, tokens are signed and verified in constant time, the `alg:none` forgery is refused, permissions come from the account rather than the client's copy of them, and a flood is refused before it costs anything.
+Every chapter of this tutorial has ended with me running the server, opening `nc`, typing JSON at it, and reading what came back. That worked, and it does not scale, and - as Chapter 17 exercise 2 pointed out - it would never have caught a timing side channel anyway.
 
-The middleware chain we just built - `rateLimit → requireAuth → handler` - is a cross-cutting concern expressed as a wrapper. TypeScript has another way to express exactly that, one that has been in the language for years and is finally standardised. Next: **decorators and metadata**, and an honest look at when they earn their keep and when they are middleware with worse error messages.
+Chapter 11 promised this. `MessageHandler` takes a `ChatClient`, which is an interface; `Registry` is a class you can construct; the whole chat rule set can be driven by a fake client that pushes onto an array. We have been building toward being able to test this thing without a socket for eight chapters.
+
+Next: **testing** - and collecting on that promise.
 
 ---
 
-Source: <https://purphoros.com/howto/typescript/auth>
+Source: <https://purphoros.com/howto/typescript/decorators>
