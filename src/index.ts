@@ -33,6 +33,7 @@ export { createBus, formatEvent, statusLine } from "./bus.js";
 export { configure, resolvePort, DEFAULTS } from "./config.js";
 export { isAdmin } from "./types.js";
 export { chatPage } from "./page.js";
+export { Router } from "./router.js";
 
 export {
   ChatError,
@@ -66,6 +67,7 @@ export type { Result, SafeError } from "./errors.js";
 export type { ServerConfig } from "./config.js";
 export type { Bus, ChatEvent, ServerEvents } from "./bus.js";
 export type { HttpRequest, HttpResponse, HttpOutcome } from "./http.js";
+export type { PathParams, RouteHandler, HttpMethod } from "./router.js";
 export type {
   ChatClient,
   Identifiable,

@@ -12,6 +12,7 @@ import { chatPage } from "./page.js";
 import { describeRoom, summarize } from "./views.js";
 import type { FileHistory } from "./history.js";
 import type { Registry } from "./state.js";
+import { Router } from "./router.js";
 import type { TcpClient } from "./clients.js";
 
 // One parsed HTTP request. Header names are lowercased: HTTP header names are
@@ -110,87 +111,105 @@ export function isWebSocketUpgrade(req: HttpRequest): boolean {
 }
 
 export class HttpService {
+  private readonly router: Router;
+
   constructor(
     private readonly registry: Registry,
     private readonly bus: Bus,
     private readonly history: FileHistory,
-  ) {}
+  ) {
+    this.router = this.buildRoutes();
+  }
 
   // The server's own state, served over HTTP. The chat rooms and the web page
   // are the same rooms - one process, three protocols.
   //
-  // This may throw, and does: requireRoomNamed raises the very same
+  // Chapter 12 wrote this as a chain of `if (req.path === "..." && req.method
+  // === "GET")`, with one hand-rolled regex for the room route and a `named[1]`
+  // that the compiler had no opinion about. The routes are a table now, and the
+  // parameters are typed - `params.room` is a string because the *pattern* says
+  // so, and `params.rooom` does not compile.
+  //
+  // These handlers may throw, and do: requireRoomNamed raises the very same
   // NotFoundError the chat side raises. The boundary below turns it into a 404.
+  private buildRoutes(): Router {
+    const { registry, history } = this;
+
+    return new Router()
+      .on("GET", "/", () => html(200, chatPage(registry.clients.size, registry.rooms.size)))
+
+      .on("GET", "/api/status", () =>
+        json(200, {
+          status: "running",
+          uptime: process.uptime(),
+          clients: registry.clients.size,
+          rooms: registry.rooms.size,
+        }))
+
+      // The protocol, served from the protocol. CATALOG is a Record keyed by
+      // every ClientMessage variant, so this endpoint cannot describe a message
+      // the server does not accept, nor omit one it does.
+      .on("GET", "/api/protocol", () => json(200, { clientMessages: COMMANDS }))
+
+      .on("GET", "/api/rooms", () => json(200, [...registry.rooms.values()].map(describeRoom)))
+
+      // The route that earns the chapter.
+      //
+      // `params.room` is a `string`, and it is a string because the pattern
+      // "/api/rooms/:room" says it is - PathParams read the name out of the
+      // literal type. There is no regex, no capture group, no `[1]`, and nothing
+      // to keep in sync. Rename the parameter in the pattern and this line stops
+      // compiling, which is exactly what should happen.
+      .on("GET", "/api/rooms/:room", async (_req, params) => {
+        const room = registry.requireRoomNamed(params.room);
+        return json(200, { ...describeRoom(room), recent: await history.recent(room.name, 10) });
+      })
+
+      // Every room's archive, read concurrently.
+      //
+      // Promise.all is the point here. The sequential version - `for (const room
+      // of rooms) { out.push(await read(room)) }` - reads the files one after
+      // another and takes as long as all of them added up, for no reason: none
+      // depends on any other. It fails fast, and here that is correct: this
+      // endpoint promises the whole archive, and two thirds of an archive is not
+      // a smaller success, it is a wrong answer delivered confidently.
+      .on("GET", "/api/history", async () => {
+        const perRoom = await Promise.all(
+          [...registry.rooms.keys()].map((room) => history.recent(room, 10)),
+        );
+        const recent: MessageSummary[] = perRoom.flat();
+        return json(200, recent);
+      })
+
+      // Deliberately broken, and left in on purpose: the only honest way to show
+      // what the boundary does with a failure nobody planned for. curl it and you
+      // get a 500 saying "Internal server error" and absolutely nothing else. The
+      // stack goes to the log, where the person who can fix it is looking.
+      .on("GET", "/api/crash", () => {
+        throw new Error("the kind of bug you did not see coming");
+      })
+
+      .on("POST", "/api/echo", (req) =>
+        json(200, { echo: req.body ?? "", bytes: Buffer.byteLength(req.body ?? "") }));
+  }
+
   private async route(req: HttpRequest): Promise<HttpResponse> {
-    const { registry } = this;
-
-    if (req.path === "/" && req.method === "GET") {
-      return html(200, chatPage(registry.clients.size, registry.rooms.size));
+    const matched = this.router.match(req.method, req.path);
+    if (matched !== undefined) {
+      return await matched.handler(req, matched.params);
     }
 
-    if (req.path === "/api/status" && req.method === "GET") {
-      return json(200, {
-        status: "running",
-        uptime: process.uptime(),
-        clients: registry.clients.size,
-        rooms: registry.rooms.size,
-      });
-    }
-
-    // The protocol, served from the protocol. CATALOG is a Record keyed by every
-    // ClientMessage variant, so this endpoint cannot describe a message the
-    // server does not accept, nor omit one it does.
-    if (req.path === "/api/protocol" && req.method === "GET") {
-      return json(200, { clientMessages: COMMANDS });
-    }
-
-    if (req.path === "/api/rooms" && req.method === "GET") {
-      return json(200, [...registry.rooms.values()].map(describeRoom));
-    }
-
-    // One room by name. The same NotFoundError the chat side throws - from the
-    // same helper - comes back here as a 404 with the same message, because a
-    // ChatError carries both an ErrorCode and an HTTP status. One failure, one
-    // description of it, two wires.
-    const named = /^\/api\/rooms\/([^/]+)$/.exec(req.path);
-    if (named?.[1] !== undefined && req.method === "GET") {
-      const room = registry.requireRoomNamed(decodeURIComponent(named[1]));
-      return json(200, { ...describeRoom(room), recent: await this.history.recent(room.name, 10) });
-    }
-
-    // Every room's archive, read concurrently.
-    //
-    // Promise.all is the point here. The sequential version - `for (const room
-    // of rooms) { out.push(await read(room)) }` - reads three files one after
-    // another and takes as long as all three added up, for no reason: none of
-    // them depends on any other. Promise.all starts all three and waits for the
-    // slowest. Three files is not much; three hundred is the difference between
-    // a page load and a timeout.
-    //
-    // It fails fast, and here that is correct: this endpoint promises the whole
-    // archive, and two thirds of the archive is not a smaller success, it is a
-    // wrong answer delivered confidently.
-    if (req.path === "/api/history" && req.method === "GET") {
-      const perRoom = await Promise.all(
-        [...registry.rooms.keys()].map((room) => this.history.recent(room, 10)),
-      );
-      const recent: MessageSummary[] = perRoom.flat();
-      return json(200, recent);
-    }
-
-    // Deliberately broken, and left in on purpose: the only honest way to show
-    // what the boundary does with a failure nobody planned for. curl it and you
-    // get a 500 saying "Internal server error" and absolutely nothing else. The
-    // stack goes to the log, where the person who can fix it is looking.
-    if (req.path === "/api/crash" && req.method === "GET") {
-      throw new Error("the kind of bug you did not see coming");
-    }
-
-    if (req.path === "/api/echo") {
-      if (req.method !== "POST") {
-        return json(405, { error: "Use POST" });
-      }
-      return json(200, { echo: req.body ?? "", bytes: Buffer.byteLength(req.body ?? "") });
+    // No handler. But "no handler" has two causes, and they are not the same
+    // answer: a path nobody has ever heard of is a 404, and a path that exists
+    // with a verb it does not accept is a 405 - and the client is entitled to be
+    // told which verbs it *should* have used.
+    const allowed = this.router.methodsFor(req.path);
+    if (allowed.length > 0) {
+      return {
+        status: 405,
+        headers: { "Content-Type": "application/json", Allow: allowed.join(", ") },
+        body: JSON.stringify({ error: `Use ${allowed.join(" or ")}`, path: req.path }, null, 2),
+      };
     }
 
     return json(404, { error: "Not Found", path: req.path });
