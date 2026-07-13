@@ -1,305 +1,290 @@
-# Chapter 09 - Enums & Discriminated Unions
+# Chapter 10 - Error Handling
 
-Model every message our chat server handles - chat, join, leave, whisper, kick, and the rest - so that the compiler knows what each one carries, and refuses the ones that make no sense.
+Stop letting errors crash your server. Custom error classes, the Result pattern, error boundaries in event handlers, and error responses that tell a stranger enough to fix their message and nothing more.
 
-This is the chapter where the server stops guessing. Since Chapter 5 it has parsed what clients send by splitting on whitespace and looking at the first word. That worked, and it was a lie: nothing in the type system knew that `/join` needed a room, that `/nick` needed a name, or that `/jion` was not a command at all. By the end of this chapter, all three of those are compile-time facts.
+Chapter 9 ended owing you two things, and admitted to both. `decodeClientMessage` returned `{ kind: "ok" } | { kind: "invalid"; reason: string }` - a hand-rolled union doing a job that has a name. And every failure inside `handleMessage` was a `fail(); return;` pair, written a dozen times in a dozen slightly different sentences, which is what a function looks like shortly before somebody forgets the `return`.
 
-## String Enums and const Enums
+Both are gone by the end of this chapter. What replaces them is a choice you will make for the rest of your career, so it is worth making deliberately.
 
-TypeScript `enum` defines a set of named constants. String enums give each value a meaningful string representation:
+## try/catch with Typed Errors
 
-```typescript
-// String enum - each member has an explicit string value
-enum ConnectionState {
-  Connecting = "connecting",
-  Connected = "connected",
-  Disconnected = "disconnected",
-  Reconnecting = "reconnecting",
-}
-
-const state: ConnectionState = ConnectionState.Connected;
-console.log(state); // "connected"
-
-// const enum - inlined at compile time (no JavaScript object generated)
-const enum Direction {
-  Up = "UP",
-  Down = "DOWN",
-  Left = "LEFT",
-  Right = "RIGHT",
-}
-// Direction.Up is replaced with "UP" in the output - zero runtime cost
-```
-
-> **Tip**
->
-> In modern TypeScript, many developers prefer **literal union types** (`"connecting" | "connected" | "disconnected"`) over enums. Literal unions are simpler, tree-shakeable, and don't generate runtime JavaScript. We'll use both approaches and you'll see when each fits.
-
-> **Warning**
->
-> `const enum` is a trap in a project like this one, and it is worth knowing why before you reach for it. Inlining `Direction.Up` into `"UP"` requires the compiler to see the enum's declaration and its use *at the same time*. Any tool that transpiles one file at a time cannot do that - it has no idea what `Direction` is when it reaches the file that uses it. So `const enum` is an outright error under `isolatedModules`, and esbuild and swc - and therefore `tsx`, which runs this server - either reject it or quietly downgrade it to a regular enum, which is not what you asked for. Use a plain string enum, or a literal union, and let your bundler do the eliminating.
-
-## Discriminated Unions - The type Field Pattern
-
-A **discriminated union** is a union where every member has a common property (the *discriminant*) with a unique literal value. TypeScript uses this property to narrow the type:
+JavaScript's `catch` clause receives `unknown` - not `Error`. Anything can be thrown: strings, numbers, objects, `null`. You must narrow before using error properties:
 
 ```typescript
-// Each variant has a unique "type" literal
-type ChatMessage =
-  | { type: "text"; sender: string; text: string; room: string }
-  | { type: "join"; user: string; room: string }
-  | { type: "leave"; user: string; room: string }
-  | { type: "system"; text: string }
-  | { type: "command"; sender: string; command: string; args: string[] };
-
-// switch on the discriminant - TypeScript narrows in each branch
-function formatMessage(msg: ChatMessage): string {
-  switch (msg.type) {
-    case "text":
-      return `[${msg.room}] ${msg.sender}: ${msg.text}`;
-    case "join":
-      return `→ ${msg.user} joined #${msg.room}`;
-    case "leave":
-      return `← ${msg.user} left #${msg.room}`;
-    case "system":
-      return `[SYSTEM] ${msg.text}`;
-    case "command":
-      return `/${msg.command} ${msg.args.join(" ")}`;
+try {
+  JSON.parse("invalid json");
+} catch (err: unknown) {
+  // err is unknown - must narrow before using .message
+  if (err instanceof Error) {
+    console.error(err.message);  // "Unexpected token i..."
+  } else {
+    console.error("Non-Error thrown:", err);
   }
 }
 ```
 
-Inside `case "text":`, TypeScript knows `msg` is `{ type: "text"; sender: string; text: string; room: string }`. You get autocomplete for `msg.sender` and `msg.text` - properties that only exist on the "text" variant. Ask for `msg.user` in that branch and it is a compile error, because a text message has no user.
+> **Warning**
+>
+> Never write `catch (err: Error)` - TypeScript requires `unknown` or `any` for catch parameters. Always use `unknown` and narrow with `instanceof`.
+
+> **Tip**
+>
+> When you finally do stringify the unknown thing, use `String(err)` and not `` `${err}` ``. They look identical and they are not: interpolating a Symbol throws a TypeError. An error handler that throws while handling an error turns a bad afternoon into a long evening, and it will happen on the one input you never tested.
+
+## Custom Error Classes
+
+An `Error` with a message is a sentence. What you want is a *fact* - something a program can branch on and a wire can carry:
+
+```typescript
+class ChatError extends Error {
+  constructor(
+    message: string,
+    public readonly code: string,
+    public readonly statusCode: number = 400,
+  ) {
+    super(message);
+    this.name = "ChatError";
+  }
+}
+
+class AuthError extends ChatError {
+  constructor(message: string) {
+    super(message, "AUTH_FAILED", 401);
+    this.name = "AuthError";
+  }
+}
+
+// Handle with instanceof - narrows to the specific error type
+function handleError(err: unknown): { code: string; message: string } {
+  if (err instanceof AuthError) {
+    return { code: err.code, message: err.message };
+  }
+  if (err instanceof ChatError) {
+    return { code: err.code, message: err.message };
+  }
+  if (err instanceof Error) {
+    return { code: "INTERNAL", message: err.message };
+  }
+  return { code: "UNKNOWN", message: String(err) };
+}
+```
+
+The `code` is the point. A message is for a human and will be reworded next Tuesday; a code is for a program and must not be. Our `ChatError` carries a `code` *and* an HTTP `status`, because the same failure has to travel down two very different wires - an unknown room is a `ServerMessage` with code `"unknown_room"` to a chat client and a `404` to `curl`, and it should not take two error types to say one thing.
+
+> **Warning**
+>
+> Most tutorials - and the first draft of this chapter - put `Object.setPrototypeOf(this, ChatError.prototype)` in every constructor, labelled "required for instanceof to work". It is required, and only when TypeScript is **downlevelling** classes. Compile `class X extends Error` to ES5 and the emitted function cannot build the prototype chain the way `new Error()` does, so `x instanceof X` comes back `false` and every `catch` in your program quietly stops recognising its own errors.
+>
+> We target ES2022 and emit real classes, where extending a built-in works exactly as written. `src/errors.ts` omits the line, and the `instanceof` checks in the boundary do fire - verify it yourself by throwing one. Set `"target": "ES5"` in `tsconfig.json` and you will need it back. Knowing *why* it is there is the difference between engineering and folklore.
+
+## The Result Pattern
+
+Exceptions are invisible in the type signature. A function that throws looks exactly like a function that does not, and the compiler will never once remind you. The **Result pattern** puts the failure in the return type, where it cannot be missed:
+
+```typescript
+// A generic Result: either a value or an error, never both
+type Result<T, E = string> =
+  | { ok: true; value: T }
+  | { ok: false; error: E };
+
+function parsePort(input: string): Result<number> {
+  const port = Number.parseInt(input, 10);
+  if (Number.isNaN(port) || port <= 0 || port > 65535) {
+    return { ok: false, error: `Invalid port: ${input}` };
+  }
+  return { ok: true, value: port };
+}
+
+// The caller MUST look at `ok` before it can reach either field
+const result = parsePort("abc");
+if (result.ok) {
+  console.log(result.value);   // number - TypeScript knows
+} else {
+  console.log(result.error);   // string - TypeScript knows
+}
+```
+
+If that shape looks familiar, it should: it is a discriminated union, exactly like Chapter 9's, with `ok` as the discriminant. `Result` is not a new language feature. It is the pattern you already know, pointed at failure.
+
+## Choosing Between Them
+
+Here is the rule the server actually follows, and the reason both tools survive in one codebase.
+
+**Return a `Result` when the failure is expected and the caller is right there.** Decoding a line off a socket. Validating a nickname. Parsing a port off the command line. These fail constantly - anyone can type anything into `nc` - and the code that must react is the code that called you. Put the failure in the type and it cannot be ignored the way a missing `try` can.
+
+**Throw when the failure is expected and has to travel.** A room lookup fails eight frames down, inside one arm of a twelve-case switch. There is exactly one thing to do about it - tell this client - and it happens far away, at the boundary. Threading a `Result` up through every one of those cases would add a branch per case and change nothing about what happens.
+
+Watch what that buys `handleMessage`. Every case is now the happy path:
+
+```typescript
+case "chat": {
+  const room = requireRoom(client);          // throws StateError if you are nowhere
+  bus.emit("message", new ChatMessage(client.label, message.text, room.name));
+  return;
+}
+
+case "kick": {
+  const user = client.user;
+  if (user === undefined || !isAdmin(user)) {
+    throw new PermissionError("Only admins may kick. Identify yourself first.");
+  }
+  const target = requireClient(message.target);   // throws NotFoundError
+  if (target === client) {
+    throw new PermissionError("You cannot kick yourself.");
+  }
+  bus.emit("kick", client, target, message.reason);
+  return;
+}
+```
+
+No `fail(); return;`. No error string written twice. `requireRoom` and `requireClient` say what they need, and the boundary deals with them not getting it.
+
+And a third case, the one that actually kills servers: **something nobody predicted.** That is not modelled at all. It is caught, logged in full, and answered with a shrug.
+
+> **Tip**
+>
+> The honest cost of `throw`: it is not in the signature and TypeScript cannot put it there. `handleMessage` throws and its type says `void`, and no compiler will ever warn a new caller. That is precisely why the failures a caller has to *branch on* are Results instead - you get to choose which functions lie about their failure modes, and the answer should be "as few as possible, all of them behind one boundary."
+
+## Error Boundaries in Event Handlers
+
+An unhandled throw inside a socket's `data` handler does not fail that request. It takes down the process - every other connected client with it. On a server whose entire job is reading things strangers typed, that is not a risk, it is a schedule.
+
+So every line from every client, on either transport, passes through exactly one function, and nothing thrown below it escapes:
+
+```typescript
+function handleLine(client: ChatClient, line: string): void {
+  try {
+    const decoded = decodeClientMessage(line);
+    if (!decoded.ok) {
+      // An expected failure that arrived as a value. No throw, no catch -
+      // the type said this could happen and here we are, handling it.
+      client.send(toErrorMessage(decoded.error));
+      return;
+    }
+    handleMessage(client, decoded.value);
+  } catch (thrown: unknown) {
+    if (!(thrown instanceof ChatError)) {
+      // Not one of ours: a bug. The log gets the stack trace, because
+      // someone has to fix this and it is not the person who typed.
+      bus.emit("failure", client.label, asError(thrown));
+    }
+    client.send(toErrorMessage(thrown));
+  }
+}
+```
+
+The asymmetry in that `catch` is the whole security argument. **Our own errors are deliberate** - we wrote their messages knowing a stranger would read them, so `No such room "nowhere". Try: general, random, dev` goes out verbatim, and is genuinely helpful. **Anything else is a bug**, and the client is told `"Internal server error"` and not one character more:
+
+```typescript
+export function toSafeError(thrown: unknown): SafeError {
+  if (thrown instanceof ChatError) {
+    return { code: thrown.code, message: thrown.message, status: thrown.status };
+  }
+  return { code: ErrorCode.Internal, message: "Internal server error", status: 500 };
+}
+```
+
+A stack trace handed to an attacker is a gift - file paths, library versions, sometimes the shape of a query. To everyone else it is noise. The one audience allowed the whole truth is the log.
 
 > **Note**
 >
-> A discriminated union models a value that is exactly one of several shapes, each carrying its own fields. The shared literal field - here `type` - is the tag the compiler switches on, which is what makes the match exhaustive and gives each branch access to that variant's fields alone.
+> The HTTP side gets the same boundary, and it is the same code - `readHttp` catches, calls `toSafeError`, and uses the `status` where the chat side used the `code`. One error type, thrown from one helper, rendered two ways. `GET /api/rooms/nowhere` returns `404 {"error":"No such room \"nowhere\"...","code":"unknown_room"}` and a chat client asking for the same room gets a `ServerMessage` saying the same thing. That is the payoff for putting both fields on `ChatError`.
 
-## Exhaustive Checking with never
-
-The `never` type ensures every variant is handled. `never` is the type with no values, so nothing is assignable to it. Once a switch has handled every variant, the value left over in `default` has been narrowed to nothing - and only then does a call taking `never` typecheck:
+## The Last Net
 
 ```typescript
-function assertNever(value: never): never {
-  throw new Error(`Unhandled value: ${value}`);
-}
-
-function formatMessage(msg: ChatMessage): string {
-  switch (msg.type) {
-    case "text": return `${msg.sender}: ${msg.text}`;
-    case "join": return `→ ${msg.user} joined`;
-    case "leave": return `← ${msg.user} left`;
-    case "system": return `[SYSTEM] ${msg.text}`;
-    case "command": return `/${msg.command}`;
-    default: return assertNever(msg);
-    // If a case is missing, msg is NOT never → compile error
-  }
-}
+process.on("uncaughtException", (error: Error) => {
+  console.error(`FATAL - nothing caught this: ${describeThrown(error)}`);
+  process.exit(1);
+});
 ```
 
-Miss a case, and the error names the variant you forgot:
+This is **not** a second boundary, and the difference matters. The boundary in `handleLine` runs where there is still a client to answer and one request to abandon; everything else keeps working. By the time a throw reaches `uncaughtException`, nobody knows what was half-done - a room joined but not announced, a buffer consumed but not parsed. A process running on state it cannot describe is worse than a process that stopped, because it will now produce wrong answers confidently.
 
-```
-error TS2345: Argument of type '{ type: "command"; ... }' is not
-  assignable to parameter of type 'never'.
-```
-
-That is the whole trick, and it is worth being precise about what it buys you: it is not that the switch is checked once, today. It is that the switch is checked *every time anyone adds a variant, forever*. The compiler becomes the colleague who reviews your union changes and never gets bored.
-
-> **Warning**
->
-> Without `assertNever` in the default, TypeScript won't catch missing cases. The switch compiles fine - you just get `undefined` at runtime for the unhandled variant. Always add the exhaustive check when handling discriminated unions.
-
-## Deriving Types From the Union
-
-Once a union exists, you rarely need to write its variants down a second time. Three utilities do the work, and our server uses all three.
-
-`ClientMessage["type"]` is the union of every discriminant - indexing a union by a key they all share gives you the union of that key's types:
-
-```typescript
-type ClientMessageType = ClientMessage["type"];
-// "chat" | "whisper" | "join" | "leave" | "nick" | ...
-```
-
-`Extract<T, U>` goes the other way, narrowing a union to the members that match a shape:
-
-```typescript
-type JoinMessage = Extract<ClientMessage, { type: "join" }>;
-// { type: "join"; room: string }
-```
-
-And `Record<K, V>` - from Chapter 8 - turns the discriminant union into a *checklist*. An object typed `Record<ClientMessageType, Something>` must have a key for every variant. Miss one and the object literal will not compile:
-
-```typescript
-// The catalog cannot fall out of date with the protocol, because the
-// compiler will not let it. Add a variant to ClientMessage and this
-// object stops compiling until you describe the new message.
-const CATALOG: Record<ClientMessageType, CommandInfo> = {
-  chat: { ... },
-  join: { ... },
-  // forget one → error TS2741: Property 'whisper' is missing
-};
-```
-
-This is the pattern to reach for whenever something must exist "one per variant" - a help entry, a validator, a handler, a UI renderer. The union is declared once, and everything else is derived from it and checked against it.
-
-## Parsing Is Where the Types Come From
-
-Here is the most important thing in the chapter, and it is easy to get wrong. A discriminated union is a promise about a value's shape. `JSON.parse` returns `any`. Somewhere between the socket and the switch, someone has to *keep* that promise.
-
-The tempting version does not:
-
-```typescript
-function parseClientMessage(raw: string): ClientMessage | null {
-  try {
-    const data = JSON.parse(raw);
-    if (typeof data.type !== "string") return null;
-    return data as ClientMessage;   // ← a lie
-  } catch {
-    return null;
-  }
-}
-```
-
-That `as` is an assertion, not a check. It tells the compiler "trust me, this is a ClientMessage" about a value that came off a socket from someone you have never met. Send `{"type":"join"}` with no room and every downstream `msg.room` is `undefined` - typed as `string`, valued as nothing - and your server crashes in a function that looks completely correct. Chapter 3 warned about exactly this: an assertion silences the compiler, it does not change the value.
-
-The honest version checks each variant's fields and *rebuilds* the message from the parts it has proven:
-
-```typescript
-const DECODERS: DecoderMap = {
-  chat: (f) => (isString(f.text) ? { type: "chat", text: f.text } : null),
-  join: (f) => (isString(f.room) ? { type: "join", room: f.room } : null),
-  leave: () => ({ type: "leave" }),
-  // ...one per variant, and Record<> insists on all of them
-};
-```
-
-Nothing is asserted. Each decoder is handed `Record<string, unknown>` - keys we have not checked, values we know nothing about - and hands back either a real message or `null`. Everything downstream of that function works with a value the compiler can trust, because that function is the one place that earned the trust.
-
-> **Tip**
->
-> This is the shape of every well-built boundary: `unknown` on the outside, a real type on the inside, and one validating function in between. The type system cannot check what arrives on a socket. It can, however, make it impossible to *use* what arrives until someone has checked it - which is the same thing, provided you never write `as`.
-
-## Applying to Chat: The Complete Message Protocol
-
-Two unions define the whole conversation. `ClientMessage` is everything a client may say; `ServerMessage` is everything the server may say back. A client that handles every `ServerMessage` variant handles the entire protocol - there is no thirteenth thing it might be sent.
-
-```typescript
-// Client → Server
-export type ClientMessage =
-  | { type: "chat"; text: string }
-  | { type: "whisper"; to: UserId; text: string }
-  | { type: "join"; room: RoomName }
-  | { type: "leave" }
-  | { type: "nick"; name: string }
-  | { type: "who" }
-  | { type: "rooms" }
-  | { type: "history"; limit?: number }
-  | { type: "kick"; target: UserId; reason: string }
-  | { type: "status" }
-  | { type: "help" }
-  | { type: "quit" };
-
-// Server → Client
-export type ServerMessage =
-  | { type: "welcome"; id: string; transport: Transport; text: string }
-  | { type: "system"; text: string }
-  | { type: "chat"; sender: UserId; text: string; room: RoomName; at: Timestamp }
-  | { type: "whisper"; from: UserId; to: UserId; text: string; at: Timestamp }
-  | { type: "joined"; user: UserId; room: RoomName; members: number }
-  | { type: "left"; user: UserId; room: RoomName }
-  | { type: "userList"; users: readonly UserSummary[] }
-  | { type: "roomList"; rooms: readonly RoomSummary[] }
-  | { type: "history"; room: RoomName; messages: readonly MessageSummary[] }
-  | { type: "commands"; commands: readonly CommandInfo[] }
-  | { type: "kicked"; by: UserId; reason: string }
-  | { type: "error"; code: ErrorCode; message: string };
-```
-
-Both transports now carry the same JSON - one object per line over TCP, one object per frame over WebSocket - so a `nc` session and a browser tab are speaking the same language, not two dialects that happen to rhyme.
-
-That the TCP side works at all is the Chapter 5 buffering finally being paid off. TCP is a byte stream with no message boundaries: a JSON object can arrive in three chunks, or two objects can arrive in one. `takeLines()` already deals with that, and the newline is the frame. Nothing new was needed.
-
-> **Tip**
->
-> Separate `ClientMessage` and `ServerMessage` types give you type safety on both sides. The client can only send messages the server expects, and the server can only send messages the client handles. Look at `ChatClient.send()` in the listing below: it takes a `ServerMessage`, not a `string`. The chat logic never formats a line of output by hand again, and it *cannot* send a shape no client has heard of.
-
-### Two departures from the chapter
-
-**The parse must validate, not assert.** The listing at the top of this chapter ends `return data as ClientMessage`, and Chapter 3 spent a page explaining why that is exactly the wrong move. `src/protocol.ts` uses one decoder per variant, checks the fields, and constructs a fresh message. See *Parsing Is Where the Types Come From* above.
-
-**`ConnectionState` has no `Reconnecting`.** The exercise asks for four states including reconnecting, and a server has no such state - a server does not reconnect, it sits still and is connected *to*. Putting a state into the enum that no server-side connection can ever be in means every exhaustive switch has to handle a case that cannot happen, which is precisely the dead weight `assertNever` exists to prevent. So the server's enum is `Connecting` (accepted, protocol not yet sniffed), `Connected`, `Closing` (draining what we wrote), `Disconnected` - four states it genuinely passes through. `reconnecting` does exist, in the browser page at the bottom of `src/index.ts`, because that is whose state it is. Where a state lives is part of what it means.
+So: say something useful, then die honestly. Restarting is somebody else's job - systemd, Docker, Kubernetes - and they are much better at it than a `catch` block that has no idea what just happened.
 
 ## Putting It Together
 
-`src/protocol.ts` is new: the contract, and the only place a message is decoded or encoded. `src/index.ts` loses its string parsing entirely - `handleMessage()` switches over an already-checked `ClientMessage`, and `assertNever` guarantees every variant is handled. Both files are on the `chapter9` branch; here are the two pieces that matter.
+`src/errors.ts` is new: `Result<T, E>`, the `ChatError` hierarchy, and the two functions that decide what a stranger is allowed to know. It is on the `chapter10` branch, along with the changes to `protocol.ts` (the decoder returns a `Result`) and `index.ts` (`handleMessage` throws, `handleLine` is the boundary). Here are the load-bearing pieces of `errors.ts`.
 
-Everything a client may send, as a discriminated union - the `type` field is the discriminant the compiler switches on:
+`Result<T, E>` is a discriminated union - a value or an error, never both. The caller must look at `ok` before it can reach either field:
 
 ```typescript
-export type ClientMessage =
-  | { type: "chat"; text: string }
-  | { type: "whisper"; to: UserId; text: string }
-  | { type: "join"; room: RoomName }
-  | { type: "leave" }
-  | { type: "nick"; name: string }
-  | { type: "who" }
-  | { type: "rooms" }
-  | { type: "history"; limit?: number }
-  | { type: "kick"; target: UserId; reason: string }
-  | { type: "status" }
-  | { type: "help" }
-  | { type: "quit" };
+export type Result<T, E = ChatError> =
+  | { ok: true; value: T }
+  | { ok: false; error: E };
 
-// The name of a variant: "chat" | "whisper" | "join" | ... Indexing a union by a
-// key it shares gives the union of that key's types, which here is the set of
-// every legal discriminant. Nothing has to list them a second time.
-export type ClientMessageType = ClientMessage["type"];
+// `Result<T, never>` is assignable to any `Result<T, E>`: the error arm cannot
+// be constructed, which is exactly what "this one succeeded" means.
+export function ok<T>(value: T): Result<T, never> {
+  return { ok: true, value };
+}
+
+export function err<E>(error: E): Result<never, E> {
+  return { ok: false, error };
+}
 ```
 
-And the decoder. It does not `as ClientMessage` a parsed blob; it validates each variant's fields and returns a value the rest of the server can trust:
+And the error hierarchy. Every deliberate failure carries a machine-readable `code` and an HTTP `status`, so the same error renders down two wires:
 
 ```typescript
-export function decodeClientMessage(raw: string): Decoded {
-  let value: unknown;
-  try {
-    value = JSON.parse(raw);
-  } catch {
-    return invalid(`expected JSON, e.g. ${CATALOG.chat.example}`);
+export class ChatError extends Error {
+  constructor(
+    message: string,
+    readonly code: ErrorCode,
+    readonly status: number = 400,
+  ) {
+    super(message);
+    // `new.target` is the constructor that was actually called with `new`, so a
+    // NotFoundError gets name "NotFoundError" without every subclass repeating
+    // itself.
+    this.name = new.target.name;
   }
+}
 
-  if (!isRecord(value)) {
-    return invalid("expected a JSON object");
+// The message did not survive decoding: not JSON, not an object, no `type`, an
+// unknown `type`, or the right type with the wrong fields.
+export class ProtocolError extends ChatError {
+  constructor(message: string) {
+    super(message, ErrorCode.InvalidMessage, 400);
   }
+}
 
-  const type = value.type;
-  if (!isString(type)) {
-    return invalid('every message needs a "type" field');
+// The message decoded, and then said something we will not accept - a nickname
+// with a space in it, a limit of -3. Well-formed, still wrong.
+export class ValidationError extends ChatError {
+  constructor(message: string) {
+    super(message, ErrorCode.Validation, 422);
   }
+}
 
-  // hasOwn, not `in`: "toString" is *in* every object, and dispatching on it
-  // would hand us Object.prototype.toString to call as a decoder.
-  if (!Object.hasOwn(DECODERS, type)) {
-    return invalid(`unknown message type "${type}". Known types: ${KNOWN_TYPES}`);
+// You asked for something that is not here: a room, a user, a person to whisper
+// to. The code says which, because "not found" alone is not an answer.
+export class NotFoundError extends ChatError {
+  constructor(message: string, code: ErrorCode) {
+    super(message, code, 404);
   }
+}
 
-  // Widen on the way out. Each decoder in the map returns its *own* variant -
-  // that is the point of the map - but once the key is only known to be some
-  // ClientMessageType, the thing it returns is only known to be some
-  // ClientMessage. Annotating the plain function type says exactly that, and is
-  // the last of the narrowing: everything past here is typed.
-  const decode: (fields: Fields) => ClientMessage | null = DECODERS[type as ClientMessageType];
-  const message = decode(value);
-  if (message === null) {
-    return invalid(`malformed "${type}" message. Expected ${CATALOG[type as ClientMessageType].example}`);
+// You are allowed to ask, and you are not allowed to have it.
+export class PermissionError extends ChatError {
+  constructor(message: string) {
+    super(message, ErrorCode.NotPermitted, 403);
   }
+}
 
-  return { kind: "ok", message };
+// Nothing is wrong with the request; it simply makes no sense right now. You
+// cannot leave a room you are not in.
+export class StateError extends ChatError {
+  constructor(message: string, code: ErrorCode = ErrorCode.NotInRoom) {
+    super(message, code, 409);
+  }
 }
 ```
 
 > **Tip**
 >
-> The complete, runnable file is `src/protocol.ts` on the `chapter9` branch. You are not meant to paste it wholesale - build your own as you follow along, and use the reference to check yourself.
+> The complete, runnable file is `src/errors.ts` on the `chapter10` branch. You are not meant to paste it wholesale - build your own as you follow along, and use the reference to check yourself.
 
 ## Try It
 
@@ -307,68 +292,68 @@ export function decodeClientMessage(raw: string): Decoded {
 npm run dev
 ```
 
-The server tells you what it speaks now:
-
-```
-Clients now speak JSON - one object per line over TCP, one per frame over WebSocket:
-  {"type":"join","room":"general"}
-  {"type":"chat","text":"hello everyone"}
-```
-
-Open two terminals and talk between them:
-
-```bash
-nc 127.0.0.1 8080
-{"type":"nick","name":"alice"}
-{"type":"join","room":"general"}
-{"type":"chat","text":"hello everyone"}
-```
-
-Every reply is a `ServerMessage`:
+Every failure now arrives with a code you can branch on:
 
 ```json
-{"type":"welcome","id":"c1","transport":"tcp","text":"Welcome. You are c1. Send {\"type\":\"help\"} to see what I understand."}
-{"type":"system","text":"You are now alice. You are an admin (level 2)."}
-{"type":"joined","user":"alice","room":"general","members":1}
-{"type":"chat","sender":"alice","text":"hello everyone","room":"general","at":1783921779116}
-```
-
-Now get it wrong on purpose, which is the part worth doing:
-
-```json
-this is not json
-{"type":"jion","room":"general"}
-{"type":"join"}
+not json at all
+{"type":"chat","text":"before joining"}
+{"type":"join","room":"nowhere"}
+{"type":"nick","name":"has a space"}
+{"type":"whisper","to":"ghost","text":"hi"}
 ```
 
 ```json
 {"type":"error","code":"invalid_message","message":"expected JSON, e.g. {\"type\":\"chat\",\"text\":\"hello everyone\"}"}
-{"type":"error","code":"invalid_message","message":"unknown message type \"jion\". Known types: chat, whisper, join, leave, nick, who, rooms, history, kick, status, help, quit"}
-{"type":"error","code":"invalid_message","message":"malformed \"join\" message. Expected {\"type\":\"join\",\"room\":\"general\"}"}
+{"type":"error","code":"not_in_room","message":"Join a room first, e.g. {\"type\":\"join\",\"room\":\"general\"}"}
+{"type":"error","code":"unknown_room","message":"No such room \"nowhere\". Try: general, random, dev"}
+{"type":"error","code":"validation","message":"\"has a space\" is not a usable name: 1-20 characters, letters, digits, _ or - only."}
+{"type":"error","code":"no_such_target","message":"Nobody here is called \"ghost\"."}
 ```
 
-A typo is now a protocol error with an explanation, not a shrug. And the protocol can describe itself, because `CATALOG` is a `Record` keyed by every variant:
+Now the same errors down the other wire:
 
 ```bash
-curl http://127.0.0.1:8080/api/protocol
+curl -i http://127.0.0.1:8080/api/rooms/nowhere    # 404, code "unknown_room"
 ```
 
-Open <http://127.0.0.1:8080/> in a browser and you get the other end of the same two unions: a page that builds a `ClientMessage` from what you type and switches over every `ServerMessage` it might be sent. Type in the browser, watch it arrive in `nc`.
+And the one that matters. `/api/crash` throws a plain `Error` on purpose - it is left in the source precisely so you can watch the boundary hold:
+
+```bash
+curl -i http://127.0.0.1:8080/api/crash
+```
+
+```
+HTTP/1.1 500 Internal Server Error
+{ "error": "Internal server error", "code": "internal" }
+```
+
+The client learns nothing. The server log, meanwhile, gets the whole stack:
+
+```
+[SYSTEM] GET /api/crash failed - Error: the kind of bug you did not see coming
+    at handleRequest (src/index.ts:...)
+```
+
+And then - the entire point - the next request is served as if nothing happened:
+
+```bash
+curl http://127.0.0.1:8080/api/status    # 200. Still running.
+```
 
 ## Exercise
 
-1. Add a `"mute"` variant to `ClientMessage` with `target: string` and `seconds: number`. Do not touch anything else, then run `npm run typecheck` - the compiler will name every place that has to change: the decoder map, the catalog, and the switch in `handleMessage`. Follow it until it goes quiet.
-2. Remove a `case` from the switch in `handleMessage` and read the error. Which variant does it name, and why is the type it complains about `never`?
-3. Change `decodeClientMessage` to `return value as ClientMessage` instead of validating, then send `{"type":"join"}` with no room. Where does it break, and how far is that from where you lied?
-4. `describeState` switches over the `ConnectionState` enum. Add a fifth member and watch a switch you did not touch stop compiling.
-5. Give `ServerMessage` a `"typing"` variant (`user`, `room`) and emit it. The browser page's `render()` has a `default` branch rather than an `assertNever` - it is plain JavaScript. What does that cost you, and what would it take to get the guarantee back on the client side?
+1. Send `{"type":"nick","name":"a-name-far-too-long-to-be-reasonable"}` and read the code you get back. Now send `{"type":"nick","name":"carl"}`. Why is one a `validation` error and the other `unknown_user`? Which one is a `Result` and which is a `throw`, and would you have chosen the same way?
+2. Add a `RateLimitError` (code `rate_limited`, status `429`). Refuse more than five messages a second from one client. Notice that you write no new plumbing at all - the boundary already knows how to render it down both wires.
+3. Delete the `try`/`catch` from `handleLine`, then send `{"type":"join","room":"nowhere"}`. Watch the whole server die because one person made one typo. Put it back.
+4. In `toSafeError`, return `thrown.message` for *every* error rather than just `ChatError`s. Hit `/api/crash` again and read what a stranger can now see. This is the bug, in miniature, that leaks database schemas.
+5. `handleMessage` throws and its signature says `void`. Write a `Result`-returning version of one case and compare. Which one would you rather read? Which one would you rather *maintain* after someone adds a thirteenth message type?
 
 ## What's Next
 
-You now have discriminated unions - the type-safe way to model "one of several things, each with different fields" - and the exhaustive switch that makes forgetting one a build error rather than a 3am `undefined`. The server has a real protocol, checked at compile time on both ends, and a decoder that earns every type it hands out.
+Error handling is no longer an afterthought bolted onto the happy path. Failures that a caller must branch on are `Result`s, and the type system enforces it. Failures that must travel are `ChatError`s, and one boundary renders them to whichever wire the client happens to be on. Bugs are caught, logged in full, and answered with a sanitised shrug. The server stays up.
 
-What it does not have is a story for when things go wrong. Look at `decodeClientMessage`: it returns `{ kind: "invalid"; reason: string }` - a union, because that is the tool we had. Look at the socket error handlers, which just log. In the next chapter we take **error handling** seriously: try/catch with typed errors, custom error classes, and the `Result` pattern for propagating failure without pretending it cannot happen.
+Along the way, `src/` quietly became four files with a dependency order that is no longer accidental - `errors ← protocol ← index`, plus `events` off to one side - and we had to think about import cycles for the first time. That is the next chapter: **modules and project structure**, where `index.ts` stops being a thousand lines and becomes a program with a shape.
 
 ---
 
-Source: <https://purphoros.com/howto/typescript/unions>
+Source: <https://purphoros.com/howto/typescript/error-handling>
