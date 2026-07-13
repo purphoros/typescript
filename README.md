@@ -1,237 +1,214 @@
-# Chapter 22 - REST API
+# Chapter 23 - Real-Time Features
 
-The HTTP endpoints grew one at a time, whenever a chapter needed to show something. `/api/status` in Chapter 6. `/api/rooms` in Chapter 9. `/api/crash` in Chapter 10. `/api/health` in Chapter 15.
+Two questions that look like one:
 
-They are not an API. They are a pile of endpoints. And every single one of them was public:
+- Is this client's **socket** still working?
+- Is there a **person** on the other end of it?
 
-```bash
-curl http://localhost:8080/api/history
-```
-```
-200. Every message. Every room. No credential of any kind.
-```
+Until this chapter the server could not answer either. It assumed the first and never thought about the second.
 
-Chapter 17 shut the door on the chat protocol - sessions, tokens, a `requireAuth` middleware, the whole thing - and left this wide open. **That is not an oversight in Chapter 17; it is the shape of Chapter 17.** Auth was built as a middleware over `ClientMessage`, and an HTTP request is not a `ClientMessage`.
+## A TCP connection is not a heartbeat
 
-Authentication that is bolted onto one protocol is not authentication. It is a habit.
+It is a *belief*. The kernel believes the far end is still there, on the strength of packets that arrived some time ago.
 
-## Make the check impossible to forget
+If a client leaves **properly**, it sends a FIN and everybody finds out. If it leaves **improperly** - a laptop lid closes, a router reboots, a phone walks into a lift - it sends **nothing at all**. The socket stays open on our side, indefinitely, holding a place in a room for somebody who is not there.
 
-The obvious fix is a line at the top of every handler:
+TCP has its own keepalive for exactly this. Its default idle time before the first probe is **two hours**.
 
 ```typescript
-.on("GET", "/api/rooms", (req) => {
-  const session = requireSession(req);     // ...and if somebody forgets this line?
-  return json(200, ...);
-})
+socket.setKeepAlive(true, 30_000);
 ```
 
-That works, and it works for exactly as long as everybody remembers. So instead the **router carries a context type**, and there are two of them:
+Worth turning on - it costs nothing - and nowhere near enough. So the application asks:
 
 ```typescript
-private readonly open: Router<void>;
-private readonly secure: Router<Session>;
-```
-
-A `Router<void>` hands its handlers nothing. A `Router<Session>` **hands its handlers a session**:
-
-```typescript
-.on("GET", "/api/users/me", (_req, _params, session) =>
-  json(200, { name: session.user.name, admin: isAdmin(session.user) }))
-```
-
-An authenticated handler cannot forget to check for a session, because it **could not have been called without one**. The check is not a line of code somebody has to remember to write. It is the type of the argument.
-
-This is the same move as Chapter 16's state machine, and Chapter 9's `assertNever`, and Chapter 10's `Result`: **make the bad state unrepresentable, rather than validating against it in twelve places and hoping.**
-
-```typescript
-export type RouteHandler<P extends string, C> = (
-  request: HttpRequest,
-  params: PathParams<P>,
-  context: C,
-) => HttpResponse | Promise<HttpResponse>;
-```
-
-The router from Chapter 13 needed one extra type parameter. That is all.
-
-## One policy, two protocols
-
-```typescript
-private async authenticate(req: HttpRequest): Promise<Session> {
-  const header = req.headers.get("authorization");
-  const token = header?.match(/^Bearer (.+)$/i)?.[1];
-
-  if (token === undefined) {
-    throw new AuthError("Send an Authorization: Bearer <token> header.", ErrorCode.Unauthenticated);
-  }
-
-  // The same function the chat protocol's `auth` message uses.
-  const session = await resume(this.deps.accounts, token, this.deps.config.jwtSecret);
-  if (!session.ok) throw session.error;
-  return session.value;
+if (client instanceof WsClient) {
+  client.ping();                    // a protocol-level ping FRAME
+} else {
+  client.send({ type: "ping" });    // raw TCP has no such frame, so: a message
 }
 ```
-
-`resume()` is Chapter 17's, unchanged. The `alg:none` forgery is refused here for the same reason it is refused there - because it is the *same code*, not because somebody remembered to write the check twice.
 
 > **Tip**
 >
-> **A Bearer token, not a cookie.** A cookie is sent by the browser *automatically*, on every request, **including ones triggered by another website** - which is precisely what CSRF is. A credential that must be attached deliberately is a credential that cannot be used against you by a page you did not visit. That is a whole class of vulnerability we simply do not have. (Chapter 24 comes back to this, because the WebSocket upgrade has the same problem and we have not fixed it yet.)
+> The WebSocket ping is a **frame**, not a message. It never reaches the application on the other end - the browser's own WebSocket stack answers it, automatically, with a pong frame, and no JavaScript on the page is ever told it happened. That is why it works against clients that have never heard of us.
+>
+> Raw TCP has no such thing, so TCP clients get `{"type":"ping"}` and are expected to answer `{"type":"pong"}`. Two mechanisms, one meaning, because the transports genuinely differ and pretending otherwise would mean inventing a worse version of something WebSocket already has.
 
-## Order matters, and it leaks if you get it wrong
-
-```typescript
-const publicRoute = this.open.match(req.method, path);
-if (publicRoute !== undefined) return await publicRoute.handler(req, publicRoute.params, undefined as void);
-
-const secureRoute = this.secure.match(req.method, path);
-if (secureRoute === undefined) {
-  // ...405 or 404
-}
-
-const session = await this.authenticate(req);   // only now
-```
-
-Look at where `authenticate` is: **after** we know the route exists.
-
-Do it the other way round and an unauthenticated request to `/api/secrets` gets a `401` - which tells a stranger *that the path exists and they simply cannot see it*. Do it this way and it gets a `404`, which tells them nothing.
+Miss two in a row and you are not slow, you are gone:
 
 ```
-  GET /api/rooms    (no token) -> 401
-  GET /api/secrets  (no token) -> 404
+  clients connected: 2 (one answers pings, one never will)
+  waiting out the heartbeat...
+  clients connected: 1
+  zombie got 2 ping(s), never answered, and was told: "No heartbeat. Closing."
 ```
-
-It is a small leak. It is also free not to make it.
-
-## Status codes are an interface
-
-| | |
-|---|---|
-| **201** + `Location` | you made a thing, and here is where it now lives |
-| **204** | it worked, and there is nothing to say |
-| **401** + `WWW-Authenticate` | I do not know who you are |
-| **403** | I know exactly who you are, and the answer is still no |
-| **404** | there is no such thing |
-| **405** + `Allow` | there is such a thing, and not by that verb |
-| **422** | I understood you perfectly, and no |
-
-The 400/422 line is the one people skip, and it is Chapter 10's distinction wearing an HTTP hat: `{"text": 123}` is a **400** (I could not read you), and `{"text": "<1001 characters>"}` is a **422** (I read you, and no).
-
-And a `401` without `WWW-Authenticate` is not a 401, it is a 401-shaped noise. The header is what tells a client *how* to authenticate:
-
-```
-HTTP/1.1 401 Unauthorized
-WWW-Authenticate: Bearer
-```
-
-## Pagination: a cursor, not an offset
-
-```typescript
-page(room: RoomName, limit: number, before?: number): Promise<MessageSummary[]>;
-```
-
-`LIMIT 20 OFFSET 40` looks equivalent, and is not. **Messages arrive while somebody is reading.** Every new row shifts the old ones down, so page 3 shows you two messages you already saw on page 2 - and if a row is deleted, page 3 skips one entirely.
-
-A cursor says *"before this moment"*, and a moment does not move:
-
-```sql
-WHERE room = ? AND at < ? ORDER BY at DESC LIMIT ?
-```
-
-It walks the same `(room, at)` index from Chapter 21, so **page 40 costs exactly what page 1 did** - which `OFFSET` cannot promise, because `OFFSET` has to count past every row it is skipping.
-
-The server builds the next link so the client never computes anything:
 
 ```json
-{
-  "room": "general",
-  "messages": [ ... ],
-  "next": "/api/rooms/general/messages?limit=10&before=1015"
+{"level":"info","msg":"reaping a client that stopped answering","client":"c2","user":"bob"}
+```
+
+> **Warning**
+>
+> **I could not reproduce the real failure on a laptop, and I am not going to pretend I did.** On loopback, a destroyed socket always produces a FIN or an RST, and the server always notices - so the "ghost client" I wanted to demonstrate never appears. The bug is real (it is why every chat protocol in the world has a heartbeat), and my *demonstration* of it is a client that deliberately declines to answer, which is what a ghost looks like from the server's side.
+>
+> That is an honest test of the mechanism and a dishonest test of the scenario, and it is worth being clear about which one you have. Reproducing the real thing needs `iptables -j DROP` and two machines.
+
+## One timer, not a thousand
+
+```typescript
+this.heartbeat = setInterval(() => {
+  const now = Date.now();
+  for (const client of [...this.registry.clients.values()]) {
+    // reap, ping, expire typing, reassess presence
+  }
+}, HEARTBEAT_MS);
+
+this.heartbeat.unref();
+```
+
+One loop for the whole server. A thousand clients with a `setInterval` each is a thousand timers the event loop must consider on every tick, to do a job one loop does in a millisecond.
+
+And `.unref()` - Chapter 15's lesson, exactly as true the second time. **A timer holds the event loop open, and a server that will not exit is a server nobody can restart.**
+
+## Liveness and presence are different axes
+
+A pong proves the socket works. It proves **nothing whatever** about whether anybody is reading.
+
+| | measured from | means |
+|---|---|---|
+| **liveness** | anything we hear at all - a pong, a message, a frame | the socket works |
+| **presence** | the last thing a human deliberately *said* | somebody is there |
+
+```typescript
+const next: Presence = quiet > AWAY_AFTER_MS ? "away" : quiet > IDLE_AFTER_MS ? "idle" : "active";
+
+if (next === liveness.presence) {
+  return undefined;      // not news
+}
+liveness.presence = next;
+return next;             // news
+```
+
+`reassess` returns the new value **only when it changed** - so the heartbeat loop broadcasts a transition, not a firehose of "alice is still idle" every five seconds. A client that is idle for an hour generates exactly one message.
+
+## Ephemeral state must decay
+
+Here is the rule, and it is the most useful thing in the chapter:
+
+> **Ephemeral state must expire on its own, because the event that would clear it is exactly the event most likely to go missing.**
+
+Chat clients send *"I am typing"* and then, very often, never send *"I stopped"*. The tab closed. The network hiccuped. They changed their mind and wandered off. If the indicator waits to be cancelled, it waits forever, and everyone in the room watches a permanent "alice is typing…" from somebody who left twenty minutes ago.
+
+So it has a **TTL**, and the server enforces it:
+
+```typescript
+export const TYPING_TTL_MS = 4_000;
+
+expiredTyping(client: ChatClient, now: number): boolean {
+  const liveness = this.of(client);
+  if (liveness.typingUntil !== 0 && liveness.typingUntil <= now) {
+    liveness.typingUntil = 0;
+    return true;      // and say so, once
+  }
+  return false;
 }
 ```
 
-And when there is no more history, `next` is `null` - which is how a client knows to stop without guessing.
+```
+--- and if she just stops, with no message and no cancel? ---
+  bob sees: typing(true). Now alice goes quiet, and never sends typing:false...
+  the indicator expired on its own: {"type":"typing","user":"alice","room":"general","typing":false}
+```
 
-The test asserts the property that matters:
+And the typing indicator is **never persisted, never archived, and never replayed to a joiner**. It is not a message; it is a fact about *right now*, and in four seconds it will not even be that. It does not go anywhere near `bus.emit("message")` and so it never reaches the three listeners that would log it, store it, and put it in everybody's history.
+
+## Debouncing belongs on the server
+
+Every chat client in the world sends `typing` on **every keystroke**. Ours does too - with a 2-second throttle, because that is basic manners - but you cannot ask the world to be well-behaved. You can only decline to repeat it:
 
 ```typescript
-// A new message arriving now must NOT shift the next page - which is exactly
-// what OFFSET would have done.
-await store.append({ room: "general", sender: "bob", text: "brand new", at: 99999 });
-const third = parse(await call(rest, "GET", second.next, { token }));
-expect(third.messages.map((m) => m.text)).toEqual(["m0","m1","m2","m3","m4"]);
+startedTyping(client: ChatClient): boolean {
+  const liveness = this.of(client);
+  const now = Date.now();
+  const wasTyping = liveness.typingUntil > now;
+  liveness.typingUntil = now + TYPING_TTL_MS;
+  return !wasTyping;      // true only when this is NEWS
+}
 ```
 
-## The nicest thing in the chapter took no new code
+```
+--- alice types. She sends 10 keystrokes worth of "typing". ---
+  bob received 1 typing event(s) from 10 keystrokes
+```
+
+Ten in, one out. A room of fifty people, all typing, is fifty broadcasts rather than five hundred - and the difference compounds with every person in the room, because each event goes to *everybody*.
+
+## A bug I shipped, and how it read
+
+The first version of `spoke()` did the obvious, tidy thing:
 
 ```typescript
-.on("POST", "/api/rooms/:room/messages", (req, params, session) => {
-  const room = registry.requireRoomNamed(params.room);
-  // ...validate...
-  const message = new ChatMessage(session.user.name, text, room.name);
-  bus.emit("message", message);
-  return jsonWith(201, { Location: ... }, { ... });
-})
+spoke(client: ChatClient): Presence | undefined {
+  const liveness = this.of(client);
+  liveness.lastSpoke = Date.now();
+  liveness.typingUntil = 0;    // sending a message means you have stopped typing
+  ...
+}
 ```
 
-`bus.emit("message", ...)` - that is it. The same three listeners run that have run since Chapter 8: the log, the archive, and the broadcast.
+Which is true! And it broke the feature.
 
-So a `curl` in a terminal appears **instantly** in a browser's chat window:
+The handler cancels the indicator by asking `stoppedTyping()` whether there *was* one - and `spoke()` had already erased the evidence. So `stoppedTyping()` said "no", no `typing: false` was broadcast, and the "alice is typing…" stayed on everybody's screen until it timed out four seconds later.
 
+**Two methods quietly fighting over one field.** The fix is not to be careful about the order - that is a comment, and comments do not run. The fix is for `spoke()` to mind its own business:
+
+```typescript
+// Cancel the typing indicator *first*, while there is still an indicator to
+// cancel. See PresenceTracker.spoke - the first version had these the other way
+// round, and the "alice is typing…" stayed on screen after the message arrived.
+if (this.presence.stoppedTyping(client)) {
+  registry.broadcast(room.name, { type: "typing", ..., typing: false }, client);
+}
+
+const became = this.presence.spoke(client);
 ```
-  bob is sitting in #general over WebSocket, waiting...
-  a curl POST /api/rooms/general/messages happened; bob (WebSocket) received:
-    {"type":"chat","sender":"alice","text":"hello from a REST call","room":"general","at":1783958804307}
-```
 
-Nothing was written to make that work. Chapter 8 decoupled *what happened* from *everyone who cares about it*, and a REST POST is just one more thing that happened. **That is what the abstraction was for, and this is the invoice being paid four hundred pages later.**
-
-## And http.ts got smaller
-
-Routing moved out to `rest.ts`. What is left in `http.ts` is what that module was always actually about: turning bytes into an `HttpRequest`, and an `HttpResponse` back into bytes.
-
-Parsing is not routing. For six chapters they lived in one file because there was not enough of either to notice.
+It took running two clients and watching one of them. No type would have caught it: both methods have perfectly good signatures, and they were both doing something reasonable.
 
 ## Putting It Together
 
-`src/rest.ts` closes the hole: the HTTP API had no auth at all. It is on the `chapter22` branch.
+`src/presence.ts` tracks who is there, who is typing, and who is gone. It is on the `chapter23` branch.
 
-Two routers, and the split is the point. A `Router<Session>` hands each handler a session - so an authenticated handler cannot forget to check for one, because it could not have been called without one:
+Typing is debounced on the server - `startedTyping` returns true only when it is *news*, so ten keystrokes are one broadcast:
 
 ```typescript
-  private readonly open: Router<void>;
-  private readonly secure: Router<Session>;
-
-  constructor(private readonly deps: RestDeps) {
-    this.open = this.publicRoutes();
-    this.secure = this.authenticatedRoutes();
+  startedTyping(client: ChatClient): boolean {
+    const liveness = this.of(client);
+    const now = Date.now();
+    const wasTyping = liveness.typingUntil > now;
+    liveness.typingUntil = now + TYPING_TTL_MS;
+    return !wasTyping;
   }
 ```
 
-And the gate. The Bearer token is verified by the same `resume` the chat protocol uses - one policy, two protocols:
+And the indicator expires on its own, because the client will very often never send the cancel:
 
 ```typescript
-  private async authenticate(req: HttpRequest): Promise<Session> {
-    const header = req.headers.get("authorization");
-    const token = header?.match(/^Bearer (.+)$/i)?.[1];
-
-    if (token === undefined) {
-      throw new AuthError("Send an Authorization: Bearer <token> header.", ErrorCode.Unauthenticated);
+  expiredTyping(client: ChatClient, now: number): boolean {
+    const liveness = this.of(client);
+    if (liveness.typingUntil !== 0 && liveness.typingUntil <= now) {
+      liveness.typingUntil = 0;
+      return true;
     }
-
-    // The same function the chat protocol's `auth` message uses. One policy, two
-    // protocols - which is the thing that was missing.
-    const session = await resume(this.deps.accounts, token, this.deps.config.jwtSecret);
-    if (!session.ok) {
-      throw session.error;
-    }
-    return session.value;
+    return false;
   }
+}
 ```
 
 > **Tip**
 >
-> The complete, runnable file is `src/rest.ts` on the `chapter22` branch. You are not meant to paste it wholesale - build your own as you follow along, and use the reference to check yourself.
+> The complete, runnable file is `src/presence.ts` on the `chapter23` branch. You are not meant to paste it wholesale - build your own as you follow along, and use the reference to check yourself.
 
 ## Try It
 
@@ -239,50 +216,51 @@ And the gate. The Bearer token is verified by the same `resume` the chat protoco
 npm run build && npm start
 ```
 
-```bash
-# The hole is closed.
-curl -i localhost:8080/api/rooms
-#   401 Unauthorized
-#   WWW-Authenticate: Bearer
+Open <http://127.0.0.1:8080/> in **two** browser tabs, log in as `alice` and `bob`, and both `/join general`. Type in one and watch the other.
 
-# A path that does not exist tells you nothing.
-curl -i localhost:8080/api/secrets       # 404, not 401
+Over TCP, where you can see the wire:
 
-# Log in.
-TOKEN=$(curl -s -X POST -d '{"name":"alice","password":"correct-horse"}' \
-  localhost:8080/api/login | jq -r .token)
+```json
+{"type":"login","name":"alice","password":"correct-horse"}
+{"type":"auth","token":"..."}
+{"type":"join","room":"general"}
+{"type":"typing","typing":true}
+```
 
-curl -s -H "Authorization: Bearer $TOKEN" localhost:8080/api/users/me
-#   { "name": "alice", "admin": true, ... }
+Wait five seconds and the server will ask:
 
-# Post a message, and watch it land in an open browser tab.
-curl -i -H "Authorization: Bearer $TOKEN" \
-  -d '{"text":"hello from a REST call"}' \
-  localhost:8080/api/rooms/general/messages
-#   201 Created
-#   Location: /api/rooms/general/messages?before=...&limit=1
+```json
+{"type":"ping"}
+```
 
-# Page backwards through history.
-curl -s -H "Authorization: Bearer $TOKEN" \
-  "localhost:8080/api/rooms/general/messages?limit=5" | jq '{next, count: (.messages|length)}'
+Answer it - `{"type":"pong"}` - and you stay. **Do not answer it, and in eleven seconds you are gone:**
+
+```json
+{"type":"system","text":"No heartbeat. Closing."}
+```
+
+Say nothing for a minute (but keep ponging) and the room is told you have wandered off:
+
+```json
+{"type":"presence","user":"alice","room":"general","presence":"idle"}
 ```
 
 ## Exercise
 
-1. Move `authenticate()` to the top of `handle()`, before the route lookup. Now `curl /api/secrets` returns 401. Explain, to somebody who does not think it matters, exactly what you just told an attacker.
-2. Register a handler on `this.secure` that ignores its `session` argument. Now try to register one on `this.open` that *uses* a session. Read the error. That is the chapter.
-3. Implement `GET /api/rooms/:room/messages` with `OFFSET` instead of a cursor. Then write a test that posts a message between page 1 and page 2, and watch it fail.
-4. Add `ETag` and `If-None-Match` to `GET /api/rooms/:room`, returning `304 Not Modified`. What do you hash, and what happens when a member joins?
-5. `POST /api/rooms/:room/messages` is not rate-limited - Chapter 17's `rateLimit` middleware is on the *chat* pipeline. Fix it, and notice that you are about to write the same "one policy, two protocols" fix a second time.
+1. Set `TYPING_TTL_MS` to `600000`. Type one character, close the tab, and watch everybody else stare at "alice is typing…" for ten minutes. That is what "ephemeral state must decay" is protecting you from.
+2. Make `SILENCE_LIMIT_MS` one heartbeat instead of two. Now drop a single packet (or just be on hotel wifi). What did you break, and why is "two" not a magic number but an argument?
+3. `typing` is broadcast to everybody in the room. Make it not tell a client about *itself* - oh, it already does that (`registry.broadcast(..., client)`). Now find the other place in this codebase where a client is told about its own action, and decide whether it should be.
+4. Add read receipts: `{"type":"read","upto":<timestamp>}`, and a `presence`-style broadcast of who has read what. Which of the two axes does it belong to, and where does it get persisted - if at all?
+5. Move the reap loop into `PresenceTracker` so `ChatServer` does not need to know what a heartbeat is. Then try to test it. What did you make harder, and was it worth it?
 
 ## What's Next
 
-The API has auth that cannot be forgotten, status codes that mean things, pagination that does not lie, and a POST that lands in everybody's chat window.
+The server knows who is there, who is typing, and who is gone. Ghost clients are reaped, ephemeral state decays on its own, and presence is broadcast on change rather than on a timer.
 
-The chat itself, though, has not moved since Chapter 16. There is no way to tell that somebody is typing, no way to know who is actually *there* rather than merely connected, and a client whose network drops leaves a ghost sitting in the room forever, because nothing ever checks.
+And it has, sitting quietly in `server.ts` since Chapter 7, a WebSocket upgrade that will accept a connection **from any website on the internet**, with no check of any kind on where it came from.
 
-Next: **real-time features.**
+Next: **security and hardening.**
 
 ---
 
-Written for this repository. Upstream: <https://purphoros.com/howto/typescript/rest-api>
+Written for this repository. Upstream: <https://purphoros.com/howto/typescript/realtime>
