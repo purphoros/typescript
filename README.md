@@ -1,266 +1,217 @@
-# Chapter 12 - Async/Await & Promises
+# Chapter 13 - Advanced Types
 
-Node.js is asynchronous by nature. Promises and async/await let you write asynchronous code that reads like synchronous code - no callback hell.
+Mapped types, conditional types, template literals, and `infer` - the type-level programming tools that power TypeScript's most sophisticated patterns.
 
-Everything in this server so far has run to completion the moment it was called. Nothing has ever waited for anything. That ends here, because history has to survive a restart, and a disk does not answer immediately.
+You have been using them since Chapter 9 without being told. This chapter names them, and then spends one route proving they earn their keep - and one dispatch table proving they sometimes cannot.
 
-Almost everything difficult in this chapter comes from that one fact.
+## Mapped Types
 
-## Callbacks → Promises → async/await
-
-```typescript
-// 1. Callbacks (the old way - "callback hell")
-fs.readFile("data.json", (err, data) => {
-  if (err) { console.error(err); return; }
-  fs.readFile("more.json", (err2, data2) => {
-    if (err2) { console.error(err2); return; }
-    // nested deeper and deeper...
-  });
-});
-
-// 2. Promises (better - chainable)
-fs.promises.readFile("data.json")
-  .then(data => fs.promises.readFile("more.json"))
-  .then(data2 => console.log(data2))
-  .catch(err => console.error(err));
-
-// 3. async/await (best - reads like sync code)
-async function loadData(): Promise<string> {
-  const data = await fs.promises.readFile("data.json", "utf-8");
-  const more = await fs.promises.readFile("more.json", "utf-8");
-  return data + more;
-}
-```
-
-`async`/`await` is syntactic sugar over Promises. An `async` function always returns a `Promise`. `await` pauses that function until the Promise settles - but does **not** block the thread. Other connections keep being served while one of them waits for a disk.
-
-## Promise&lt;T&gt; - The Typed Asynchronous Value
+A mapped type transforms every property of an existing type. `{ [K in keyof T]: NewType }` iterates over the keys of `T` and produces a new type:
 
 ```typescript
-// Promise<T> is the async equivalent of T
-async function recent(room: string, limit: number): Promise<MessageSummary[]> {
-  const all = await this.read(room);
-  return all.slice(-limit);
-}
+// Make all properties optional (this is how Partial<T> works)
+type MyPartial<T> = {
+  [K in keyof T]?: T[K];
+};
 
-const messages = await history.recent("general", 20); // MessageSummary[]
-```
-
-> **Note**
->
-> `Promise<T>` is the async equivalent of `T`. A function returning `Promise<string>` is a function returning `string`, later. `await` unwraps it: `await Promise<string>` gives you `string`. That is the whole type story, and it is genuinely that simple. The type system is not where async gets hard.
-
-## Error Handling in Async Code
-
-Here is the gift, and it is easy to walk straight past it. This is the error boundary from Chapter 10:
-
-```typescript
-async handleLine(client: ChatClient, line: string): Promise<void> {
-  try {
-    const decoded = decodeClientMessage(line);
-    if (!decoded.ok) {
-      client.send(toErrorMessage(decoded.error));
-      return;
-    }
-    await this.handleMessage(client, decoded.value);
-  } catch (thrown: unknown) {
-    if (!(thrown instanceof ChatError)) {
-      this.bus.emit("failure", client.label, asError(thrown));
-    }
-    client.send(toErrorMessage(thrown));
-  }
-}
-```
-
-It went `async`, and **the try/catch did not change one character**. A rejected `await` throws *at the await*, so the same `catch` that has been handling synchronous failures since Chapter 10 now also handles a disk that is on fire. Compare the `.then().catch()` version, where the failure path is a different mechanism, in a different place, from the success path.
-
-> **Warning**
->
-> `return this.route(request)` inside a `try` is a bug. The function returns the Promise and *then* the try block exits - so when that Promise later rejects, the `catch` is long gone and the rejection escapes. You need `return await this.route(request)`. It is the one place a "redundant" await is doing essential work, and linters that flag `no-return-await` will confidently tell you to delete it. `src/http.ts` has the comment.
-
-## The Four Combinators
-
-| Method | Behaviour | Use case |
-|---|---|---|
-| `Promise.all` | All succeed, or first failure kills it | Load N things you need all of |
-| `Promise.race` | First to settle, win or lose | Timeouts |
-| `Promise.allSettled` | Wait for all, never rejects | Best-effort, partial results are fine |
-| `Promise.any` | First success, ignores failures | Fallback providers |
-
-The server uses three of them, and *which* one is the entire decision each time.
-
-**`Promise.all` - reading every room's archive** (`http.ts`). Three files, none depending on any other. The sequential version reads them one after another and takes as long as all three added up, for no reason. `all` starts all three and waits for the slowest. It fails fast, and here that is correct: this endpoint promises the whole archive, and two thirds of the archive is not a smaller success - it is a wrong answer delivered confidently.
-
-```typescript
-const perRoom = await Promise.all(
-  [...registry.rooms.keys()].map((room) => this.history.recent(room, 10)),
-);
-```
-
-**`Promise.allSettled` - loading history at startup** (`server.ts`). Same three files, opposite answer. With `all`, one corrupt `dev.jsonl` means the server refuses to start, taking `general` and `random` down over a room nobody was using. Starting with an empty `dev` and saying so out loud is strictly better. `allSettled` never rejects, so the caller is *forced* to look at each result and decide - which is exactly the decision being made:
-
-```typescript
-const results = await Promise.allSettled(
-  rooms.map((room) => this.history.recent(room.name, this.config.historyLimit)),
-);
-
-results.forEach((result, index) => {
-  if (result.status === "rejected") {
-    this.bus.emit("failure", `load ${room.name}`, asError(result.reason));
-    return;                       // this room starts empty. Carry on.
-  }
-  for (const message of result.value) {
-    room.remember(ChatMessage.restore(message));
-  }
-});
-```
-
-**`Promise.race` - the write timeout** (`async.ts`). A hung `await` is not an error, it is a hang: the process stays up, the event loop stays busy, and the queue behind it silently stops moving. A timeout converts that into a failure, which is a thing we know how to handle.
-
-```typescript
-export async function withTimeout<T>(work: Promise<T>, ms: number, label: string): Promise<T> {
-  let timer: NodeJS.Timeout | undefined;
-  const expiry = new Promise<never>((_, reject) => {
-    timer = setTimeout(() => reject(new TimeoutError(`${label} took longer than ${ms}ms`)), ms);
-  });
-  try {
-    return await Promise.race([work, expiry]);
-  } finally {
-    clearTimeout(timer);   // or the timer keeps the process alive for `ms`
-  }
-}
-```
-
-> **Warning**
->
-> `Promise.race` does not cancel the loser. A timed-out write keeps running to completion - nobody is listening, but the disk still does the work. **A Promise cannot be un-started.** All a timeout gives you is permission to stop waiting, which is the only power you ever had. If you need real cancellation, you need `AbortController`, and the thing you are calling has to support it.
->
-> And note the `finally`. Without `clearTimeout`, a write that succeeds in 2ms leaves a 2000ms timer pending, and Node will not exit until it fires. A server that refuses to shut down is a server nobody can restart.
-
-## Async Breaks Two Things You Had For Free
-
-This is the part the tutorials skip, and it is the whole reason this chapter is long.
-
-### 1. Ordering
-
-A synchronous `for` loop over two lines processed line one, then line two. The language guaranteed it. Fire two `async` calls in that same loop and they interleave - line two can finish before line one, and a client that sent `{"join"}` followed by `{"chat"}` gets told it is not in a room.
-
-`socket.on("data")` is a synchronous callback that **cannot await**, and Node will happily fire it again while the previous one is suspended. Two chunks arriving back to back would both be reading and consuming *the same buffer*, concurrently.
-
-So each connection gets a queue of one:
-
-```typescript
-export class Serializer {
-  private tail: Promise<unknown> = Promise.resolve();
-
-  run<T>(task: () => Promise<T>): Promise<T> {
-    // Catch on the chaining copy, not the returned one: a failed task must not
-    // wedge every task behind it, but the caller still gets the real rejection.
-    const result = this.tail.then(task);
-    this.tail = result.catch(() => undefined);
-    return result;
-  }
-
-  async drain(): Promise<void> { await this.tail; }
-}
-```
-
-```typescript
-const onData = (chunk: Buffer): void => {
-  conn.append(chunk);                       // synchronous: capture the bytes first
-  void queue.run(() => this.process(conn, socket, greeting, detach))
-            .catch((thrown) => this.bus.emit("failure", conn.id, asError(thrown)));
+// Make all properties readonly (this is how Readonly<T> works)
+type MyReadonly<T> = {
+  readonly [K in keyof T]: T[K];
 };
 ```
 
-`await` inside the line loop is deliberate, not a missed optimisation. These are messages from one person, in the order that person sent them, and running them concurrently would be reordering somebody's conversation.
-
-### 2. Errors that nobody is holding
-
-Look at this listener. It compiles. It is wrong.
-
-```typescript
-bus.on("message", async (m) => { await history.append(m); });   // NO
-```
-
-A listener's signature is `(message: ChatMessage) => void`. The emitter that calls it is synchronous - it cannot await, it has no idea what a Promise is, and it will not wait for one. But an `async` function returns `Promise<void>`, and **`Promise<void>` is assignable to `void`**, so TypeScript allows this deliberately. It works right up until the write fails: nobody is holding the Promise, the rejection is unhandled, and Node kills the process. Your chat server goes down because one disk write failed.
-
-The fix is not to make the emitter async. It is to make the forgetting **explicit**:
-
-```typescript
-bus.on("message", (message) => {
-  void history
-    .append(summarize(message))
-    .catch((thrown: unknown) => bus.emit("failure", `archive ${message.room}`, asError(thrown)));
-});
-```
-
-`void` says *this Promise is deliberately not awaited*. `.catch` says *and nothing escapes*. Fire-and-forget is a perfectly good choice here - a chat message is delivered whether or not it was archived - but it is only a choice when the forgetting is written down.
+That is the whole mechanism, and you have already leaned on it twice. `CATALOG` in `protocol.ts` is a `Record<ClientMessageType, CommandInfo>` - a mapped type over the discriminants of a union - which is why forgetting to document a new message type is a compile error at the object literal rather than a gap in the help text. `DECODERS` is `{ [K in ClientMessageType]: Decoder<K> }`, which is the same trick with a twist: the *value* type depends on the key.
 
 > **Note**
 >
-> The `unhandledRejection` handler in `main.ts` has been there since Chapter 10, and until this chapter it was unreachable. It is now genuinely live. Understand what it is: **proof that something was forgotten**, not a strategy for forgetting things. Every `void ....catch(...)` in this codebase exists so that net never fires.
+> This is how TypeScript's own utilities are built. `Partial<T>`, `Required<T>`, `Readonly<T>`, `Record<K, V>`, `Pick<T, K>` - all mapped types, none of them magic. You can read their definitions in `lib.es5.d.ts`, and they are each about three lines long.
 
-## Applying Async: History That Survives a Restart
-
-The archive is one append-only NDJSON file per room - the same framing the TCP transport uses, which is not a coincidence. A format that survives a half-delivered socket read also survives a half-completed write: a torn last line is simply a line that does not parse, and we skip it and keep the rest.
-
-```
-data/general.jsonl
-{"sender":"alice","text":"message 1","room":"general","at":1783923554955}
-{"sender":"alice","text":"message 2","room":"general","at":1783923554955}
-```
-
-Two layers, and the split is the point:
-
-| | where | who waits |
-|---|---|---|
-| **Join replay** | the `RingBuffer` in `ChatRoom` - last 50, in memory | nobody. Joining a room does no I/O. |
-| **`{"type":"history"}`** | the file on disk - everything | the one client who asked |
-
-Hot path in memory, deep query on disk. That is not a compromise, it is what a database *is*.
-
-The three primitives live in `src/async.ts`, the archive in `src/history.ts`, and the wiring in `src/server.ts` and `src/handler.ts` - all on the `chapter12` branch. The one construct worth reading in full is the `Serializer`: a queue of one that restores the ordering a `for` loop used to give for free.
+## Conditional Types and `infer`
 
 ```typescript
-export class Serializer {
-  // Starts resolved: the first task chains onto nothing and runs immediately.
-  private tail: Promise<unknown> = Promise.resolve();
+// T extends U ? X : Y - a ternary at the type level
+type IsString<T> = T extends string ? true : false;
 
-  run<T>(task: () => Promise<T>): Promise<T> {
-    // Catch on the *chaining* copy, not on the returned one. If a task rejects,
-    // the queue must keep moving - one bad write cannot wedge every write after
-    // it - but the caller still gets the real rejection to deal with.
-    const result = this.tail.then(task);
-    this.tail = result.catch(() => undefined);
-    return result;
-  }
+// `infer` is a capture: it names a type found inside a pattern
+type ElementOf<T> = T extends (infer E)[] ? E : never;
 
-  // Everything submitted so far has finished. Used at shutdown, where "we have
-  // written it down" needs to be true before the process exits.
-  async drain(): Promise<void> {
-    await this.tail;
-  }
+type C = ElementOf<string[]>;   // string
+type D = ElementOf<boolean>;    // never (not an array)
+
+// This is how ReturnType<T> works
+type MyReturnType<T> = T extends (...args: never[]) => infer R ? R : never;
+```
+
+`infer R` says: *match this shape, and wherever `R` appears, remember what was actually there.* It is pattern matching, and like all pattern matching it either fits or it does not - the `: never` branch is what "does not fit" looks like.
+
+`never` in a union vanishes: `"a" | never` is just `"a"`. That is not a curiosity, it is the mechanism the next section runs on.
+
+## Template Literal Types
+
+```typescript
+type HandlerName = `handle${Capitalize<"chat" | "join">}`;
+// "handleChat" | "handleJoin"
+
+type ApiRoute = `/api/${"rooms" | "status"}`;
+// "/api/rooms" | "/api/status"
+```
+
+Strings you can compute with. And, crucially, strings you can **take apart** - combine a template literal pattern with `infer` and you have a parser that runs in the type checker.
+
+## Applying It: A Router That Reads Its Own URLs
+
+Here is the code this chapter deletes. It is from `http.ts`, and it is the only route with a parameter in it:
+
+```typescript
+const named = /^\/api\/rooms\/([^/]+)$/.exec(req.path);
+if (named?.[1] !== undefined && req.method === "GET") {
+  const room = registry.requireRoomNamed(decodeURIComponent(named[1]));
+  ...
+}
+```
+
+Everything about `named[1]` is a promise the compiler cannot check. It is `string | undefined` regardless of what the regex actually contains. Add a second parameter, renumber the groups, mistype the index - the type system has nothing to say about any of it.
+
+But the route pattern *already says* what its parameters are. `/api/rooms/:room` has one, and it is called `room`. So make the compiler read that sentence:
+
+```typescript
+// "/api/rooms/:room"  →  "" | "api" | "rooms" | ":room"
+type Segments<P extends string> = P extends `${infer Head}/${infer Tail}`
+  ? Head | Segments<Tail>
+  : P;
+
+// ":room" → "room";  "rooms" → never  (and never vanishes from the union)
+type ParamName<S extends string> = S extends `:${infer Name}` ? Name : never;
+
+// and the mapped type that turns the surviving names into an object
+export type PathParams<P extends string> = {
+  readonly [K in ParamName<Segments<P>>]: string;
+};
+```
+
+All three features, doing one job:
+
+```typescript
+PathParams<"/api/rooms/:room">                  // { readonly room: string }
+PathParams<"/api/rooms/:room/messages/:id">     // { readonly room: string; readonly id: string }
+PathParams<"/api/status">                       // {}
+```
+
+The no-parameter case needed no special handling. A union of `never` *is* `never`, and mapping over `never` produces no keys. It falls out.
+
+Now the route:
+
+```typescript
+.on("GET", "/api/rooms/:room", async (_req, params) => {
+  const room = registry.requireRoomNamed(params.room);
+  return json(200, { ...describeRoom(room), recent: await history.recent(room.name, 10) });
+})
+```
+
+`params.room` is a `string` because the *pattern* says so. And a typo is not a 3am `undefined`:
+
+```
+error TS2551: Property 'rooom' does not exist on type
+  'PathParams<"/api/rooms/:room">'. Did you mean 'room'?
 ```
 
 > **Tip**
 >
-> The full files are on the branch. `history.ts` writes NDJSON to disk with a per-room queue and a write timeout; `server.ts` awaits `flush()` at shutdown so no queued write is lost, and uses top-level `await` - legal only because Chapter 11 made the package genuinely ESM.
+> `on<P extends string>(method, pattern: P, ...)` - the generic with no default is what makes TypeScript infer the *literal* `"/api/rooms/:room"` rather than widening it to `string`. Widen it and `PathParams<string>` is `{}`: the parameters silently vanish, everything still compiles, and the feature is gone. When a type-level trick "stops working for no reason", this is almost always why.
 
-## A bug that only running it would find
+### One assertion, and why it is honest
 
-The first version of `server.load()` rebuilt each room with `new ChatMessage(sender, text, room)`. `ChatMessage`'s constructor stamps `at = Date.now()`.
+Inside the router, the stored handler must accept `Record<string, string>` - the matcher is splitting a string that arrived over a socket, and it learns the keys as it goes. The handler demands `{ readonly room: string }`. Those do not line up, and I was surprised:
 
-Every restart therefore relabelled the *entire history* with the boot time. The file on disk was perfectly correct, and everything the server said about it was wrong - messages from last Tuesday, all claiming to have been sent at 09:14:03 this morning, in a plausible order, with no error anywhere.
+```
+error TS2322: Type 'Record<string, string>' is missing the following
+  properties from type 'PathParams<"/api/rooms/:room">': room
+```
+
+Which is **correct**. An index signature says *if* a key is present its value is a string. It is not proof that `room` is present. TypeScript is refusing an unsound assignment, and it is right to.
+
+So `Router.on()` contains exactly one `as`, and it is safe for a reason you can state: **the same pattern string produces both sides.** `on()` computes the handler's parameter type from the literal; `match()` populates the params object from that same stored pattern, key for key. They cannot drift, because there is only one pattern and it is the source of both.
+
+That is the bargain a typed library makes. The unsafety is concentrated into one audited line *inside* the router, and every call site outside it is checked. The regex had the opposite arrangement: no assertion anywhere, and an unverified `named[1]` at every call site that touched it. **One assertion you can point at beats twenty you cannot.**
+
+## Where Mapped Types Cannot Help
+
+The chapter's own worked example is a handler map - dispatch the message to `handleChat`, `handleJoin`, and so on, each receiving its own narrowed variant. It is the obvious next move after the decoder map, and this server does not do it. Here is why, because the reason is the most useful thing in the chapter.
+
+Both maps look identical:
 
 ```typescript
-// A message read back from disk did not happen just now.
-static restore(summary: MessageSummary): ChatMessage {
-  return new ChatMessage(summary.sender, summary.text, summary.room, undefined, summary.at);
+// A - the decoder map, in protocol.ts today. Compiles.
+type Decoder<K extends ClientMessageType> = (f: Fields) => Extract<ClientMessage, { type: K }> | null;
+const DECODERS: { [K in ClientMessageType]: Decoder<K> } = { ... };
+
+// B - the handler map. Does not.
+type Handler<K extends ClientMessageType> = (msg: Extract<ClientMessage, { type: K }>) => void;
+const HANDLERS: { [K in ClientMessageType]: Handler<K> } = { ... };
+
+function dispatch(msg: ClientMessage) {
+  HANDLERS[msg.type](msg);
 }
 ```
 
-Persistence means preserving *when*, not just what. No type would have caught this - `Timestamp` is `number`, and `Date.now()` is a very good `number`. It took starting the server twice.
+```
+error TS2345: Argument of type 'ClientMessage' is not assignable to parameter of type 'never'.
+  The intersection '{ type: "chat"; ... } & { type: "join"; ... } & { type: "leave"; }'
+  was reduced to 'never' because property 'type' has conflicting types in some constituents.
+```
+
+Indexing with a *union* key gives a union of functions. To call it, TypeScript must find an argument acceptable to **all** of them - so it intersects the parameter types, and a chat message that is also a join message is nothing at all. `never`.
+
+The decoder map escapes this because **its parameter does not vary with the key.** Every decoder takes the same `Fields`; only the *return* changes. Returns are covariant, so widening on the way out is sound, and one honest annotation does it:
+
+```typescript
+const decode: (fields: Fields) => ClientMessage | null = DECODERS[type as ClientMessageType];
+```
+
+A handler's parameter *does* vary with the key, and parameters are contravariant. There is no sound widening. Every workaround is an assertion - and unlike the router's, this one buys nothing, because `handleMessage`'s `switch` is **already** exhaustive, already narrows correctly, and needs no `as` at all.
+
+> **Warning**
+>
+> This is the trap of type-level programming: the tools are strong enough that you can force almost anything, and forcing it means asserting it. The question is never "can I express this in the type system?" It is "does expressing it this way remove more lies than it adds?" For the router: yes, decisively. For the dispatch table: no. So the `switch` stays, and `assertNever` keeps guarding it.
+>
+> (The underlying limitation is real and long-standing - correlated union types, TypeScript issue #30581. You are not missing a trick.)
+
+## Putting It Together
+
+The whole chapter earns one thing: a router that reads its own URL patterns. `src/router.ts` on the `chapter13` branch has the runtime matcher too; here is the type-level half.
+
+A type-level parser: `Segments` splits the path, `ParamName` keeps only the `:name` parts, and `PathParams` maps them to an object - all in the type checker:
+
+```typescript
+type Segments<P extends string> = P extends `${infer Head}/${infer Tail}`
+  ? Head | Segments<Tail>
+  : P;
+
+// A segment beginning with ":" is a parameter, and its name is the rest.
+// Everything else contributes `never`, which vanishes from a union - so the
+// literal segments simply fall away and only the names survive.
+//
+//   ParamName<":room">  =  "room"
+//   ParamName<"rooms">  =  never
+type ParamName<S extends string> = S extends `:${infer Name}` ? Name : never;
+
+// And the mapped type that turns those names into an object.
+//
+//   PathParams<"/api/rooms/:room">           =  { readonly room: string }
+//   PathParams<"/api/rooms/:room/msg/:id">   =  { readonly room: string; readonly id: string }
+//   PathParams<"/api/status">                =  {}
+//
+// A route with no parameters gets `{}`, because a union of `never` is `never`
+// and mapping over `never` produces no keys at all. Nothing had to special-case
+// it; it falls out.
+export type PathParams<P extends string> = {
+  readonly [K in ParamName<Segments<P>>]: string;
+};
+```
+
+> **Tip**
+>
+> The complete, runnable file is `src/router.ts` on the `chapter13` branch. You are not meant to paste it wholesale - build your own as you follow along, and use the reference to check yourself.
 
 ## Try It
 
@@ -268,53 +219,42 @@ Persistence means preserving *when*, not just what. No type would have caught th
 npm run build && npm start
 ```
 
-Say five things, then stop the server with Ctrl-C:
-
-```json
-{"type":"nick","name":"alice"}
-{"type":"join","room":"general"}
-{"type":"chat","text":"message 1"}
-...
-```
-
-```
-[SYSTEM] Shutting down
-[SYSTEM] History flushed. Goodbye.
-```
-
-That second line is the `await` in `shutdown()` doing its job. Chapter 11's version called `process.exit()` the moment the socket closed, and a queued write that had not reached the disk simply died with the process.
-
-Now look at what is on disk, and then start it again:
-
 ```bash
-cat data/general.jsonl
-npm start
+curl -i http://127.0.0.1:8080/api/rooms/general    # 200 - params.room = "general"
+curl -i http://127.0.0.1:8080/api/rooms/nowhere    # 404 - the room, not the route
+curl -i "http://127.0.0.1:8080/api/rooms/a%20b"    # decoded once, in the router
+curl -i -X GET http://127.0.0.1:8080/api/echo      # 405, Allow: POST
+curl -i http://127.0.0.1:8080/api/nonsense         # 404
+```
+
+That 405 is new, and nobody wrote it. The old code had a hand-rolled `if (req.method !== "POST") return json(405, ...)` inside the `/api/echo` branch - and nowhere else, because it was a rule living in a branch instead of in the structure. `methodsFor(path)` asks the table which verbs *would* have matched, and the difference between "no such path" and "no such verb on this path" stops being something you remember and starts being something you get.
+
+Then break it on purpose, which is the only way to feel the point:
+
+```typescript
+.on("GET", "/api/rooms/:room", async (_req, params) => {
+  const room = registry.requireRoomNamed(params.rooom);   // one letter
 ```
 
 ```
-[SYSTEM] general: recovered 5 message(s) from disk
-```
-
-Join and the last five messages are there - with their **original** timestamps. Ask for more than memory holds, and it reads the archive:
-
-```json
-{"type":"history","limit":100}
+error TS2551: Property 'rooom' does not exist on type 'PathParams<"/api/rooms/:room">'.
+  Did you mean 'room'?
 ```
 
 ## Exercise
 
-1. Change the archive listener in `bus.ts` to `bus.on("message", async (m) => { await history.append(m); })`. It compiles. Now make the write fail (`chmod 000 data/`) and watch the process die. Explain, precisely, who was holding that Promise.
-2. Delete the `Serializer` from `acceptTcp` and call `this.process(...)` directly. Send `{"join"}` and `{"chat"}` in a single write with no gap. What comes back, and why is it different every few runs?
-3. Set `WRITE_TIMEOUT_MS` to `1` in `history.ts`. Messages still send, and the log fills with timeout failures. Is the data on disk? Should it be? What does that tell you about what `Promise.race` actually did?
-4. Remove the `clearTimeout` from the `finally` in `withTimeout`. Run the server, send one message, Ctrl-C. Time how long it takes to exit, and account for every millisecond.
-5. Rewrite `/api/history` to use `for (const room of rooms) { out.push(await ...) }`. Add 200 rooms and measure both. Then argue for whichever one you would actually ship.
+1. Add `.on("GET", "/api/rooms/:room/messages/:id", ...)`. You get `params.room` and `params.id` and you write no parsing code. Now ask for `params.messageId` and read the error.
+2. Change `on<P extends string>` to `on(method: HttpMethod, pattern: string, ...)`. Everything still compiles, and every `params.room` is now an error - or worse, `{}` silently. Explain what `P` was doing.
+3. Write `type Reverse<S extends string>` that reverses a string type using template literals and `infer`. Then stop and ask what it is for. (This is the exercise that teaches restraint.)
+4. Try to build the `HANDLERS` dispatch map from the section above. Get the `never` error. Now make it compile with an `as`, and write down what you have promised the compiler and who checks it.
+5. `PathParams<"/api/rooms/:room">` gives `{ readonly room: string }`. Every param is a `string`. Design (do not necessarily build) a `:id{number}` syntax where the parameter type is inferred as `number`. What has to change, and what would you have to validate at runtime that the types cannot?
 
 ## What's Next
 
-The server waits, and does it correctly: ordering preserved by an explicit queue, failures caught by the same boundary as before, fire-and-forget written down as fire-and-forget, and a shutdown that does not lie about what reached the disk.
+The compiler now reads route patterns. It reads message unions. It reads event maps. In each case the type is derived from one source of truth, and drift is a build error rather than a bug report.
 
-Next: **advanced types** - mapped types, conditional types, template literal types, and `infer`. The tools for making the compiler derive things you are currently writing out by hand - starting with the `ServerEvents` map, which still lists every event and its handler signature in a place that can quietly disagree with reality.
+But there is a hole in the middle of all of it, and Chapter 9 admitted to it at the time. `decodeClientMessage` hand-checks every field of every variant - `isString(f.text)`, `isString(f.room)` - one line per property, written by a human, kept in step with `ClientMessage` by nothing but diligence. The types and the validator agree today because someone made sure. Next: **JSON and validation**, where a schema becomes the single source of both.
 
 ---
 
-Source: <https://purphoros.com/howto/typescript/async>
+Source: <https://purphoros.com/howto/typescript/advanced-types>
