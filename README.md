@@ -1,272 +1,223 @@
-# Chapter 14 - JSON & Validation
+# Chapter 15 - The Node.js Runtime
 
-`JSON.parse` returns `any` - a type safety hole. Zod closes it with schemas that validate at runtime **and** generate TypeScript types at compile time.
+The event loop, EventEmitter, Buffers, signals, and file I/O - the runtime this chat server has been standing on since Chapter 5 without ever quite looking down.
 
-Chapter 9 already refused the easy lie. It did not write `as ClientMessage`; it hand-checked every field of every variant and rebuilt the message from the parts it had proven. That was right, and it left a different problem behind - one this chapter finally deletes.
+Most of this chapter's exercises are already done. Graceful shutdown: Chapter 10. The `uncaughtException` and `unhandledRejection` nets: Chapter 10. History on disk with `fs.appendFile`, read back at startup: Chapter 12. `EventEmitter` - we wrote a typed one from scratch in Chapter 8.
 
-## The JSON.parse Problem
+So this chapter is not a tour. It is the runtime **collecting on two debts**, both of which have been real bugs in our code for ten chapters, and both of which Node has been quietly telling us about the whole time.
+
+## The Event Loop
+
+Node runs your JavaScript on **one thread**.
+
+```
+  ┌─── timers ──── setTimeout, setInterval
+  │
+  ├─── poll ────── I/O callbacks. Your socket "data" handler lives here.
+  │
+  ├─── check ───── setImmediate
+  │
+  └─── close ───── socket.on("close")
+
+  between every phase: microtasks (Promise.then), then process.nextTick
+```
+
+`await` yields, so other clients are served while one of them waits on a disk - that is Chapter 12's whole argument. But a **synchronous** loop that runs for 400ms serves nobody for 400ms. Every socket, every timer, every callback simply waits. From the outside, the server has hung, because for 400ms it has.
+
+So the most useful number a Node process can report about itself is *how late its own timers are running*:
 
 ```typescript
-// DANGEROUS - no runtime validation
-const data = JSON.parse(raw) as ClientMessage;
-// If raw is {"type": 42}, data.type is a number.
-// TypeScript thinks it's a ClientMessage. It is not.
+this.probe = setInterval(() => {
+  const now = performance.now();
+  const lag = Math.max(0, now - this.last - PROBE_MS);  // how late were we?
+  this.maxLag = Math.max(this.maxLag, lag);
+  this.last = now;
+}, PROBE_MS);
+
+this.probe.unref();
 ```
+
+Ask to be woken in 50ms; see how late you actually were. Nobody woke us because the thread was busy, and *how* late is exactly how long it was busy.
 
 > **Warning**
 >
-> `as Type` is a type **assertion**, not a type **check**. It tells the compiler "trust me" and does not look at the value. Never use it on data from a socket, a file, an API, or a user. Chapter 9 said this and it is worth saying twice, because it is the single most common way a "fully typed" codebase turns out to be lying.
-
-## The problem Chapter 9 left behind
-
-Here is the honest version we shipped instead - and the reason it could not stay:
-
-```typescript
-const DECODERS: DecoderMap = {
-  chat: (f) => (isString(f.text) ? { type: "chat", text: f.text } : null),
-  join: (f) => (isString(f.room) ? { type: "join", room: f.room } : null),
-  whisper: (f) =>
-    isString(f.to) && isString(f.text) ? { type: "whisper", to: f.to, text: f.text } : null,
-  // ...twelve of these
-};
-```
-
-And, separately, the type it was supposed to be checking:
-
-```typescript
-export type ClientMessage =
-  | { type: "chat"; text: string }
-  | { type: "join"; room: RoomName }
-  // ...twelve of these, again
-```
-
-**Two descriptions of the same thing.** Add a field to the type and the decoder still compiles. Add it to the decoder and the type still compiles. Neither knows the other exists. They agreed for five chapters because somebody remembered every single time - and "somebody remembered" is not a guarantee, it is a nice thing that has not stopped being true yet.
-
-There was a third gap too, and it was never in the type system at all: `text: string` says nothing whatsoever about a client sending ten megabytes of it.
-
-## Runtime Validation with Zod
-
-```bash
-npm install zod
-```
-
-```typescript
-import { z } from "zod";
-
-const UserSchema = z.object({
-  name: z.string().min(1).max(50),
-  age: z.number().int().positive(),
-});
-
-// Extract the TypeScript type FROM the schema
-type User = z.infer<typeof UserSchema>;
-// { name: string; age: number }
-
-// safeParse returns a discriminated union - no exceptions
-const result = UserSchema.safeParse(unknownData);
-if (result.success) {
-  result.data;          // User - validated, and a NEW object
-} else {
-  result.error.issues;  // what was wrong, and where
-}
-```
-
-> **Tip**
->
-> `z.infer<typeof Schema>` is the whole chapter. The schema is written once; the runtime check and the compile-time type are both *derived from it*. They cannot disagree, because there is no longer a second thing to disagree with.
->
-> And note `safeParse` returns a `{ success: true, data } | { success: false, error }` - a discriminated union, exactly like the `Result` from Chapter 10. Zod arrived at the same shape for the same reason.
-
-## The Protocol as a Schema
-
-```typescript
-const nickname = z.string().min(1).max(20).regex(/^[a-z0-9_-]+$/i, {
-  message: "must be 1-20 characters: letters, digits, _ or -",
-});
-
-const roomName = z.string().min(1).max(32).regex(/^[a-z0-9-]+$/, {
-  message: "must be lowercase letters, digits or hyphens",
-});
-
-// A megabyte of "a" is not a chat message, and `text: string`
-// was never going to be the thing that noticed.
-const chatText = z.string().min(1).max(1000);
-
-export const ClientMessageSchema = z.discriminatedUnion("type", [
-  message({ type: z.literal("chat"), text: chatText }),
-  message({ type: z.literal("whisper"), to: nickname, text: chatText }),
-  message({ type: z.literal("join"), room: roomName }),
-  // ...
-]);
-```
-
-And then, in `protocol.ts`, the twelve-arm hand-written union is replaced by one line:
-
-```typescript
-export type ClientMessage = z.infer<typeof ClientMessageSchema>;
-export type ClientMessageType = ClientMessage["type"];
-```
-
-It is still a real discriminated union. Everything built on it in Chapters 9-13 keeps working, untouched: the `switch` in `handleMessage` still narrows, `assertNever` still guards it, `Extract<ClientMessage, { type: "join" }>` still picks one variant, and `CATALOG` is still a `Record<ClientMessageType, CommandInfo>` that will not compile if you add a message and forget to document it.
-
-**124 lines came out of `protocol.ts`.** The decoder map, the `Fields` type, `isString`, `Decoder<K>`, `DecoderMap`, `KNOWN_TYPES`, and `validateNickname` are all gone, and nothing they did was lost.
+> `.unref()` is not an optimisation, it is the difference between a server that exits and one that does not. A timer holds the event loop open. Without that line, the loop always has one more thing to do - forever, every 50ms - so `server.close()` completes, every client disconnects, and the process sits there being perfectly healthy and refusing to die. It presents as *"our deploys hang"*. Nothing should stay alive merely because something is watching it.
 
 > **Note**
 >
-> `z.discriminatedUnion` is not just a union of objects. It reads the literal `type` on each member and builds a lookup - so an unknown discriminant fails **once**, immediately, naming the twelve it knows, rather than attempting all twelve schemas and reporting twelve separate failures about a message that was only ever going to be one of them. A plain `z.union` would do the latter, and the error would be unreadable.
+> Node ships `perf_hooks.monitorEventLoopDelay`, which sounds exactly like the above, and the first draft of `runtime.ts` used it. On this machine (Node 22, darwin/arm64) its `mean` and `max` sat at ~12ms whether the loop was idle **or blocked solid for 400ms** - while the fifteen lines above reported a max of 351ms for the same block.
+>
+> Whatever it was measuring, it was not the thing this server needs to know. That is less a complaint about the API than the reason this chapter exists: **a metric you have not watched move is not a metric, it is a number.** Block your own event loop on purpose and confirm your monitoring notices - because the day it matters, you will be reading it at 3am and believing it.
 
-## Where the rules live now
+## Debt One: `socket.write()` returns a boolean
 
-`validateNickname` used to be a regex in `protocol.ts`, called by the handler, three modules away from the type that described the field it constrained. Now the rule is *attached to the field*:
+We have never once looked at it.
 
 ```typescript
-message({ type: z.literal("nick"), name: nickname }),
+this.socket.write(raw);   // returns false when the kernel's buffer is full
 ```
 
-Nothing can accept a nickname without also enforcing what a nickname is. That is the difference between a rule you apply and a rule that is true - and it is why the handler's `nick` case got shorter without getting weaker:
+`false` means *the client is not reading as fast as you are writing*. And Node does not drop the surplus - it **queues it, in your process, indefinitely**.
+
+So one laptop that suspends mid-conversation, in a busy room, is a memory leak with a heartbeat. Every broadcast appends to a buffer nobody is draining. The client is completely fine. We are the casualty.
+
+The fix is to believe the runtime:
 
 ```typescript
-case "nick": {
-  // message.name is already a well-formed nickname. The schema said so before
-  // this function was called. What is left is the one question a schema cannot
-  // answer: is there a person by that name?
-  const user = registry.knownUsers.get(message.name);
-  if (user === undefined) {
-    throw new NotFoundError(`Unknown user "${message.name}". ...`, ErrorCode.UnknownUser);
+const MAX_BACKLOG_BYTES = 1_000_000;
+
+protected accepts(): boolean {
+  if (this.backlog > MAX_BACKLOG_BYTES) {
+    this.dropped = `not reading - ${Math.round(this.backlog / 1024)}KB unsent`;
+    this.markClosing();
+    this.destroy();
+    return false;
   }
-  ...
+  return true;
 }
 ```
 
-## Keeping Chapter 10's line
+`backlog` is a number Node has always kept and we never asked for - `socket.writableLength` for TCP, `ws.bufferedAmount` for WebSocket. Same disease, same cure. A megabyte behind is roughly a thousand messages behind; a client that far behind is not slow, it is gone, and the honest thing is to say so.
 
-A schema fails for two very different reasons, and collapsing them would throw away something Chapter 10 worked for. So `protocol.ts` reads Zod's issue codes and decides which happened:
-
-```typescript
-const STRUCTURAL: ReadonlySet<string> = new Set([
-  "invalid_type",       // wrong primitive, or a field that is not there
-  "invalid_union",      // no variant matched - usually an unknown `type`
-  "invalid_value",
-  "invalid_key",
-  "unrecognized_keys",  // a field we have never heard of, e.g. "txet"
-]);
-
-const structural = error.issues.some((issue) => STRUCTURAL.has(issue.code));
-return structural ? new ProtocolError(message) : new ValidationError(message);
-```
-
-| | means | code |
-|---|---|---|
-| **ProtocolError** | "I could not read you." The shape is wrong. | `invalid_message` |
-| **ValidationError** | "I read you, and no." The shape is right; the content is not. | `validation` |
-
-That is not pedantry. One means the client's **code** is broken and a developer has to look at it. The other means the client's **user** typed something we will not take, and they can simply try again. Different audiences, different codes - which is the argument `ErrorCode` was invented for in the first place.
-
-Here is the whole matrix, run against the real decoder:
+Watch it happen. Connect a client, call `pause()` so it never drains its socket, then flood the room:
 
 ```
-  valid chat             OK               {"type":"chat","text":"hello"}
-  missing field          invalid_message  room: expected string, received undefined. Expected {"type":"join","room":"general"}
-  wrong type             invalid_message  text: expected string, received number. ...
-  unknown message type   invalid_message  type: Invalid discriminator value. Expected 'chat' | 'whisper' | 'join' | ...
-  typo'd key             invalid_message  text: expected string, received undefined; Unrecognized key: "txet". ...
-  not an object          invalid_message  Invalid input: expected object, received string.
-  empty text             validation       text: Too small: expected string to have >=1 characters. ...
-  text too long          validation       text: Too big: expected string to have <=1000 characters. ...
-  nick with a space      validation       name: must be 1-20 characters: letters, digits, _ or -. ...
-  UPPERCASE room         validation       room: must be lowercase letters, digits or hyphens. ...
-  negative limit         validation       limit: Too small: expected number to be >0. ...
-```
-
-Every error code from Chapter 10 still comes back, from a validator that is now a hundred lines shorter and cannot drift from its type.
-
-> **Warning**
->
-> `.strict()` rejects unknown keys rather than silently dropping them, so `{"type":"chat","txet":"hi"}` names `txet` instead of quietly becoming a chat message with no text. That is a real trade, and worth making on purpose. The permissive rule - *ignore what you do not recognise* - is what lets a protocol evolve: an old server survives a new client sending a field it has never heard of. We give that up, and we can afford to, because **this server serves its own client** - `page.ts` is delivered over HTTP from the same port. They ship together and cannot skew. A protocol with clients you do not control should think much harder before choosing this.
-
-## Manual vs Zod
-
-| Approach | Pros | Cons |
-|---|---|---|
-| `as Type` | Zero code | No validation. Lies to the compiler. |
-| Manual checks | No dependency; explicit | Type and check are two things that must be kept in step by hand |
-| **Zod** | Schema **is** the type; constraints the type cannot express; errors with paths | A dependency; and a schema you can no longer read at a glance |
-
-The middle row is what we had, and it was not *wrong* - it was correct for five chapters. It was simply carrying an obligation that a schema does not have.
-
-## Putting It Together
-
-`src/schemas.ts` is new: the protocol as a schema. `src/protocol.ts` on the `chapter14` branch infers `ClientMessage` from it and decodes with `safeParse`.
-
-The protocol described once, as a Zod discriminated union. `z.infer` turns this into the `ClientMessage` type, and `safeParse` validates against it - one source of truth for both:
-
-```typescript
-export const ClientMessageSchema = z.discriminatedUnion("type", [
-  message({ type: z.literal("chat"), text: chatText }),
-  message({ type: z.literal("whisper"), to: nickname, text: chatText }),
-  message({ type: z.literal("join"), room: roomName }),
-  message({ type: z.literal("leave") }),
-  message({ type: z.literal("nick"), name: nickname }),
-  message({ type: z.literal("who") }),
-  message({ type: z.literal("rooms") }),
-  message({ type: z.literal("history"), limit: z.number().int().positive().max(500).optional() }),
-  message({ type: z.literal("kick"), target: nickname, reason: z.string().min(1).max(200) }),
-  message({ type: z.literal("status") }),
-  message({ type: z.literal("help") }),
-  message({ type: z.literal("quit") }),
-]);
+[SYSTEM] alice dropped: not reading - 977KB unsent
 ```
 
 > **Tip**
 >
-> The complete, runnable file is `src/schemas.ts` on the `chapter14` branch. You are not meant to paste it wholesale - build your own as you follow along, and use the reference to check yourself.
+> `WsClient.destroy()` calls `ws.terminate()`, not `ws.close()`. `close()` starts a polite closing handshake - which a client that has stopped reading will never complete. You would be waiting for a reply from someone whose defining characteristic is that they are not listening.
 
-## Try It
+## Debt Two: the inbox had no bottom
 
-```bash
-npm run build && npm start
+```typescript
+append(chunk: Buffer): void {
+  this.inbox = Buffer.concat([this.inbox, chunk]);   // ...forever
+}
 ```
 
-The old errors, unchanged:
+Chapter 5 buffers bytes until a complete line arrives. It never asked what happens if one never does. Open a socket, send 500MB with no newline in it, and this server would hold every byte, patiently, waiting for a line ending that was never coming.
 
-```json
-{"type":"jion","room":"general"}
-{"type":"join"}
-```
-```json
-{"type":"error","code":"invalid_message","message":"type: Invalid discriminator value. Expected 'chat' | 'whisper' | 'join' | 'leave' | 'nick' | 'who' | 'rooms' | 'history' | 'kick' | 'status' | 'help' | 'quit'."}
-{"type":"error","code":"invalid_message","message":"room: Invalid input: expected string, received undefined. Expected {\"type\":\"join\",\"room\":\"general\"}"}
-```
+```typescript
+const MAX_INBOX_BYTES = 256 * 1024;
 
-And the new ones - the constraints that were never expressible as types:
-
-```json
-{"type":"chat","text":"<five thousand characters>"}
-{"type":"join","room":"General"}
-{"type":"chat","txet":"typo"}
-```
-```json
-{"type":"error","code":"validation","message":"text: Too big: expected string to have <=1000 characters. ..."}
-{"type":"error","code":"validation","message":"room: must be lowercase letters, digits or hyphens. ..."}
-{"type":"error","code":"invalid_message","message":"text: expected string, received undefined; Unrecognized key: \"txet\". ..."}
+append(chunk: Buffer): boolean {
+  this.inbox = Buffer.concat([this.inbox, chunk]);
+  return this.inbox.length <= MAX_INBOX_BYTES;
+}
 ```
 
-That last one is worth pausing on. Before this chapter, `{"type":"chat","txet":"typo"}` failed with `malformed "chat" message` - true, and useless. Now it names the key you fat-fingered.
+The *framing* is what makes a bound possible at all: we only ever need enough bytes to hold one complete unit - one JSON line, or one HTTP head plus body. A chat message is capped at 1KB by the schema (Chapter 14). 256KB is enormously generous, and anything past it is not a large message, it is a client that has stopped sending newlines.
 
+```
+[SYSTEM] c6 dropped: sent 256KB with no complete message
+```
+
+## Buffers, and where memory actually goes
+
+Both bugs are Buffer bugs, and both hide in the same place:
+
+```typescript
+heapUsedMb: mb(memory.heapUsed),   // JavaScript objects
+rssMb: mb(memory.rss),             // everything the OS gave us - Buffers included
+```
+
+**Buffers live outside the V8 heap.** A server leaking a slow client's unsent mail leaks `rss` while `heapUsed` stays perfectly calm. Report only `heapUsed` - as most dashboards do - and the leak is invisible right up until the OOM killer arrives.
+
+## Signals: SIGTERM is the one that matters
+
+```typescript
+process.on("SIGINT", () => leave("SIGINT"));
+process.on("SIGTERM", () => leave("SIGTERM"));
+```
+
+SIGINT is Ctrl-C: a person, at a terminal, watching. **SIGTERM is what every process supervisor in the world sends first** - systemd, Docker, Kubernetes - and then, after roughly ten seconds, it sends SIGKILL, which cannot be caught, handled, or negotiated with.
+
+A server that handles only SIGINT looks flawless on a laptop and loses data on **every single deploy**: the container stops, SIGTERM arrives, nothing is listening, the default action kills the process, and the writes still in Chapter 12's queue simply never happen. We went to real trouble to flush that queue. Handling only SIGINT would have been a way of doing all that work for the one case that does not matter.
+
+## Environment: `process.env` is untrusted input
+
+It is `Record<string, string | undefined>` - every value a string, every value possibly absent. It arrives from a shell instead of a socket, and it deserves precisely the same treatment, which as of Chapter 14 we know how to give it:
+
+```typescript
+export const EnvSchema = z.object({
+  HOST: z.string().min(1).optional(),
+  PORT: z.coerce.number().int().min(1).max(65535).optional(),
+  DATA_DIR: z.string().min(1).optional(),
+  ROOMS: z.string().min(1)
+    .transform((v) => v.split(",").map((r) => r.trim()).filter(Boolean))
+    .pipe(z.array(z.string().regex(/^[a-z0-9-]+$/)).min(1))
+    .optional(),
+});
+```
+
+Everything optional: an unset variable is a default, not an error. But a *set* one that is nonsense is fatal, on purpose. `PORT=banana` is not a request to use 8080 - it is a mistake in a deployment, and a server that silently binds to 8080 anyway will be found at 3am by somebody wondering why the load balancer is unhappy. **Fail at startup, loudly, while the person who typed it is still watching.**
+
+Precedence is `argv` → `env` → `DEFAULTS`: specific beats general, immediate beats standing.
+
+## Putting It Together
+
+Two bugs the runtime had been reporting all along, plus a way to see them. The files are on the `chapter15` branch.
+
+Event-loop lag, measured the only way that works: ask to be woken in 50ms, see how late you actually were. `.unref()` is what lets the process still exit:
+
+```typescript
+    this.probe = setInterval(() => {
+      const now = performance.now();
+      const lag = Math.max(0, now - this.last - PROBE_MS);
+      this.maxLag = Math.max(this.maxLag, lag);
+      this.totalLag += lag;
+      this.samples++;
+      this.last = now;
+    }, PROBE_MS);
+
+    // .unref() and the server can still exit.
+    //
+    // A timer holds the event loop open. Without this line the loop always has
+    // one more thing to do - forever, every 50ms - and `server.close()` would
+    // complete, every client would disconnect, and the process would sit there
+    // being perfectly healthy and refusing to die. It is a two-word fix for a
+    // bug that presents as "our deploys hang", and it is the reason a monitoring
+    // timer must never keep a process alive: nothing should stay up merely
+    // because something is watching it.
+    this.probe.unref();
+```
+
+And backpressure - the bug the runtime had been signalling since Chapter 5. Past a megabyte unsent, the client is not slow, it is gone:
+
+```typescript
+  protected accepts(): boolean {
+    if (this.dropped !== undefined) {
+      return false;
+    }
+    if (this.backlog > MAX_BACKLOG_BYTES) {
+      this.dropped = `not reading - ${Math.round(this.backlog / 1024)}KB unsent`;
+      this.markClosing();
+      this.destroy();
+      return false;
+    }
+    return true;
+  }
+```
+
+> **Tip**
+>
+> `monitorEventLoopDelay` looked right and read ~12ms whether idle or blocked; the hand-rolled probe above caught a 400ms block. Watch your metrics move before you trust them.
 ## Exercise
 
-1. Add a `"topic"` message: `{ type: "topic", room, text }`, where the topic is at most 120 characters. Add it to `ClientMessageSchema` and run `npm run typecheck`. Count how many places the compiler sends you - and notice that the *validator* was not one of them.
-2. Delete `.strict()` from the `message()` helper. Send `{"type":"chat","text":"hi","admin":true}`. What happens, and what would have to be true of your clients for that to be the behaviour you want?
-3. Zod's regex message for a bad nickname is ours (`must be 1-20 characters...`); the message for a too-long one is Zod's (`Too big: expected string...`). Give `.max(20)` a custom message too. Which reads better to somebody who is not a programmer?
-4. Move the `STRUCTURAL` set into `errors.ts` and write a test for it: for each of the twelve error cases in this chapter, assert the code that comes back. This is the test that stops a Zod upgrade from silently reclassifying your errors.
-5. `z.coerce.number()` is used for the port, and coercion is usually a bad idea. Why is it defensible *there* and not for, say, `{"type":"history","limit":"10"}`?
+1. Add an endpoint that blocks the thread for two seconds (`while (Date.now() < end) {}`). Hit it, then immediately hit `/api/health` from another terminal - and notice you cannot, because there is one thread and you are standing on it. Read `eventLoopMaxMs` afterwards.
+2. Delete `.unref()` from `runtime.ts`. Start the server, Ctrl-C, and watch it refuse to exit. Explain, in one sentence, what is still keeping it alive.
+3. Set `MAX_BACKLOG_BYTES` to `50_000_000` and re-run the slow-client experiment while watching `rss` versus `heapUsedMb`. Which one moves? Why is that the answer to "where do Buffers live"?
+4. Handle SIGHUP and reload `ROOMS` from the environment without restarting. What breaks about clients currently in a room that no longer exists - and is that a reason not to do it?
+5. `Buffer.concat` in `append()` copies the whole inbox on every chunk, so a message arriving in N pieces costs O(N²). With a 256KB bound that is fine. Work out at what bound it stops being fine, and what you would use instead.
 
 ## What's Next
 
-The protocol is described once. The type, the validator, the size limits, the naming rules and the error messages all come from that one description, and there is nothing left to keep in step by hand.
+The server now knows what it is doing to the machine, and the machine can no longer be used against it: no unbounded read buffer, no unbounded write queue, no timer holding the door shut, no deploy that quietly drops the last few messages.
 
-The server is now, in a real sense, finished as a *program*: it has a protocol, a boundary, persistence, modules, and a router. What it does not have is a clear-eyed account of the machine it runs on. Next: **the Node.js runtime** - the event loop, `EventEmitter`, Buffers, and process lifecycle. Much of it this server has been quietly relying on since Chapter 5, and it is time to say out loud what has actually been happening.
+Next: **the chat server core** - rooms, the client state machine, and broadcasting. Everything we have built has been in service of a chat server, and it is time to look hard at the chat itself.
 
 ---
 
-Source: <https://purphoros.com/howto/typescript/json-validation>
+Source: <https://purphoros.com/howto/typescript/nodejs-runtime>
