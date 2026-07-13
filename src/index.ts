@@ -1,15 +1,22 @@
-// Chat server - TCP, now speaking HTTP as well.
+// Chat server - TCP, HTTP, and now WebSocket, all on one port.
 //
-// HTTP is just text over TCP: a request line, headers, a blank line, a body.
-// So the same listener can serve both protocols. We read the first line and
-// decide: `GET / HTTP/1.1` is a browser or curl, anything else is a person at
-// a terminal typing chat commands.
+// Chapter 6 ended with a promise: a WebSocket connection *begins* as an HTTP
+// request carrying `Upgrade: websocket`. This chapter collects on it. The same
+// listener still sniffs the first line, and now there are three outcomes:
 //
-// That sniffing is not a party trick - it is exactly what Chapter 7 needs. A
-// WebSocket connection *begins* as an HTTP request carrying `Upgrade:
-// websocket`, on this very port.
+//   GET / HTTP/1.1 ...                      → serve HTML or JSON, hang up
+//   GET / HTTP/1.1 ... Upgrade: websocket   → 101, hand the socket to `ws`
+//   anything else                           → a person typing chat commands
+//
+// So `ws` runs in noServer mode: it never opens a port of its own. We do the
+// listening, we parse the request, and we hand over the raw socket.
+//
+// The payoff is broadcasting. A message typed into `nc` reaches a browser, and
+// a message from the browser reaches `nc` - the two transports meet in a room.
 
 import net from "node:net";
+import { IncomingMessage } from "node:http";
+import { WebSocketServer, WebSocket } from "ws";
 
 // --- Configuration -------------------------------------------------------
 
@@ -38,6 +45,10 @@ type ConnectionState = "connecting" | "connected" | "disconnected";
 
 // What the peer turned out to be. "unknown" until the first line arrives.
 type Protocol = "unknown" | "chat" | "http";
+
+// How a client is attached. Used only for display - the chat logic does not
+// care, which is the whole point of the ChatClient interface below.
+type Transport = "tcp" | "ws";
 
 // Interfaces describe shape. `type` stays for unions, which interfaces cannot express.
 interface Identifiable {
@@ -68,6 +79,24 @@ interface Message extends Identifiable {
   editedAt?: Timestamp;
 }
 
+// Anyone the server can talk to, however they got here. handleLine() and
+// broadcast() work in terms of this and nothing else, so a telnet user and a
+// browser tab are interchangeable to them.
+interface ChatClient extends Identifiable {
+  readonly transport: Transport;
+  readonly connectedAt: Timestamp;
+  readonly label: string;
+  readonly uptime: number;
+  readonly status: ConnectionState;
+  readonly user: User | undefined;
+  readonly room: RoomName | undefined;
+  send(line: string): void;
+  end(line: string): void;
+  identifyAs(user: User): void;
+  enterRoom(name: RoomName): void;
+  exitRoom(): void;
+}
+
 // One parsed HTTP request. Header names are lowercased: HTTP header names are
 // case-insensitive, so `Content-Length` and `content-length` must not differ.
 interface HttpRequest {
@@ -85,6 +114,13 @@ interface HttpResponse {
   headers: Record<string, string>;
   body: string;
 }
+
+// What reading the buffer produced. A discriminated union again: the caller
+// switches on `kind` and the compiler hands it exactly the right fields.
+type HttpOutcome =
+  | { kind: "incomplete" }                                       // still arriving
+  | { kind: "handled" }                                          // answered, closing
+  | { kind: "upgrade"; request: HttpRequest; head: Buffer };     // hand off to ws
 
 // Every event the server can emit. The `type` field is the discriminant:
 // switching on it tells the compiler which other fields exist.
@@ -158,37 +194,21 @@ class ChatMessage implements Message, Serializable {
   }
 }
 
-// One Connection wraps one TCP socket. The socket stays private: callers speak
-// to the client through send()/end(), never by touching the stream directly.
-//
-// TCP is a byte stream, not a sequence of messages. What arrives in one "data"
-// event is whatever happened to be in flight - half a line, three lines, the
-// headers of a request but not its body. So bytes are buffered here until a
-// whole unit is present, and only then handed on.
-class Connection implements Identifiable {
-  readonly id: string;
-  readonly address: string;
-  readonly connectedAt: Timestamp;
+// The identity and room bookkeeping every client needs, regardless of how it
+// is attached. The two transports differ only in how bytes leave and arrive.
+abstract class BaseClient implements ChatClient {
+  readonly connectedAt: Timestamp = Date.now();
+  protected state: ConnectionState = "connected";
+  protected identity?: User;
+  protected currentRoom?: RoomName;
 
-  private state: ConnectionState = "connecting";
-  private protocol: Protocol = "unknown";
-  private inbox: Buffer = Buffer.alloc(0);
-  private identity?: User;
-  private currentRoom?: RoomName;
+  constructor(readonly id: string, readonly transport: Transport) {}
 
-  constructor(private readonly socket: net.Socket, sequence: number) {
-    this.id = `c${sequence}`;
-    this.address = `${socket.remoteAddress}:${socket.remotePort}`;
-    this.connectedAt = Date.now();
-    this.state = "connected";
-  }
+  abstract send(line: string): void;
+  abstract end(line: string): void;
 
   get status(): ConnectionState {
     return this.state;
-  }
-
-  get mode(): Protocol {
-    return this.protocol;
   }
 
   get user(): User | undefined {
@@ -199,14 +219,51 @@ class Connection implements Identifiable {
     return this.currentRoom;
   }
 
-  // Who this connection is, for logging: the chosen nick, else the socket id.
+  // Who this client is, for logging: the chosen nick, else the connection id.
   get label(): string {
     return this.identity?.name ?? this.id;
   }
 
-  // How long this client has been connected, in milliseconds.
   get uptime(): number {
     return Date.now() - this.connectedAt;
+  }
+
+  identifyAs(user: User): void {
+    this.identity = user;
+  }
+
+  enterRoom(name: RoomName): void {
+    this.currentRoom = name;
+  }
+
+  exitRoom(): void {
+    this.currentRoom = undefined;
+  }
+
+  markClosed(): void {
+    this.state = "disconnected";
+  }
+}
+
+// A raw TCP client: telnet, nc, a person at a terminal.
+//
+// TCP is a byte stream, not a sequence of messages. What arrives in one "data"
+// event is whatever happened to be in flight - half a line, three lines, the
+// headers of a request but not its body. So bytes are buffered here until a
+// whole unit is present, and only then handed on.
+class TcpClient extends BaseClient {
+  readonly address: string;
+
+  private protocol: Protocol = "unknown";
+  private inbox: Buffer = Buffer.alloc(0);
+
+  constructor(private readonly socket: net.Socket, sequence: number) {
+    super(`c${sequence}`, "tcp");
+    this.address = `${socket.remoteAddress}:${socket.remotePort}`;
+  }
+
+  get mode(): Protocol {
+    return this.protocol;
   }
 
   // Bytes received but not yet consumed.
@@ -249,19 +306,6 @@ class Connection implements Identifiable {
     this.socket.write(raw);
   }
 
-  identifyAs(user: User): void {
-    this.identity = user;
-  }
-
-  enterRoom(name: RoomName): void {
-    this.currentRoom = name;
-  }
-
-  exitRoom(): void {
-    this.currentRoom = undefined;
-  }
-
-  // Flush what is queued, then close politely.
   end(line: string): void {
     this.send(line);
     this.socket.end();
@@ -270,10 +314,29 @@ class Connection implements Identifiable {
   close(): void {
     this.socket.end();
   }
+}
 
-  // Mark closed. The socket itself is already gone by the time this runs.
-  markClosed(): void {
-    this.state = "disconnected";
+// A WebSocket client: a browser tab, or wscat. `ws` has already done the
+// framing, so a message arrives whole - no buffering, no newline hunting.
+class WsClient extends BaseClient {
+  constructor(
+    private readonly ws: WebSocket,
+    sequence: number,
+    readonly address: string,
+  ) {
+    super(`w${sequence}`, "ws");
+  }
+
+  // A client may be mid-disconnect: sending to a closing socket throws.
+  send(line: string): void {
+    if (this.ws.readyState === WebSocket.OPEN) {
+      this.ws.send(line);
+    }
+  }
+
+  end(line: string): void {
+    this.send(line);
+    this.ws.close();
   }
 }
 
@@ -306,6 +369,7 @@ function address(host: Host, port?: Port): string {
 // response's first line.
 function statusLine(code: number): string {
   switch (code) {
+    case 101: return "Switching Protocols";
     case 200: return "OK";
     case 201: return "Created";
     case 204: return "No Content";
@@ -429,20 +493,46 @@ function html(status: number, body: string): HttpResponse {
   return { status, headers: { "Content-Type": "text/html; charset=utf-8" }, body };
 }
 
+// This is the whole handshake, as far as we are concerned: a GET that says it
+// wants to become a WebSocket. `ws` validates the key and version for us.
+function isWebSocketUpgrade(req: HttpRequest): boolean {
+  return (
+    req.method === "GET" &&
+    req.headers.get("upgrade")?.toLowerCase() === "websocket" &&
+    (req.headers.get("connection")?.toLowerCase().includes("upgrade") ?? false)
+  );
+}
+
+// A browser client, served from the same port it will connect back to.
+function chatPage(): string {
+  return `<!doctype html>
+<meta charset="utf-8">
+<title>Chat</title>
+<h1>Chat server</h1>
+<p>${clients.size} client(s) connected across ${rooms.size} rooms.</p>
+<div id="log" style="font-family:monospace;white-space:pre-wrap"></div>
+<input id="input" style="width:30em" placeholder="/join general" autofocus>
+<script>
+  const ws = new WebSocket("ws://" + location.host);
+  const log = (line) => {
+    document.getElementById("log").textContent += line + "\\n";
+  };
+  ws.onmessage = (event) => log(event.data);
+  ws.onclose = () => log("[disconnected]");
+  document.getElementById("input").addEventListener("keydown", (event) => {
+    if (event.key === "Enter" && event.target.value) {
+      ws.send(event.target.value);
+      event.target.value = "";
+    }
+  });
+</script>`;
+}
+
 // The server's own state, served over HTTP. The chat rooms and the web page are
-// the same rooms - one process, two protocols.
+// the same rooms - one process, three protocols.
 function handleRequest(req: HttpRequest): HttpResponse {
   if (req.path === "/" && req.method === "GET") {
-    const roomRows = [...rooms.values()]
-      .map((room) => `<li>${room.name} - ${room.memberCount} member(s)</li>`)
-      .join("");
-    return html(
-      200,
-      `<h1>Chat server</h1>
-<p>${clients.size} chat client(s) connected.</p>
-<ul>${roomRows}</ul>
-<p>Talk to it: <code>nc ${CONFIG.host} ${port}</code></p>`,
-    );
+    return html(200, chatPage());
   }
 
   if (req.path === "/api/status" && req.method === "GET") {
@@ -472,13 +562,14 @@ function handleRequest(req: HttpRequest): HttpResponse {
   return json(404, { error: "Not Found", path: req.path });
 }
 
-// Consume as much of the buffer as forms a complete request, answer it, hang
-// up. Returns without doing anything if the request is still arriving.
-function drainHttp(conn: Connection): void {
+// Consume as much of the buffer as forms a complete request. Either the request
+// is still arriving, or it has been answered, or it wants to become a WebSocket
+// and the caller must hand the socket over.
+function readHttp(conn: TcpClient): HttpOutcome {
   const buffered = conn.pending;
   const headerEnd = buffered.indexOf(HEADERS_END);
   if (headerEnd === -1) {
-    return; // headers still in flight
+    return { kind: "incomplete" }; // headers still in flight
   }
 
   const head = buffered.subarray(0, headerEnd).toString("utf8");
@@ -489,19 +580,26 @@ function drainHttp(conn: Connection): void {
   const contentLength = lengthHeader?.[1] !== undefined ? parseInt(lengthHeader[1], 10) : 0;
 
   if (buffered.length < bodyStart + contentLength) {
-    return; // body still in flight
+    return { kind: "incomplete" }; // body still in flight
   }
 
   const body = contentLength > 0
     ? buffered.subarray(bodyStart, bodyStart + contentLength).toString("utf8")
     : undefined;
 
+  const request = parseRequest(head, body);
+
+  if (request !== null && isWebSocketUpgrade(request)) {
+    // Anything after the request is the start of the WebSocket stream. It
+    // belongs to `ws`, not to us.
+    const leftover = buffered.subarray(bodyStart + contentLength);
+    conn.consume(buffered.length);
+    return { kind: "upgrade", request, head: leftover };
+  }
+
   conn.consume(bodyStart + contentLength);
 
-  const request = parseRequest(head, body);
-  const response = request === null
-    ? json(400, { error: "Bad Request" })
-    : handleRequest(request);
+  const response = request === null ? json(400, { error: "Bad Request" }) : handleRequest(request);
 
   emit({
     type: "system",
@@ -511,6 +609,7 @@ function drainHttp(conn: Connection): void {
 
   conn.write(serializeResponse(response));
   conn.close(); // we said Connection: close, so honour it
+  return { kind: "handled" };
 }
 
 // --- Server state --------------------------------------------------------
@@ -527,9 +626,9 @@ const knownUsers = new Map<string, User | AdminUser>([
   ["bob", { id: "u2", name: "bob", joinedAt: Date.now() }],
 ]);
 
-// Every live *chat* connection, keyed by its id. HTTP clients come and go
-// within a single request and are never listed here.
-const clients = new Map<string, Connection>();
+// Every live chat client, TCP or WebSocket alike. HTTP requests come and go
+// within a single exchange and are never listed here.
+const clients = new Map<string, ChatClient>();
 let sequence = 0;
 
 const commands: [string, string][] = [
@@ -544,95 +643,112 @@ const commands: [string, string][] = [
   ["/quit", "Disconnect"],
 ];
 
+// --- Broadcast -----------------------------------------------------------
+
+// Send to everyone in a room, optionally skipping one client (usually the
+// sender). Transport is irrelevant here: a line typed into nc lands in a
+// browser, and vice versa, because both are just ChatClients.
+function broadcast(room: RoomName, line: string, except?: ChatClient): void {
+  for (const client of clients.values()) {
+    if (client.room === room && client !== except) {
+      client.send(line);
+    }
+  }
+}
+
 // --- Command handling ----------------------------------------------------
 
 // One line from one client. Returns nothing; everything it does is a side
-// effect on the connection, the rooms, or the log.
-function handleLine(conn: Connection, line: string): void {
+// effect on the client, the rooms, or the log.
+function handleLine(client: ChatClient, line: string): void {
   const [command, ...rest] = line.split(/\s+/);
   const argument = rest.join(" ");
 
   switch (command) {
     case "/help":
-      conn.send("Commands:");
+      client.send("Commands:");
       for (const [name, description] of commands) {
-        conn.send(`  ${name.padEnd(8)} ${description}`);
+        client.send(`  ${name.padEnd(8)} ${description}`);
       }
       return;
 
     case "/who":
-      conn.send(`Connected clients: ${clients.size}`);
+      client.send(`Connected clients: ${clients.size}`);
       for (const other of clients.values()) {
         const user = other.user;
         const role = user !== undefined && isAdmin(user) ? " (admin)" : "";
         const where = other.room !== undefined ? ` in ${other.room}` : "";
-        const you = other.id === conn.id ? " ← you" : "";
-        conn.send(`  ${other.label}${role}${where}${you}`);
+        const you = other.id === client.id ? " ← you" : "";
+        client.send(`  ${other.label} [${other.transport}]${role}${where}${you}`);
       }
       return;
 
     case "/rooms":
       for (const room of rooms.values()) {
-        conn.send(`  ${room.name.padEnd(8)} ${room.memberCount} member(s)`);
+        client.send(`  ${room.name.padEnd(8)} ${room.memberCount} member(s)`);
       }
       return;
 
     case "/nick": {
       const user = knownUsers.get(argument);
       if (user === undefined) {
-        conn.send(`Unknown user "${argument}". Try: ${[...knownUsers.keys()].join(", ")}`);
+        client.send(`Unknown user "${argument}". Try: ${[...knownUsers.keys()].join(", ")}`);
         return;
       }
-      conn.identifyAs(user);
+      client.identifyAs(user);
       const role = isAdmin(user) ? ` You are an admin (level ${user.adminLevel}).` : "";
-      conn.send(`You are now ${user.name}.${role}`);
+      client.send(`You are now ${user.name}.${role}`);
       return;
     }
 
     case "/join": {
       const room = rooms.get(argument);
       if (room === undefined) {
-        conn.send(`No such room "${argument}". Try: ${[...rooms.keys()].join(", ")}`);
+        client.send(`No such room "${argument}". Try: ${[...rooms.keys()].join(", ")}`);
         return;
       }
-      const previous = conn.room;
+      const previous = client.room;
       if (previous !== undefined) {
-        rooms.get(previous)?.leave(conn.label);
+        rooms.get(previous)?.leave(client.label);
+        broadcast(previous, `← ${client.label} left`, client);
+        client.exitRoom();
       }
-      room.join(conn.label);
-      conn.enterRoom(room.name);
-      conn.send(`Joined ${room.name} (${room.memberCount} member(s)).`);
-      emit({ type: "join", user: conn.label, room: room.name, at: Date.now() });
+      room.join(client.label);
+      client.enterRoom(room.name);
+      client.send(`Joined ${room.name} (${room.memberCount} member(s)).`);
+      broadcast(room.name, `→ ${client.label} joined`, client);
+      emit({ type: "join", user: client.label, room: room.name, at: Date.now() });
       return;
     }
 
     case "/leave": {
-      const current = conn.room;
+      const current = client.room;
       if (current === undefined) {
-        conn.send("You are not in a room.");
+        client.send("You are not in a room.");
         return;
       }
-      rooms.get(current)?.leave(conn.label);
-      conn.exitRoom();
-      conn.send(`Left ${current}.`);
-      emit({ type: "leave", user: conn.label, room: current, at: Date.now() });
+      rooms.get(current)?.leave(client.label);
+      client.exitRoom();
+      client.send(`Left ${current}.`);
+      broadcast(current, `← ${client.label} left`, client);
+      emit({ type: "leave", user: client.label, room: current, at: Date.now() });
       return;
     }
 
     case "/time":
-      conn.send(`Server time: ${new Date().toISOString()}`);
+      client.send(`Server time: ${new Date().toISOString()}`);
       return;
 
     case "/uptime":
-      conn.send(`Connected for ${formatDuration(conn.uptime)}.`);
+      client.send(`Connected for ${formatDuration(client.uptime)}.`);
       return;
 
     case "/status":
-      conn.send(`Connection ${conn.id}: ${describeState(conn.status)}`);
+      client.send(`Client ${client.id} [${client.transport}]: ${describeState(client.status)}`);
       return;
 
     case "/quit":
-      conn.end("Goodbye!");
+      client.end("Goodbye!");
       return;
 
     default:
@@ -640,27 +756,78 @@ function handleLine(conn: Connection, line: string): void {
   }
 
   if (command !== undefined && command.startsWith("/")) {
-    conn.send(`Unknown command: ${command}. Try /help.`);
+    client.send(`Unknown command: ${command}. Try /help.`);
     return;
   }
 
-  // Not a command - an ordinary chat message. It is echoed to its sender for
-  // now; Chapter 7 broadcasts it to everyone else in the room.
-  const room = conn.room;
+  // Not a command - a chat message. It now reaches the whole room, whichever
+  // transport each member happens to be using.
+  const room = client.room;
   if (room === undefined) {
-    conn.send("Join a room first: /join general");
+    client.send("Join a room first: /join general");
     return;
   }
 
-  const message = new ChatMessage(conn.label, line, room);
+  const message = new ChatMessage(client.label, line, room);
   emit({ type: "message", user: message.sender, room: message.room, text: message.text, at: message.at });
-  conn.send(`Echo: ${message.text}`);
+  broadcast(room, `[${message.sender}] ${message.text}`);
 }
+
+// Everything a client needs when it arrives, whatever transport brought it.
+function welcome(client: ChatClient): void {
+  clients.set(client.id, client);
+  emit({ type: "system", text: `${client.id} connected [${client.transport}]`, at: Date.now() });
+  client.send(`Welcome! You are ${client.id}. Type /help for commands.`);
+}
+
+// ...and everything it needs when it leaves.
+function farewell(client: ChatClient): void {
+  const room = client.room;
+  if (room !== undefined) {
+    rooms.get(room)?.leave(client.label);
+    broadcast(room, `← ${client.label} left`, client);
+  }
+  clients.delete(client.id);
+  emit({
+    type: "system",
+    text: `${client.label} disconnected (${clients.size} remaining)`,
+    at: Date.now(),
+  });
+}
+
+// --- WebSocket -----------------------------------------------------------
+
+// noServer: `ws` opens no port and does no listening. It only ever receives
+// sockets we have already accepted, parsed, and decided to upgrade.
+const wss = new WebSocketServer({ noServer: true });
+
+wss.on("connection", (ws: WebSocket, request: IncomingMessage) => {
+  const client = new WsClient(ws, ++sequence, request.socket.remoteAddress ?? "unknown");
+  welcome(client);
+
+  // `ws` reassembles frames, so a message arrives whole. No buffering here -
+  // that work was only ever needed because raw TCP has no message boundaries.
+  ws.on("message", (data: Buffer) => {
+    const text = parseInput(data.toString("utf8"));
+    if (text.length > 0) {
+      handleLine(client, text);
+    }
+  });
+
+  ws.on("close", () => {
+    client.markClosed();
+    farewell(client);
+  });
+
+  ws.on("error", (err: Error) => {
+    emit({ type: "system", text: `${client.id} error: ${err.message}`, at: Date.now() });
+  });
+});
 
 // --- Protocol detection --------------------------------------------------
 
 // Look at the first complete line. Undefined means it has not arrived yet.
-function sniff(conn: Connection): Protocol | undefined {
+function sniff(conn: TcpClient): Protocol | undefined {
   const newline = conn.pending.indexOf(0x0a);
   if (newline === -1) {
     return undefined;
@@ -669,30 +836,24 @@ function sniff(conn: Connection): Protocol | undefined {
   return HTTP_REQUEST_LINE.test(firstLine) ? "http" : "chat";
 }
 
-function startChat(conn: Connection): void {
-  conn.becomes("chat");
-  clients.set(conn.id, conn);
-  conn.send(`Welcome! You are ${conn.id}. Type /help for commands.`);
-}
-
 // --- The server ----------------------------------------------------------
 
 // The callback runs once per connection. Everything inside it belongs to that
 // one client; the event loop interleaves them all on a single thread.
 const server = net.createServer((socket) => {
-  const conn = new Connection(socket, ++sequence);
-  emit({ type: "system", text: `${conn.id} connected from ${conn.address}`, at: Date.now() });
+  const conn = new TcpClient(socket, ++sequence);
 
   // A browser or curl sends its request immediately, so we can read it and
   // know. A person at a terminal sends nothing until they type - so if the
   // line never comes, assume a human and greet them.
   const greeting = setTimeout(() => {
     if (conn.mode === "unknown") {
-      startChat(conn);
+      conn.becomes("chat");
+      welcome(conn);
     }
   }, GREETING_DELAY_MS);
 
-  socket.on("data", (chunk: Buffer) => {
+  const onData = (chunk: Buffer): void => {
     conn.append(chunk);
 
     if (conn.mode === "unknown") {
@@ -701,16 +862,52 @@ const server = net.createServer((socket) => {
         return; // not even one line yet
       }
       clearTimeout(greeting);
-      if (detected === "http") {
-        conn.becomes("http");
-      } else {
-        startChat(conn);
+      conn.becomes(detected);
+      if (detected === "chat") {
+        welcome(conn);
       }
     }
 
     if (conn.mode === "http") {
-      drainHttp(conn);
-      return;
+      const outcome = readHttp(conn);
+      switch (outcome.kind) {
+        case "incomplete":
+        case "handled":
+          return;
+
+        case "upgrade": {
+          // The socket stops being ours. Detach every listener before handing
+          // it over, or we would keep trying to read WebSocket frames as text.
+          socket.off("data", onData);
+          socket.off("close", onClose);
+          socket.off("error", onError);
+          clearTimeout(greeting);
+
+          // A genuine IncomingMessage, built from the request we parsed by
+          // hand in Chapter 6. No cast, no lie: `ws` gets what it expects.
+          const request = new IncomingMessage(socket);
+          request.method = outcome.request.method;
+          request.url = outcome.request.path;
+          request.httpVersion = "1.1";
+          request.headers = Object.fromEntries(outcome.request.headers);
+
+          emit({
+            type: "system",
+            text: `${conn.id} upgrading to WebSocket → 101 ${statusLine(101)}`,
+            at: Date.now(),
+          });
+
+          // ws computes Sec-WebSocket-Accept, writes the 101, and owns the
+          // socket from here on.
+          wss.handleUpgrade(request, socket, outcome.head, (ws) => {
+            wss.emit("connection", ws, request);
+          });
+          return;
+        }
+
+        default:
+          return assertNever(outcome);
+      }
     }
 
     for (const line of conn.takeLines()) {
@@ -719,28 +916,24 @@ const server = net.createServer((socket) => {
         handleLine(conn, text);
       }
     }
-  });
+  };
 
-  socket.on("close", () => {
+  const onClose = (): void => {
     clearTimeout(greeting);
     conn.markClosed();
-
-    if (conn.mode !== "chat") {
-      return; // an HTTP request, already answered and logged
+    if (conn.mode === "chat") {
+      farewell(conn);
     }
-
-    const room = conn.room;
-    if (room !== undefined) {
-      rooms.get(room)?.leave(conn.label);
-    }
-    clients.delete(conn.id);
-    emit({ type: "system", text: `${conn.label} disconnected (${clients.size} remaining)`, at: Date.now() });
-  });
+  };
 
   // Always handle this. An unhandled socket error takes the whole process down.
-  socket.on("error", (err: Error) => {
+  const onError = (err: Error): void => {
     emit({ type: "system", text: `${conn.id} error: ${err.message}`, at: Date.now() });
-  });
+  };
+
+  socket.on("data", onData);
+  socket.on("close", onClose);
+  socket.on("error", onError);
 });
 
 server.on("error", (err: NodeJS.ErrnoException) => {
@@ -754,8 +947,8 @@ server.on("error", (err: NodeJS.ErrnoException) => {
 // Ctrl-C: stop accepting connections, hang up on everyone, then exit.
 process.on("SIGINT", () => {
   emit({ type: "system", text: "Shutting down", at: Date.now() });
-  for (const conn of clients.values()) {
-    conn.end("Server shutting down.");
+  for (const client of clients.values()) {
+    client.end("Server shutting down.");
   }
   server.close(() => process.exit(0));
 });
@@ -766,6 +959,8 @@ const host: Host = CONFIG.host;
 server.listen(port, host, () => {
   console.log(`Chat server listening on ${address(host, port)}`);
   console.log(`Rooms: ${[...rooms.keys()].join(", ")}`);
-  console.log(`Chat: nc ${host} ${port}`);
-  console.log(`HTTP: curl http://${address(host, port)}/`);
+  console.log(`Chat:    nc ${host} ${port}`);
+  console.log(`HTTP:    curl http://${address(host, port)}/`);
+  console.log(`Browser: http://${address(host, port)}/`);
+  console.log(`WebSock: wscat -c ws://${address(host, port)}`);
 });
