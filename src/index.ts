@@ -1,38 +1,57 @@
-// Chat server - TCP, HTTP and WebSocket on one port, now wired through a
-// typed event bus.
+// Chat server - TCP, HTTP and WebSocket on one port, now speaking a protocol
+// instead of a pile of strings.
 //
-// Chapters 5-7 grew a habit: every interesting moment in the server called
-// console.log directly, and /join reached over to broadcast() itself. That
-// couples the thing that happens to everything that cares about it.
+// Chapters 5-8 parsed what clients sent by splitting on whitespace and looking
+// at the first word. It worked, and it was a lie: nothing in the type system
+// knew that "/join" needed a room, that "/nick" needed a name, or that "/jion"
+// was not a command at all. Every one of those questions was answered at
+// runtime, by a string comparison, in a switch that would happily fall through
+// to `default` and shrug.
 //
-// Generics let us cut that knot properly. `TypedEmitter<ServerEvents>` is an
-// event bus whose event names and payloads are checked at compile time, so
-// handleLine() merely announces what happened - "a message arrived" - and three
-// independent listeners log it, store it in the room's history, and broadcast
-// it. Adding a fourth changes none of the existing code.
+// src/protocol.ts replaces the lot with two discriminated unions. Clients send a
+// ClientMessage; the server answers with a ServerMessage. Both transports carry
+// the same JSON - one object per line over TCP, one object per frame over
+// WebSocket - so a `nc` session and a browser tab are now literally speaking the
+// same language, not two dialects that happen to rhyme.
+//
+// The compiler enforces all of it. handleMessage switches on `msg.type` and
+// assertNever holds it to account: add a variant to ClientMessage and this file
+// stops compiling until it is handled. Not a TODO. A build error.
 
 import net from "node:net";
 import { IncomingMessage } from "node:http";
 import { WebSocketServer, WebSocket } from "ws";
 import { TypedEmitter, RingBuffer, pluck } from "./events";
+import {
+  assertNever,
+  CATALOG,
+  COMMANDS,
+  ConnectionState,
+  decodeClientMessage,
+  describeState,
+  encodeServerMessage,
+  ErrorCode,
+  type ClientMessage,
+  type MessageSummary,
+  type RoomName,
+  type RoomSummary,
+  type ServerMessage,
+  type Timestamp,
+  type Transport,
+  type UserId,
+  type UserSummary,
+} from "./protocol";
 
 // --- Domain types --------------------------------------------------------
 
 type Host = string;
 type Port = number;
-type UserId = string;
-type RoomName = string;
-type Timestamp = number;
 
-// A connection is in exactly one of these three states - nothing else.
-type ConnectionState = "connecting" | "connected" | "disconnected";
-
-// What the peer turned out to be. "unknown" until the first line arrives.
-type Protocol = "unknown" | "chat" | "http";
-
-// How a client is attached. Used only for display - the chat logic does not
-// care, which is the whole point of the ChatClient interface below.
-type Transport = "tcp" | "ws";
+// What the peer turned out to be. "unknown" until the first line arrives. This
+// is the *transport* the peer is speaking, not to be confused with the message
+// protocol in protocol.ts - HTTP and chat clients both end up sending JSON, they
+// just wrap it differently.
+type PeerKind = "unknown" | "chat" | "http";
 
 // `Readonly<T>` marks every property immutable, so nothing can reassign the
 // config after startup.
@@ -97,9 +116,11 @@ interface Message extends Identifiable {
   editedAt?: Timestamp;
 }
 
-// Anyone the server can talk to, however they got here. handleLine() and
-// broadcast() work in terms of this and nothing else, so a telnet user and a
-// browser tab are interchangeable to them.
+// Anyone the server can talk to, however they got here.
+//
+// Note what send() now takes. It is not a string - it is a ServerMessage. The
+// transport decides how to put it on the wire; the chat logic never builds a
+// line of output by hand again, and cannot send a shape no client understands.
 interface ChatClient extends Identifiable {
   readonly transport: Transport;
   readonly connectedAt: Timestamp;
@@ -108,8 +129,8 @@ interface ChatClient extends Identifiable {
   readonly status: ConnectionState;
   readonly user: User | undefined;
   readonly room: RoomName | undefined;
-  send(line: string): void;
-  end(line: string): void;
+  send(message: ServerMessage): void;
+  end(message: ServerMessage): void;
   identifyAs(user: User): void;
   enterRoom(name: RoomName): void;
   exitRoom(): void;
@@ -140,12 +161,16 @@ type HttpOutcome =
   | { kind: "handled" }                                          // answered, closing
   | { kind: "upgrade"; request: HttpRequest; head: Buffer };     // hand off to ws
 
-// A log record. The `type` field is the discriminant: switching on it tells the
-// compiler which other fields exist.
+// What the server writes to its own console. This is *not* ServerMessage: the
+// log records things no client is ever told - an HTTP request, a socket error, a
+// protocol violation - and deliberately omits things clients do see, like the
+// text of a private whisper. Two audiences, two unions.
 type ChatEvent =
   | { type: "message"; user: UserId; room: RoomName; text: string; at: Timestamp }
+  | { type: "whisper"; from: UserId; to: UserId; at: Timestamp }
   | { type: "join"; user: UserId; room: RoomName; at: Timestamp }
   | { type: "leave"; user: UserId; room: RoomName; at: Timestamp }
+  | { type: "kick"; by: UserId; target: UserId; reason: string; at: Timestamp }
   | { type: "system"; text: string; at: Timestamp };
 
 // The bus's contract: event name → the handler that listens for it. Every
@@ -162,15 +187,13 @@ type ServerEvents = {
   join: (client: ChatClient, room: RoomName) => void;
   leave: (client: ChatClient, room: RoomName) => void;
   message: (message: ChatMessage) => void;
+  whisper: (from: ChatClient, to: ChatClient, text: string) => void;
+  kick: (by: ChatClient, target: ChatClient, reason: string) => void;
   request: (method: string, path: string, status: number) => void;
   upgrade: (id: string) => void;
   notice: (text: string) => void;
   failure: (source: string, error: Error) => void;
 };
-
-// `Pick<T, K>` keeps only the named properties. The API exposes what a message
-// says, not the internals of the class that holds it.
-type MessageSummary = Pick<ChatMessage, "sender" | "text" | "room" | "at">;
 
 // --- Classes -------------------------------------------------------------
 
@@ -256,14 +279,17 @@ class ChatMessage implements Message, Serializable {
 // is attached. The two transports differ only in how bytes leave and arrive.
 abstract class BaseClient implements ChatClient {
   readonly connectedAt: Timestamp = Date.now();
-  protected state: ConnectionState = "connected";
   protected identity?: User;
   protected currentRoom?: RoomName;
 
-  constructor(readonly id: string, readonly transport: Transport) {}
+  constructor(
+    readonly id: string,
+    readonly transport: Transport,
+    protected state: ConnectionState,
+  ) {}
 
-  abstract send(line: string): void;
-  abstract end(line: string): void;
+  abstract send(message: ServerMessage): void;
+  abstract end(message: ServerMessage): void;
 
   get status(): ConnectionState {
     return this.state;
@@ -298,8 +324,19 @@ abstract class BaseClient implements ChatClient {
     this.currentRoom = undefined;
   }
 
+  // The three transitions the server can drive. A connection walks Connecting →
+  // Connected → Closing → Disconnected and never goes back, which is why
+  // ConnectionState has no "reconnecting": that is the client's business.
+  markConnected(): void {
+    this.state = ConnectionState.Connected;
+  }
+
+  markClosing(): void {
+    this.state = ConnectionState.Closing;
+  }
+
   markClosed(): void {
-    this.state = "disconnected";
+    this.state = ConnectionState.Disconnected;
   }
 }
 
@@ -309,19 +346,23 @@ abstract class BaseClient implements ChatClient {
 // event is whatever happened to be in flight - half a line, three lines, the
 // headers of a request but not its body. So bytes are buffered here until a
 // whole unit is present, and only then handed on.
+//
+// That framing work, done back in Chapter 5, is exactly what earns us JSON here:
+// one object per line. The newline is the frame.
 class TcpClient extends BaseClient {
   readonly address: string;
 
-  private protocol: Protocol = "unknown";
+  private peer: PeerKind = "unknown";
   private inbox: Buffer = Buffer.alloc(0);
 
   constructor(private readonly socket: net.Socket, sequence: number) {
-    super(`c${sequence}`, "tcp");
+    // Accepted, but we do not yet know whether this is curl or a person.
+    super(`c${sequence}`, "tcp", ConnectionState.Connecting);
     this.address = `${socket.remoteAddress}:${socket.remotePort}`;
   }
 
-  get mode(): Protocol {
-    return this.protocol;
+  get mode(): PeerKind {
+    return this.peer;
   }
 
   // Bytes received but not yet consumed.
@@ -329,8 +370,8 @@ class TcpClient extends BaseClient {
     return this.inbox;
   }
 
-  becomes(protocol: Protocol): void {
-    this.protocol = protocol;
+  becomes(peer: PeerKind): void {
+    this.peer = peer;
   }
 
   append(chunk: Buffer): void {
@@ -343,7 +384,7 @@ class TcpClient extends BaseClient {
   }
 
   // Every *complete* line in the buffer. A trailing partial line stays put
-  // until the rest of it arrives.
+  // until the rest of it arrives - a half-delivered JSON object is not JSON.
   takeLines(): string[] {
     const lines: string[] = [];
     let newline = this.inbox.indexOf(0x0a);
@@ -355,56 +396,54 @@ class TcpClient extends BaseClient {
     return lines;
   }
 
-  send(line: string): void {
-    this.socket.write(`${line}\n`);
+  // Newline-delimited JSON. The trailing \n is not decoration: it is the frame
+  // marker the other end splits on.
+  send(message: ServerMessage): void {
+    this.socket.write(`${encodeServerMessage(message)}\n`);
   }
 
-  // Raw write: HTTP builds its own bytes, newlines and all.
+  // Raw write: HTTP builds its own bytes, headers and all.
   write(raw: string): void {
     this.socket.write(raw);
   }
 
-  end(line: string): void {
-    this.send(line);
+  end(message: ServerMessage): void {
+    this.send(message);
+    this.markClosing();
     this.socket.end();
   }
 
   close(): void {
+    this.markClosing();
     this.socket.end();
   }
 }
 
 // A WebSocket client: a browser tab, or wscat. `ws` has already done the
-// framing, so a message arrives whole - no buffering, no newline hunting.
+// framing, so a message arrives whole - no buffering, no newline hunting. One
+// frame is one JSON object.
 class WsClient extends BaseClient {
   constructor(
     private readonly ws: WebSocket,
     sequence: number,
     readonly address: string,
   ) {
-    super(`w${sequence}`, "ws");
+    // The handshake is already done by the time `ws` hands us the socket.
+    super(`w${sequence}`, "ws", ConnectionState.Connected);
   }
 
   // A client may be mid-disconnect: sending to a closing socket throws.
-  send(line: string): void {
+  send(message: ServerMessage): void {
     if (this.ws.readyState === WebSocket.OPEN) {
-      this.ws.send(line);
+      this.ws.send(encodeServerMessage(message));
     }
   }
 
-  end(line: string): void {
-    this.send(line);
+  end(message: ServerMessage): void {
+    this.send(message);
+    this.markClosing();
     this.ws.close();
   }
-}
-
-// --- Exhaustiveness ------------------------------------------------------
-
-// Reaching this is impossible once every variant is handled, so `value` narrows
-// to `never`. Add a ChatEvent variant and forget a switch case, and the call
-// below stops compiling - the compiler finds the gap for us.
-function assertNever(value: never): never {
-  throw new Error(`Unexpected value: ${String(value)}`);
 }
 
 // --- Functions -----------------------------------------------------------
@@ -442,15 +481,6 @@ function statusLine(code: number): string {
   }
 }
 
-function describeState(state: ConnectionState): string {
-  switch (state) {
-    case "connecting":   return "handshake in progress";
-    case "connected":    return "ready to send and receive";
-    case "disconnected": return "socket closed";
-    default:             return assertNever(state);
-  }
-}
-
 // A custom type guard. AdminUser is the only variant carrying `adminLevel`, so
 // the `in` check is enough to narrow - no discriminant field required.
 function isAdmin(user: User): user is AdminUser {
@@ -468,12 +498,16 @@ function parseInput(input: unknown): string {
   return "<unsupported>";
 }
 
-// Narrowing by discriminant: each branch sees only that variant's fields.
+// Narrowing by discriminant: each branch sees only that variant's fields. Add a
+// ChatEvent variant and the assertNever call below names it as the one you have
+// not handled.
 function formatEvent(event: ChatEvent): string {
   switch (event.type) {
     case "message": return `[${event.room}] ${event.user}: ${event.text}`;
+    case "whisper": return `${event.from} → ${event.to} (private)`;
     case "join":    return `→ ${event.user} joined ${event.room}`;
     case "leave":   return `← ${event.user} left ${event.room}`;
+    case "kick":    return `⚡ ${event.by} kicked ${event.target}: ${event.reason}`;
     case "system":  return `[SYSTEM] ${event.text}`;
     default:        return assertNever(event);
   }
@@ -485,8 +519,24 @@ function formatDuration(ms: number): string {
   return minutes > 0 ? `${minutes}m ${seconds % 60}s` : `${seconds}s`;
 }
 
+// The class knows its own id and how to serialize itself. The wire needs neither.
 function summarize(message: ChatMessage): MessageSummary {
   return { sender: message.sender, text: message.text, room: message.room, at: message.at };
+}
+
+function describeClient(client: ChatClient): UserSummary {
+  const user = client.user;
+  return {
+    id: client.id,
+    label: client.label,
+    transport: client.transport,
+    room: client.room ?? null,
+    admin: user !== undefined && isAdmin(user),
+  };
+}
+
+function describeRoom(room: ChatRoom): RoomSummary {
+  return { name: room.name, members: room.memberCount, messages: room.messageCount };
 }
 
 // --- Server state --------------------------------------------------------
@@ -502,7 +552,7 @@ for (const name of config.rooms) {
 }
 
 // Users the server already knows about. Chapter 17 replaces this with real
-// authentication; for now /nick simply claims an identity.
+// authentication; for now a "nick" message simply claims an identity.
 const knownUsers = new Map<string, User | AdminUser>([
   ["alice", { id: "u1", name: "alice", joinedAt: Date.now(), adminLevel: 2, permissions: ["kick", "ban", "mute"] }],
   ["bob", { id: "u2", name: "bob", joinedAt: Date.now() }],
@@ -513,30 +563,18 @@ const knownUsers = new Map<string, User | AdminUser>([
 const clients = new Map<string, ChatClient>();
 let sequence = 0;
 
-const commands: [string, string][] = [
-  ["/help", "Show available commands"],
-  ["/who", "List connected clients"],
-  ["/rooms", "List rooms and their member counts"],
-  ["/history", "Replay recent messages in this room"],
-  ["/nick", "Identify yourself: /nick alice"],
-  ["/join", "Join a room: /join general"],
-  ["/leave", "Leave the current room"],
-  ["/time", "Show the server time"],
-  ["/uptime", "Show how long you have been connected"],
-  ["/quit", "Disconnect"],
-];
-
 // --- The event bus -------------------------------------------------------
 
 const bus = new TypedEmitter<ServerEvents>();
 
 // Send to everyone in a room, optionally skipping one client (usually the
-// sender). Transport is irrelevant here: a line typed into nc lands in a
-// browser, and vice versa, because both are just ChatClients.
-function broadcast(room: RoomName, line: string, except?: ChatClient): void {
+// sender). Transport is irrelevant here: a message typed into nc lands in a
+// browser, and vice versa, because both are just ChatClients being handed a
+// ServerMessage that each knows how to put on its own wire.
+function broadcast(room: RoomName, message: ServerMessage, except?: ChatClient): void {
   for (const client of clients.values()) {
     if (client.room === room && client !== except) {
-      client.send(line);
+      client.send(message);
     }
   }
 }
@@ -556,6 +594,11 @@ bus.on("leave", (client, room) =>
   log({ type: "leave", user: client.label, room, at: Date.now() }));
 bus.on("message", (message) =>
   log({ type: "message", user: message.sender, room: message.room, text: message.text, at: message.at }));
+// The log records *that* a whisper happened. It does not record what it said.
+bus.on("whisper", (from, to) =>
+  log({ type: "whisper", from: from.label, to: to.label, at: Date.now() }));
+bus.on("kick", (by, target, reason) =>
+  log({ type: "kick", by: by.label, target: target.label, reason, at: Date.now() }));
 bus.on("request", (method, path, status) =>
   log({ type: "system", text: `${method} ${path} → ${status} ${statusLine(status)}`, at: Date.now() }));
 bus.on("upgrade", (id) =>
@@ -570,24 +613,51 @@ bus.on("message", (message) => {
   rooms.get(message.room)?.remember(message);
 });
 
-// Listener 3: the wire. This is what actually delivers chat to other people.
+// Listener 3: the wire. This is what actually delivers chat to other people -
+// and every line of it now hands over a ServerMessage, not a formatted string.
 bus.on("message", (message) => {
-  broadcast(message.room, `[${message.sender}] ${message.text}`);
+  broadcast(message.room, {
+    type: "chat",
+    sender: message.sender,
+    text: message.text,
+    room: message.room,
+    at: message.at,
+  });
+});
+bus.on("whisper", (from, to, text) => {
+  const delivered: ServerMessage = {
+    type: "whisper",
+    from: from.label,
+    to: to.label,
+    text,
+    at: Date.now(),
+  };
+  to.send(delivered);
+  from.send(delivered); // the sender sees their own whisper land
 });
 bus.on("join", (client, room) => {
-  broadcast(room, `→ ${client.label} joined`, client);
+  broadcast(room, { type: "joined", user: client.label, room, members: rooms.get(room)?.memberCount ?? 0 }, client);
 });
 bus.on("leave", (client, room) => {
-  broadcast(room, `← ${client.label} left`, client);
+  broadcast(room, { type: "left", user: client.label, room }, client);
+});
+bus.on("kick", (by, target, reason) => {
+  const room = target.room;
+  if (room !== undefined) {
+    broadcast(room, { type: "system", text: `${target.label} was kicked by ${by.label}: ${reason}` }, target);
+  }
+  target.end({ type: "kicked", by: by.label, reason });
 });
 
-// Three listeners on "message", and the code that emits it knows about none of
-// them. That is the whole point: handleLine announces, it does not orchestrate.
+// Four listeners across "message", "whisper" and "kick", and the code that emits
+// them knows about none of them. That is still the point: handleMessage
+// announces, it does not orchestrate.
 
 // --- HTTP ----------------------------------------------------------------
 
 // `GET /path HTTP/1.1` - the shape of an HTTP request's first line. Anything
-// else on the wire is a chat client.
+// else on the wire is a chat client. A JSON object never matches this, so the
+// sniffing from Chapter 6 survives the protocol change untouched.
 const HTTP_REQUEST_LINE = /^(GET|HEAD|POST|PUT|PATCH|DELETE|OPTIONS) \S+ HTTP\/1\.[01]$/;
 
 const CRLF = "\r\n";
@@ -656,26 +726,122 @@ function isWebSocketUpgrade(req: HttpRequest): boolean {
 }
 
 // A browser client, served from the same port it will connect back to.
+//
+// This is the other half of the protocol, and it is worth reading as such. The
+// page builds a ClientMessage from what you type and switches over every
+// ServerMessage it might be sent - the same two unions, from the other end. The
+// slash commands are gone from the server and live here instead, which is where
+// they always belonged: they are input sugar for a human, not part of the wire.
 function chatPage(): string {
   return `<!doctype html>
 <meta charset="utf-8">
 <title>Chat</title>
 <h1>Chat server</h1>
 <p>${clients.size} client(s) connected across ${rooms.size} rooms.</p>
+<p><small>Type a message, or /join general, /nick alice, /who, /rooms, /history,
+/w bob hello, /leave, /status, /help</small></p>
 <div id="log" style="font-family:monospace;white-space:pre-wrap"></div>
 <input id="input" style="width:30em" placeholder="/join general" autofocus>
 <script>
-  const ws = new WebSocket("ws://" + location.host);
-  const log = (line) => {
-    document.getElementById("log").textContent += line + "\\n";
-  };
-  ws.onmessage = (event) => log(event.data);
-  ws.onclose = () => log("[disconnected]");
-  document.getElementById("input").addEventListener("keydown", (event) => {
-    if (event.key === "Enter" && event.target.value) {
-      ws.send(event.target.value);
-      event.target.value = "";
+  const logEl = document.getElementById("log");
+  const log = (line) => { logEl.textContent += line + "\\n"; };
+
+  // A client-side ConnectionState. This is where "reconnecting" lives - the
+  // server never has that state, because a server does not reconnect.
+  let state = "connecting";
+  let ws = null;
+
+  // What you typed → a ClientMessage. The server no longer parses slashes;
+  // this does, and sends it a well-formed object.
+  const toMessage = (input) => {
+    if (!input.startsWith("/")) return { type: "chat", text: input };
+    const [command, ...rest] = input.slice(1).split(" ");
+    switch (command) {
+      case "join":    return { type: "join", room: rest[0] ?? "" };
+      case "nick":    return { type: "nick", name: rest[0] ?? "" };
+      case "leave":   return { type: "leave" };
+      case "who":     return { type: "who" };
+      case "rooms":   return { type: "rooms" };
+      case "history": return { type: "history" };
+      case "status":  return { type: "status" };
+      case "help":    return { type: "help" };
+      case "quit":    return { type: "quit" };
+      case "w":
+      case "whisper": return { type: "whisper", to: rest[0] ?? "", text: rest.slice(1).join(" ") };
+      case "kick":    return { type: "kick", target: rest[0] ?? "", reason: rest.slice(1).join(" ") || "no reason" };
+      default:        return null;
     }
+  };
+
+  // A ServerMessage → a line on screen. Every variant the server can send is
+  // handled here; anything else is a bug worth seeing rather than swallowing.
+  const render = (msg) => {
+    const time = (at) => new Date(at).toLocaleTimeString();
+    switch (msg.type) {
+      case "welcome":  return msg.text;
+      case "system":   return "[system] " + msg.text;
+      case "chat":     return "[" + time(msg.at) + "] " + msg.sender + ": " + msg.text;
+      case "whisper":  return "(private) " + msg.from + " → " + msg.to + ": " + msg.text;
+      case "joined":   return "→ " + msg.user + " joined " + msg.room + " (" + msg.members + " here)";
+      case "left":     return "← " + msg.user + " left " + msg.room;
+      case "userList": return msg.users.length + " connected:\\n" + msg.users
+        .map((u) => "  " + u.label + " [" + u.transport + "]" + (u.admin ? " (admin)" : "") + (u.room ? " in " + u.room : ""))
+        .join("\\n");
+      case "roomList": return msg.rooms
+        .map((r) => "  " + r.name + " - " + r.members + " member(s), " + r.messages + " message(s)")
+        .join("\\n");
+      case "history":  return msg.messages.length === 0
+        ? "(no history in " + msg.room + ")"
+        : "--- last " + msg.messages.length + " in " + msg.room + " ---\\n" + msg.messages
+            .map((m) => "  " + m.sender + ": " + m.text)
+            .join("\\n");
+      case "commands": return "The server understands:\\n" + msg.commands
+        .map((c) => "  " + c.type.padEnd(8) + " " + c.description + "\\n           " + c.example)
+        .join("\\n");
+      case "kicked":   return "You were kicked by " + msg.by + ": " + msg.reason;
+      case "error":    return "[error: " + msg.code + "] " + msg.message;
+      default:         return "[unknown message] " + JSON.stringify(msg);
+    }
+  };
+
+  const connect = () => {
+    ws = new WebSocket("ws://" + location.host);
+
+    ws.onopen = () => {
+      if (state === "reconnecting") log("[reconnected]");
+      state = "connected";
+    };
+
+    ws.onmessage = (event) => {
+      try {
+        log(render(JSON.parse(event.data)));
+      } catch {
+        log("[unparseable] " + event.data);
+      }
+    };
+
+    ws.onclose = () => {
+      if (state === "closed") return;
+      state = "reconnecting";
+      log("[disconnected - retrying in 2s]");
+      setTimeout(connect, 2000);
+    };
+  };
+
+  connect();
+
+  document.getElementById("input").addEventListener("keydown", (event) => {
+    if (event.key !== "Enter" || !event.target.value) return;
+    const message = toMessage(event.target.value);
+    if (message === null) {
+      log("[error] unknown command. Try /help");
+    } else if (state !== "connected") {
+      log("[error] not connected");
+    } else {
+      if (message.type === "quit") state = "closed";
+      ws.send(JSON.stringify(message));
+    }
+    event.target.value = "";
   });
 </script>`;
 }
@@ -696,16 +862,17 @@ function handleRequest(req: HttpRequest): HttpResponse {
     });
   }
 
-  if (req.path === "/api/rooms" && req.method === "GET") {
-    return json(200, [...rooms.values()].map((room) => ({
-      name: room.name,
-      members: room.memberList,
-      memberCount: room.memberCount,
-      messageCount: room.messageCount,
-    })));
+  // The protocol, served from the protocol. CATALOG is a Record keyed by every
+  // ClientMessage variant, so this endpoint cannot describe a message the server
+  // does not accept, nor omit one it does.
+  if (req.path === "/api/protocol" && req.method === "GET") {
+    return json(200, { clientMessages: COMMANDS });
   }
 
-  // Pick<> keeps the payload to what a message says, not how it is stored.
+  if (req.path === "/api/rooms" && req.method === "GET") {
+    return json(200, [...rooms.values()].map(describeRoom));
+  }
+
   if (req.path === "/api/history" && req.method === "GET") {
     const recent: MessageSummary[] = [...rooms.values()]
       .flatMap((room) => room.recent(10).map(summarize));
@@ -768,80 +935,91 @@ function readHttp(conn: TcpClient): HttpOutcome {
   return { kind: "handled" };
 }
 
-// --- Command handling ----------------------------------------------------
+// --- Message handling ----------------------------------------------------
+
+function fail(client: ChatClient, code: ErrorCode, message: string): void {
+  client.send({ type: "error", code, message });
+}
+
+// Find a client by the name it goes by. Whisper and kick both need this, and
+// both must cope with it not being there.
+function findByLabel(label: string): ChatClient | undefined {
+  for (const client of clients.values()) {
+    if (client.label === label) {
+      return client;
+    }
+  }
+  return undefined;
+}
 
 // Show a client what it missed.
 function replay(client: ChatClient, room: ChatRoom, count: number): void {
-  const recent = room.recent(count);
-  if (recent.length === 0) {
-    return;
-  }
-  client.send(`--- last ${recent.length} message(s) in ${room.name} ---`);
-  for (const message of recent) {
-    client.send(`[${message.sender}] ${message.text}`);
-  }
-  client.send("---");
+  client.send({
+    type: "history",
+    room: room.name,
+    messages: room.recent(count).map(summarize),
+  });
 }
 
-// One line from one client. It announces what happened on the bus; it does not
-// decide who cares.
-function handleLine(client: ChatClient, line: string): void {
-  const [command, ...rest] = line.split(/\s+/);
-  const argument = rest.join(" ");
-
-  switch (command) {
-    case "/help":
-      client.send("Commands:");
-      for (const [name, description] of commands) {
-        client.send(`  ${name.padEnd(9)} ${description}`);
-      }
+// One message from one client.
+//
+// This is the chapter in a single function. `message` arrives as a
+// ClientMessage - already decoded, already checked - and the switch narrows it
+// variant by variant, so `message.room` exists in the "join" branch and nowhere
+// else. The assertNever at the bottom is the guarantee: every variant of
+// ClientMessage is handled here, and the compiler has checked that claim.
+function handleMessage(client: ChatClient, message: ClientMessage): void {
+  switch (message.type) {
+    case "help":
+      client.send({ type: "commands", commands: COMMANDS });
       return;
 
-    case "/who":
-      client.send(`Connected clients: ${clients.size}`);
-      for (const other of clients.values()) {
-        const user = other.user;
-        const role = user !== undefined && isAdmin(user) ? " (admin)" : "";
-        const where = other.room !== undefined ? ` in ${other.room}` : "";
-        const you = other.id === client.id ? " ← you" : "";
-        client.send(`  ${other.label} [${other.transport}]${role}${where}${you}`);
-      }
+    case "who":
+      client.send({ type: "userList", users: [...clients.values()].map(describeClient) });
       return;
 
-    case "/rooms":
-      for (const room of rooms.values()) {
-        client.send(`  ${room.name.padEnd(8)} ${room.memberCount} member(s), ${room.messageCount} message(s)`);
-      }
+    case "rooms":
+      client.send({ type: "roomList", rooms: [...rooms.values()].map(describeRoom) });
       return;
 
-    case "/history": {
+    case "history": {
       const current = client.room;
       const room = current !== undefined ? rooms.get(current) : undefined;
       if (room === undefined) {
-        client.send("Join a room first: /join general");
+        fail(client, ErrorCode.NotInRoom, `Join a room first, e.g. ${CATALOG.join.example}`);
         return;
       }
-      replay(client, room, room.messageCount);
+      // `limit` is optional, so it is `number | undefined` here - and the
+      // compiler will not let us forget the second case.
+      replay(client, room, message.limit ?? room.messageCount);
       return;
     }
 
-    case "/nick": {
-      const user = knownUsers.get(argument);
+    case "nick": {
+      const user = knownUsers.get(message.name);
       if (user === undefined) {
-        client.send(`Unknown user "${argument}". Try: ${[...knownUsers.keys()].join(", ")}`);
+        fail(
+          client,
+          ErrorCode.UnknownUser,
+          `Unknown user "${message.name}". Try: ${[...knownUsers.keys()].join(", ")}`,
+        );
         return;
       }
       client.identifyAs(user);
       const role = isAdmin(user) ? ` You are an admin (level ${user.adminLevel}).` : "";
-      client.send(`You are now ${user.name}.${role}`);
+      client.send({ type: "system", text: `You are now ${user.name}.${role}` });
       return;
     }
 
-    case "/join": {
-      const room = rooms.get(argument);
+    case "join": {
+      const room = rooms.get(message.room);
       if (room === undefined) {
         // pluck: one property out of every room, type-checked against ChatRoom.
-        client.send(`No such room "${argument}". Try: ${pluck([...rooms.values()], "name").join(", ")}`);
+        fail(
+          client,
+          ErrorCode.UnknownRoom,
+          `No such room "${message.room}". Try: ${pluck([...rooms.values()], "name").join(", ")}`,
+        );
         return;
       }
       const previous = client.room;
@@ -852,66 +1030,119 @@ function handleLine(client: ChatClient, line: string): void {
       }
       room.join(client.label);
       client.enterRoom(room.name);
-      client.send(`Joined ${room.name} (${room.memberCount} member(s)).`);
+      client.send({ type: "joined", user: client.label, room: room.name, members: room.memberCount });
       replay(client, room, HISTORY_ON_JOIN);
       bus.emit("join", client, room.name);
       return;
     }
 
-    case "/leave": {
+    case "leave": {
       const current = client.room;
       if (current === undefined) {
-        client.send("You are not in a room.");
+        fail(client, ErrorCode.NotInRoom, "You are not in a room.");
         return;
       }
       rooms.get(current)?.leave(client.label);
       client.exitRoom();
-      client.send(`Left ${current}.`);
+      client.send({ type: "left", user: client.label, room: current });
       bus.emit("leave", client, current);
       return;
     }
 
-    case "/time":
-      client.send(`Server time: ${new Date().toISOString()}`);
+    case "chat": {
+      const room = client.room;
+      if (room === undefined) {
+        fail(client, ErrorCode.NotInRoom, `Join a room first, e.g. ${CATALOG.join.example}`);
+        return;
+      }
+      // Announce it. The log, the room's history, and the broadcast are all
+      // listeners - handleMessage does not know or care that they exist.
+      bus.emit("message", new ChatMessage(client.label, message.text, room));
+      return;
+    }
+
+    case "whisper": {
+      const target = findByLabel(message.to);
+      if (target === undefined) {
+        fail(client, ErrorCode.NoSuchTarget, `Nobody here is called "${message.to}".`);
+        return;
+      }
+      bus.emit("whisper", client, target, message.text);
+      return;
+    }
+
+    case "kick": {
+      const user = client.user;
+      // Two things must be true, and the type guard proves the second: you must
+      // have said who you are, and who you are must be an admin.
+      if (user === undefined || !isAdmin(user)) {
+        fail(client, ErrorCode.NotPermitted, "Only admins may kick. Identify yourself first.");
+        return;
+      }
+      const target = findByLabel(message.target);
+      if (target === undefined) {
+        fail(client, ErrorCode.NoSuchTarget, `Nobody here is called "${message.target}".`);
+        return;
+      }
+      if (target === client) {
+        fail(client, ErrorCode.NotPermitted, "You cannot kick yourself.");
+        return;
+      }
+      bus.emit("kick", client, target, message.reason);
+      return;
+    }
+
+    case "status":
+      client.send({
+        type: "system",
+        text:
+          `${client.id} [${client.transport}]: ${describeState(client.status)}. ` +
+          `Connected for ${formatDuration(client.uptime)}. ` +
+          `Server time ${new Date().toISOString()}.`,
+      });
       return;
 
-    case "/uptime":
-      client.send(`Connected for ${formatDuration(client.uptime)}.`);
-      return;
-
-    case "/status":
-      client.send(`Client ${client.id} [${client.transport}]: ${describeState(client.status)}`);
-      return;
-
-    case "/quit":
-      client.end("Goodbye!");
+    case "quit":
+      client.end({ type: "system", text: "Goodbye!" });
       return;
 
     default:
-      break;
+      // Unreachable, and the compiler knows it. Add a variant to ClientMessage
+      // and this line is where the build breaks.
+      return assertNever(message);
   }
+}
 
-  if (command !== undefined && command.startsWith("/")) {
-    client.send(`Unknown command: ${command}. Try /help.`);
-    return;
+// One line off a socket. Decode it, or explain why it could not be decoded.
+function handleLine(client: ChatClient, line: string): void {
+  const decoded = decodeClientMessage(line);
+  switch (decoded.kind) {
+    case "ok":
+      handleMessage(client, decoded.message);
+      return;
+    case "invalid":
+      fail(client, ErrorCode.InvalidMessage, decoded.reason);
+      return;
+    default:
+      return assertNever(decoded);
   }
-
-  const room = client.room;
-  if (room === undefined) {
-    client.send("Join a room first: /join general");
-    return;
-  }
-
-  // Announce it. The log, the room's history, and the broadcast are all
-  // listeners - handleLine does not know or care that they exist.
-  bus.emit("message", new ChatMessage(client.label, line, room));
 }
 
 // Everything a client needs when it arrives, whatever transport brought it.
-function welcome(client: ChatClient): void {
+//
+// BaseClient, not ChatClient: this is the moment a connection stops being a
+// mystery and becomes a participant, and markConnected is the server's business,
+// not something every ChatClient must expose.
+function welcome(client: BaseClient): void {
   clients.set(client.id, client);
+  client.markConnected();
   bus.emit("connect", client);
-  client.send(`Welcome! You are ${client.id}. Type /help for commands.`);
+  client.send({
+    type: "welcome",
+    id: client.id,
+    transport: client.transport,
+    text: `Welcome. You are ${client.id}. Send ${CATALOG.help.example} to see what I understand.`,
+  });
 }
 
 // ...and everything it needs when it leaves.
@@ -935,8 +1166,9 @@ wss.on("connection", (ws: WebSocket, request: IncomingMessage) => {
   const client = new WsClient(ws, ++sequence, request.socket.remoteAddress ?? "unknown");
   welcome(client);
 
-  // `ws` reassembles frames, so a message arrives whole. No buffering here -
-  // that work was only ever needed because raw TCP has no message boundaries.
+  // `ws` reassembles frames, so a message arrives whole: one frame, one JSON
+  // object. No buffering here - that work was only ever needed because raw TCP
+  // has no message boundaries.
   ws.on("message", (data: Buffer) => {
     const text = parseInput(data.toString("utf8"));
     if (text.length > 0) {
@@ -957,7 +1189,7 @@ wss.on("connection", (ws: WebSocket, request: IncomingMessage) => {
 // --- Protocol detection --------------------------------------------------
 
 // Look at the first complete line. Undefined means it has not arrived yet.
-function sniff(conn: TcpClient): Protocol | undefined {
+function sniff(conn: TcpClient): PeerKind | undefined {
   const newline = conn.pending.indexOf(0x0a);
   if (newline === -1) {
     return undefined;
@@ -1036,6 +1268,8 @@ const server = net.createServer((socket) => {
       }
     }
 
+    // One line, one JSON object. The framing from Chapter 5 is what makes that
+    // sentence true.
     for (const line of conn.takeLines()) {
       const text = parseInput(line);
       if (text.length > 0) {
@@ -1074,7 +1308,7 @@ server.on("error", (err: NodeJS.ErrnoException) => {
 process.on("SIGINT", () => {
   bus.emit("notice", "Shutting down");
   for (const client of clients.values()) {
-    client.end("Server shutting down.");
+    client.end({ type: "system", text: "Server shutting down." });
   }
   server.close(() => process.exit(0));
 });
@@ -1082,8 +1316,13 @@ process.on("SIGINT", () => {
 server.listen(config.port, config.host, () => {
   console.log(`Chat server listening on ${address(config.host, config.port)}`);
   console.log(`Rooms: ${pluck([...rooms.values()], "name").join(", ")}`);
+  console.log("");
+  console.log("Clients now speak JSON - one object per line over TCP, one per frame over WebSocket:");
+  console.log(`  ${CATALOG.join.example}`);
+  console.log(`  ${CATALOG.chat.example}`);
+  console.log("");
   console.log(`Chat:    nc ${config.host} ${config.port}`);
-  console.log(`HTTP:    curl http://${address(config.host, config.port)}/`);
+  console.log(`HTTP:    curl http://${address(config.host, config.port)}/api/protocol`);
   console.log(`Browser: http://${address(config.host, config.port)}/`);
   console.log(`WebSock: wscat -c ws://${address(config.host, config.port)}`);
 });
