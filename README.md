@@ -1,323 +1,260 @@
-# Chapter 02 - TypeScript Fundamentals
+# Chapter 03 - The Type System
 
-Variables, types, functions, arrays, tuples, and control flow - the core language you need before writing any real code.
+Union types, narrowing, literal types, type aliases, and type guards - the tools that make TypeScript more than "JavaScript with annotations."
 
-## Variables: let, const, and Type Annotations
+## Type Inference - When You Don't Need Annotations
 
-TypeScript has three ways to declare variables: `const`, `let`, and `var`. Forget `var` exists - it has scoping bugs from JavaScript's early days. Use `const` by default, `let` only when you need reassignment.
+TypeScript infers types from context. You don't need to annotate everything - the compiler figures it out from the value, the return statement, or how a variable is used:
 
 ```typescript
-// const - the binding cannot be reassigned
-const port: number = 8080;
-// port = 3000; // ERROR: Cannot assign to 'port' because it is a constant
+// Inferred from the value
+const port = 8080;           // type: number (not just "number" - literally 8080, see below)
+const host = "localhost";    // type: "localhost" (literal type!)
+let count = 0;               // type: number (let widens the type)
 
-// let - the binding can be reassigned
-let connectionCount: number = 0;
-connectionCount += 1; // fine
+// Inferred from the return statement
+function double(n: number) {
+  return n * 2;              // return type inferred as number
+}
 
-// Type annotations are optional when the type can be inferred
-const host = "127.0.0.1";      // inferred as string
-let isRunning = true;           // inferred as boolean
-const maxClients = 100;         // inferred as number
+// Inferred from array contents
+const rooms = ["general", "random"];  // type: string[]
+const mixed = [1, "two", true];       // type: (string | number | boolean)[]
 ```
 
 > **Tip**
 >
-> Prefer `const` everywhere. Only use `let` when you actually need to reassign the variable. This makes your code easier to reason about - if you see `const`, you know the value never changes.
+> `const` declarations get **literal types**: `const port = 8080` has type `8080`, not `number`. `let` declarations get widened types: `let port = 8080` has type `number`. This is because `let` can be reassigned - the compiler keeps the type broad.
 
-## Primitive Types
+## Union Types and Narrowing
 
-TypeScript has seven primitive types. `number` is a single type - no widths, no signedness, nothing to choose between - with one exception: `bigint`, for integers too large for `number` to hold exactly.
+A **union type** says "this value can be one of several types." It's written with `|`:
 
 ```typescript
-// string - text
-const username: string = "alice";
-const greeting: string = `Hello, ${username}!`;  // template literal
+// This value can be a string or a number
+type MessageId = string | number;
 
-// number - all numbers (integer and float, always 64-bit)
-const port: number = 8080;
-const pi: number = 3.14159;
-const negative: number = -42;
+let id: MessageId = "abc-123";
+id = 42;  // also fine
 
-// boolean - true or false
-const isConnected: boolean = true;
-const isAdmin: boolean = false;
+// Function that accepts multiple types
+function formatId(id: string | number): string {
+  // Can't call string methods directly - id might be a number!
+  // id.toUpperCase(); // ERROR
 
-// null - explicitly empty ("I know this is nothing")
-const noValue: null = null;
-
-// undefined - not yet assigned ("this hasn't been set")
-let uninitialized: undefined = undefined;
-
-// symbol - unique identifier (rarely used directly)
-const id: symbol = Symbol("connection-id");
-
-// bigint - integers beyond number's safe range (note the n suffix)
-const huge: bigint = 9007199254740993n;
+  // "Narrowing" - check the type at runtime, compiler refines the type
+  if (typeof id === "string") {
+    return id.toUpperCase();  // OK - TypeScript knows id is string here
+  } else {
+    return `#${id}`;          // OK - TypeScript knows id is number here
+  }
+}
 ```
+
+**Narrowing** is TypeScript's killer feature. When you check the type with `typeof`, `instanceof`, or a property check, the compiler refines the type inside that branch. You get autocompletion and type safety that follows your runtime logic.
 
 > **Note**
 >
-> `null` vs `undefined`: use `null` when you explicitly want "no value." Use `undefined` for "not yet set." In practice, most TypeScript code uses `undefined` (it's what you get when a property is missing). With `strict: true`, the compiler forces you to handle both.
+> This is TypeScript's answer to Rust's `match` on enums. Instead of declaring variants at the type level, you declare a union and narrow it at runtime. Both approaches give you exhaustive type safety - just with different syntax.
 
-## Arrays and Tuples
+## Literal Types and as const
 
-Arrays hold multiple values of the same type. Tuples hold a fixed number of values with specific types at each position.
+A literal type is a type that represents a specific value, not just a category:
 
 ```typescript
-// Arrays - all elements must be the same type
-const rooms: string[] = ["general", "random", "dev"];
-const codes: number[] = [200, 404, 500];
-const flags: Array<boolean> = [true, false, true]; // alternate syntax
+// Literal types - exact values, not just categories
+type Direction = "north" | "south" | "east" | "west";
+type StatusCode = 200 | 404 | 500;
+type Toggle = true | false;  // same as boolean, but explicit
 
-// Array methods
-rooms.push("help");           // add to end
-const first = rooms[0];       // access by index: "general"
-const count = rooms.length;   // 4
-rooms.includes("dev");        // true
-
-// Tuples - fixed length, typed at each position
-const entry: [string, number] = ["alice", 8080];
-const name = entry[0];  // string
-const port = entry[1];  // number
-// entry[2];            // ERROR: Tuple type has no element at index '2'
-
-// Tuples are useful for functions that return multiple values
-function parseAddress(addr: string): [string, number] {
-  const parts = addr.split(":");
-  return [parts[0], parseInt(parts[1], 10)];
+function move(dir: Direction): void {
+  console.log(`Moving ${dir}`);
 }
 
-const [host, portNum] = parseAddress("127.0.0.1:8080");
-// Destructuring: host = "127.0.0.1", portNum = 8080
+move("north");  // OK
+// move("up");  // ERROR: "up" is not assignable to Direction
+
+// as const - makes an object/array deeply readonly with literal types
+const config = {
+  host: "localhost",
+  port: 8080,
+  rooms: ["general", "dev"],
+} as const;
+
+// config.host has type "localhost" (not string)
+// config.port has type 8080 (not number)
+// config.rooms has type readonly ["general", "dev"] (not string[])
+// config.port = 3000;  // ERROR: Cannot assign to 'port' because it is read-only
 ```
 
 > **Tip**
 >
-> Destructuring (`const [host, port] =...`) unpacks arrays and tuples into individual variables. It's used everywhere in TypeScript - function returns, imports, event handlers.
+> `as const` is powerful for configuration objects and lookup tables. It gives you the narrowest possible types and prevents accidental mutation. Use it whenever you have a fixed set of values known at compile time.
 
-## Functions, Parameter Types, and Return Types
+## Type Aliases with type
 
-Functions in TypeScript require parameter type annotations. Return types can be inferred but are good practice to annotate explicitly.
+`type` creates a name for any type - unions, objects, tuples, functions:
 
 ```typescript
-// Named function with explicit types
-function formatMessage(sender: string, text: string): string {
-  return `[${sender}]: ${text}`;
-}
+// Simple alias
+type Port = number;
+type Host = string;
 
-// Arrow function - the preferred syntax for short functions
-const add = (a: number, b: number): number => a + b;
+// Union alias
+type MessageId = string | number;
 
-// Arrow function with block body
-const greet = (name: string): string => {
-  const greeting = `Welcome to the chat, ${name}!`;
-  return greeting;
+// Object shape
+type User = {
+  name: string;
+  port: number;
+  isAdmin: boolean;
 };
 
-// Optional parameters - marked with ?
-function connect(host: string, port: number, timeout?: number): void {
-  const t = timeout ?? 5000;  // ?? is "nullish coalescing" - use right if left is null/undefined
-  console.log(`Connecting to ${host}:${port} (timeout: ${t}ms)`);
-}
+// Function type
+type MessageHandler = (sender: string, text: string) => void;
 
-connect("localhost", 8080);        // timeout is undefined, defaults to 5000
-connect("localhost", 8080, 3000);  // timeout is 3000
+// Tuple alias
+type HostPort = [string, number];
 
-// Default parameters
-function createRoom(name: string, maxUsers: number = 50): void {
-  console.log(`Room "${name}" created (max: ${maxUsers})`);
-}
-
-createRoom("general");       // maxUsers = 50
-createRoom("vip", 10);       // maxUsers = 10
-
-// void - function returns nothing
-function logMessage(msg: string): void {
-  console.log(msg);
-}
+// Using the aliases
+const user: User = { name: "alice", port: 8080, isAdmin: false };
+const handler: MessageHandler = (sender, text) => {
+  console.log(`${sender}: ${text}`);
+};
 ```
 
-### Arrow Functions vs Named Functions
+Type aliases are **erased at runtime** - like all TypeScript types. `type User =...` doesn't create a class or a constructor. It's just a name the compiler uses for checking. The JavaScript output has no trace of it.
 
-Arrow functions (`const fn = () =>...`) and named functions (`function fn()...`) are almost identical. The main difference: arrow functions capture `this` from their enclosing scope (important for callbacks and event handlers, which we'll use heavily in the chat server). Prefer arrow functions for short expressions and callbacks.
+## The unknown and never Types
 
-## Control Flow
-
-### if / else
+Two special types that sit at opposite ends of the type system:
 
 ```typescript
-const status = 404;
+// unknown - "I don't know what this is yet"
+// You MUST narrow it before using it. Safe alternative to 'any'.
+function handleInput(data: unknown): string {
+  // data.toUpperCase();  // ERROR - can't use unknown directly
 
-if (status === 200) {
-  console.log("OK");
-} else if (status === 404) {
-  console.log("Not Found");
-} else {
-  console.log(`Status: ${status}`);
+  if (typeof data === "string") {
+    return data.toUpperCase();  // OK - narrowed to string
+  }
+  if (typeof data === "number") {
+    return data.toString();     // OK - narrowed to number
+  }
+  return String(data);          // fallback
 }
 
-// Ternary - inline if/else for expressions
-const statusText = status === 200 ? "OK" : "Error";
+// never - "this can never happen"
+// Used for exhaustive checks and functions that never return.
+function assertNever(value: never): never {
+  throw new Error(`Unexpected value: ${value}`);
+}
+
+type Command = "join" | "leave" | "msg";
+
+function handle(cmd: Command): string {
+  switch (cmd) {
+    case "join": return "Joining...";
+    case "leave": return "Leaving...";
+    case "msg": return "Messaging...";
+    default: return assertNever(cmd);  // compiler error if a case is missing
+  }
+}
 ```
 
 > **Warning**
 >
-> Always use `===` (strict equality), never `==` (loose equality). `==` does type coercion: `0 == ""` is `true`, `0 === ""` is `false`. The strict version compares both value and type.
+> Never use `any`. It disables all type checking - TypeScript becomes JavaScript. Use `unknown` instead and narrow it. `any` is an escape hatch that should be avoided in strict TypeScript code.
 
-### for loops
+## Type Guards: typeof, instanceof, in
 
-```typescript
-const rooms = ["general", "random", "dev"];
-
-// for...of - iterate over values (preferred)
-for (const room of rooms) {
-  console.log(`Room: ${room}`);
-}
-
-// for...of with index using entries()
-for (const [index, room] of rooms.entries()) {
-  console.log(`[${index}] ${room}`);
-}
-
-// Classic for loop (when you need the index directly)
-for (let i = 0; i < rooms.length; i++) {
-  console.log(`Room ${i}: ${rooms[i]}`);
-}
-
-// while
-let attempts = 0;
-while (attempts < 3) {
-  console.log(`Attempt ${attempts + 1}`);
-  attempts++;
-}
-```
-
-### switch
-
-`switch` compares a value against a list of cases and runs the first that matches:
+Type guards are runtime checks that the compiler uses to narrow types in branches:
 
 ```typescript
-function handleCommand(command: string): string {
-  switch (command) {
-    case "/join":
-      return "Joining room...";
-    case "/leave":
-      return "Leaving room...";
-    case "/help":
-      return "Available commands: /join, /leave, /msg, /help";
-    case "/msg":
-      return "Sending message...";
-    default:
-      return `Unknown command: ${command}`;
+// typeof - for primitives (string, number, boolean)
+function process(value: string | number): string {
+  if (typeof value === "string") {
+    return value.trim();     // string methods available
+  }
+  return value.toFixed(2);   // number methods available
+}
+
+// instanceof - for class instances
+class ChatError extends Error {
+  code: number;
+  constructor(message: string, code: number) {
+    super(message);
+    this.code = code;
   }
 }
-```
 
-> **Note**
->
-> A `switch` does not enforce exhaustiveness by default: forget a case and the compiler stays silent. In Chapter 9 we'll use discriminated unions, which do force every case to be handled - a missing one becomes a compile error.
+function handleError(err: unknown): void {
+  if (err instanceof ChatError) {
+    console.log(`Chat error ${err.code}: ${err.message}`);
+  } else if (err instanceof Error) {
+    console.log(`Error: ${err.message}`);
+  } else {
+    console.log(`Unknown error: ${err}`);
+  }
+}
+
+// "in" operator - check if a property exists on an object
+type TextMessage = { type: "text"; content: string };
+type ImageMessage = { type: "image"; url: string };
+type Message = TextMessage | ImageMessage;
+
+function displayMessage(msg: Message): string {
+  if ("content" in msg) {
+    return msg.content;  // TypeScript knows this is TextMessage
+  }
+  return `[Image: ${msg.url}]`;  // TypeScript knows this is ImageMessage
+}
+
+// Custom type guard - a function that returns "value is Type"
+function isTextMessage(msg: Message): msg is TextMessage {
+  return msg.type === "text";
+}
+
+if (isTextMessage(someMessage)) {
+  console.log(someMessage.content);  // narrowed to TextMessage
+}
+```
 
 ## Putting It Together
 
-Let's update our chat server's entry point to use everything from this chapter:
+This chapter is about the type system, and the server on the `chapter3` branch puts it to work. The clearest example is exhaustive narrowing over a union.
 
-`src/index.ts`
+`ConnectionState` is a union of three string literals, and `describeState` switches over it. The `default` calls `assertNever`, so if you add a fourth state and forget a case, the switch stops compiling:
 
 ```typescript
-// Chat server - startup.
-//
-// Nothing here listens on a socket yet; that arrives in Chapter 5. For now the
-// server parses its configuration, reports what it would do, and prints the
-// command set it intends to support.
-
-const DEFAULT_HOST = "127.0.0.1";
-const DEFAULT_PORT = 8080;
-
-// Parse a port from a string, falling back when it is missing or out of range.
-function parsePort(input: string, fallback: number = DEFAULT_PORT): number {
-  const parsed = parseInt(input, 10);
-  if (isNaN(parsed) || parsed <= 0 || parsed > 65535) {
-    return fallback;
+function describeState(state: ConnectionState): string {
+  switch (state) {
+    case "connecting":   return "handshake in progress";
+    case "connected":    return "ready to send and receive";
+    case "disconnected": return "socket closed";
+    default:             return assertNever(state);
   }
-  return parsed;
-}
-
-// The reason phrase for an HTTP status code. The chat server speaks HTTP before
-// it upgrades to a WebSocket (Chapter 7), so it needs these.
-function statusLine(code: number): string {
-  switch (code) {
-    case 200: return "OK";
-    case 201: return "Created";
-    case 204: return "No Content";
-    case 301: return "Moved Permanently";
-    case 400: return "Bad Request";
-    case 401: return "Unauthorized";
-    case 403: return "Forbidden";
-    case 404: return "Not Found";
-    case 500: return "Internal Server Error";
-    default:  return "Unknown";
-  }
-}
-
-// The port is optional: `??` supplies the default when it is null or undefined.
-function address(host: string, port?: number): string {
-  return `${host}:${port ?? DEFAULT_PORT}`;
-}
-
-// A connected user: name, port, isAdmin.
-type User = [string, number, boolean];
-
-// The commands the server will accept, as [command, description] pairs.
-const commands: [string, string][] = [
-  ["/join", "Join a chat room"],
-  ["/leave", "Leave the current room"],
-  ["/msg", "Send a direct message"],
-  ["/help", "Show available commands"],
-];
-
-const port = parsePort("3000");
-const host = DEFAULT_HOST;
-
-console.log(`Starting chat server on ${address(host, port)}`);
-
-const users: User[] = [
-  ["alice", 49152, true],
-  ["bob", 49153, false],
-];
-
-console.log(`\n${users.length} user(s) seeded:`);
-for (const [userName, userPort, isAdmin] of users) {
-  const role = isAdmin ? "admin" : "member";
-  console.log(`  ${userName.padEnd(8)} ${address(host, userPort)}  (${role})`);
-}
-
-console.log("\nSupported commands:");
-for (const [index, [cmd, description]] of commands.entries()) {
-  console.log(`  [${index}] ${cmd.padEnd(8)} - ${description}`);
-}
-
-const codes: number[] = [200, 201, 204, 301, 400, 401, 403, 404, 500];
-console.log("\nStatus codes understood:");
-for (const code of codes) {
-  console.log(`  ${code} → ${statusLine(code)}`);
 }
 ```
 
+> **Tip**
+>
+> The complete, runnable file is `src/index.ts` on the `chapter3` branch. You are not meant to paste it wholesale - build your own as you follow along, and use the reference to check yourself.
+
 ## Exercise
 
-1. Add a `reasonPhrase` function that takes a `number` and returns a `string` for HTTP status codes. Use a `switch` statement. Add codes 201, 204, 301, 403.
-2. Create a tuple type `[string, number, boolean]` representing a user: name, port, isAdmin. Destructure it into individual variables.
-3. Write a function with an optional parameter: `connect(host: string, port?: number)`. Default the port to 8080 using `??`.
-4. Use `for...of` with `.entries()` to print each command with its index: `[0] /join`, `[1] /leave`, etc.
-5. Try using `==` instead of `===` somewhere. Does TypeScript warn you? (Hint: enable the ESLint rule `eqeqeq` to catch this.)
+1. Create a `type ConnectionState = "connecting" | "connected" | "disconnected"`. Write a function that takes a `ConnectionState` and returns a description. Use `switch` with an `assertNever` default to ensure exhaustiveness.
+2. Write a function `parseInput(input: unknown): string` that safely handles string, number, boolean, null, and undefined inputs. Use `typeof` guards.
+3. Create a `ChatEvent` union with "message", "join", "leave", and "system" variants. Write a `formatEvent` function that formats each type differently. Add a new variant and see what the compiler says.
+4. Use `as const` on a config object. Try to modify a property and read the compiler error.
+5. Write a custom type guard `isAdmin(user: User): user is AdminUser` and use it in an `if` statement.
 
 ## What's Next
 
-You now know how to declare variables, choose types, write functions, and control program flow. These are the basic building blocks for everything that follows.
+You now have TypeScript's type system at your disposal - unions, narrowing, literal types, type guards, and discriminated unions. These are the tools that catch bugs at compile time.
 
-In the next chapter, we dive into TypeScript's **type system** - union types, narrowing, type guards, and the tools that make TypeScript more than just "JavaScript with annotations."
+In the next chapter, we learn **interfaces, objects, and classes** - how to define shapes for data, add methods, and build the structures our chat server needs.
 
 ---
 
-Source: <https://purphoros.com/howto/typescript/fundamentals>
+Source: <https://purphoros.com/howto/typescript/type-system>
