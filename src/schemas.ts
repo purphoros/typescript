@@ -112,6 +112,13 @@ export const EnvSchema = z.object({
   LOG_LEVEL: z.enum(["debug", "info", "warn", "error"]).optional(),
   LOG_FORMAT: z.enum(["pretty", "json"]).optional(),
   STORAGE: z.enum(["sqlite", "file"]).optional(),
+  // "https://chat.example.com,https://admin.example.com"
+  ALLOWED_ORIGINS: z
+    .string()
+    .min(1)
+    .transform((v) => v.split(",").map((o) => o.trim()).filter(Boolean))
+    .pipe(z.array(z.string().url()).min(1))
+    .optional(),
   PORT: z.coerce.number().int().min(1).max(65535).optional(),
   DATA_DIR: z.string().min(1).optional(),
   HISTORY_LIMIT: z.coerce.number().int().positive().max(10_000).optional(),

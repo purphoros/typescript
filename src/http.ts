@@ -7,6 +7,7 @@
 
 import { asError, ChatError, toSafeError } from "./errors.js";
 import { statusLine, type Bus } from "./bus.js";
+import { securityHeaders } from "./security.js";
 import type { Rest } from "./rest.js";
 import type { TcpClient } from "./clients.js";
 
@@ -73,6 +74,12 @@ export function serializeResponse(res: HttpResponse): string {
   const headers: Record<string, string> = {
     "Content-Length": String(Buffer.byteLength(res.body)),
     Connection: "close",
+    // On *every* response, not just the HTML one.
+    //
+    // A JSON error page is still a page a browser will render if you point it at
+    // one, and `nosniff` matters most precisely where the content type is
+    // something an attacker would like the browser to guess about.
+    ...securityHeaders(),
     ...res.headers,
   };
 

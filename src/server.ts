@@ -33,11 +33,13 @@ import { Registry } from "./state.js";
 import { Metrics, Runtime } from "./runtime.js";
 import { Logger } from "./logger.js";
 import { PresenceTracker, HEARTBEAT_MS } from "./presence.js";
+import { ConnectionLimits, isOriginAllowed, type OriginPolicy } from "./security.js";
 import { TcpClient, WsClient } from "./clients.js";
 import type { PeerKind } from "./types.js";
 
 export class ChatServer {
   readonly presence = new PresenceTracker();
+  readonly limits: ConnectionLimits;
   private heartbeat: NodeJS.Timeout | undefined;
   readonly registry: Registry;
   readonly bus: Bus;
@@ -57,6 +59,7 @@ export class ChatServer {
     readonly logger: Logger = new Logger({ level: config.logLevel, format: config.logFormat }),
   ) {
     this.registry = new Registry(config);
+    this.limits = new ConnectionLimits(config.maxConnections, config.maxConnectionsPerAddress);
 
     // The one place in the whole server that knows which storage it has.
     // Everything below this line deals in MessageStore and AccountStore, and
@@ -248,6 +251,13 @@ export class ChatServer {
     return address(this.config.host, this.config.port);
   }
 
+  // A missing Origin is allowed: nc, wscat, a mobile app and a script do not send
+  // one, and none of them can be tricked into attaching somebody else's cookies.
+  // The confused-deputy problem Origin exists to solve is a *browser* problem.
+  private get originPolicy(): OriginPolicy {
+    return { allowed: this.config.allowedOrigins, allowNonBrowser: true };
+  }
+
   // --- WebSocket ---------------------------------------------------------
 
   private acceptWebSocket(ws: WebSocket, request: IncomingMessage): void {
@@ -320,6 +330,23 @@ export class ChatServer {
   // Runs once per connection. Everything inside it belongs to that one client;
   // the event loop interleaves them all on a single thread.
   private acceptTcp(socket: net.Socket): void {
+    const address = socket.remoteAddress ?? "unknown";
+
+    // Chapter 15 bounded what one connection could make us hold. This bounds how
+    // many connections one address may have at all - because a bound on each of a
+    // million things is not a bound.
+    //
+    // Refused *before* a TcpClient is constructed, before it is registered, before
+    // any buffer is allocated. The cheapest possible no.
+    const refusal = this.limits.refuse(address);
+    if (refusal !== undefined) {
+      this.logger.warn("refused a connection", { address, reason: refusal });
+      socket.destroy();
+      return;
+    }
+    this.limits.opened(address);
+    socket.on("close", () => this.limits.closed(address));
+
     const conn = new TcpClient(socket, this.registry.nextSequence());
 
     // The OS's own keepalive. It costs nothing and it is not enough: the default
@@ -439,6 +466,28 @@ export class ChatServer {
           return;
 
         case "upgrade": {
+          // THE CHECK THIS SERVER HAS BEEN MISSING SINCE CHAPTER 7.
+          //
+          // The Same-Origin Policy does not apply to WebSockets. It was written
+          // before they existed and never extended to them - so a page on any
+          // website in the world can call `new WebSocket("ws://your-server")` and
+          // the browser will open it, with no preflight and no opt-in.
+          //
+          // Origin is the only defence there is. See security.ts.
+          if (!isOriginAllowed(outcome.request, this.originPolicy)) {
+            this.logger.warn("refused a WebSocket upgrade from a disallowed origin", {
+              client: conn.id,
+              origin: outcome.request.headers.get("origin") ?? "(none)",
+            });
+            conn.write(
+              "HTTP/1.1 403 Forbidden\r\n" +
+                "Content-Length: 0\r\n" +
+                "Connection: close\r\n\r\n",
+            );
+            conn.close();
+            return;
+          }
+
           // The socket stops being ours. Detach every listener before handing it
           // over, or we would keep trying to read WebSocket frames as text.
           detach();

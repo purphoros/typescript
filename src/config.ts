@@ -3,6 +3,7 @@
 import { parsePort, type RoomName } from "./protocol.js";
 import { EnvSchema } from "./schemas.js";
 import { defaultFormat, type LogFormat, type LogLevel } from "./logger.js";
+import { defaultOrigins } from "./security.js";
 import type { CliOptions } from "./cli.js";
 import type { Host, Port } from "./types.js";
 
@@ -26,6 +27,12 @@ export type ServerConfig = Readonly<{
   //   "sqlite" - an index, real search, O(log n) reads
   //   "file"   - an append-only JSONL log you can read with `cat`
   storage: "sqlite" | "file";
+  // Which browser origins may open a WebSocket. Empty means none - and a socket
+  // from a browser is the only kind that can be tricked into carrying somebody
+  // else's credentials. See security.ts.
+  allowedOrigins: readonly string[];
+  maxConnections: number;
+  maxConnectionsPerAddress: number;
 }>;
 
 // `as const` gives every field its literal type and makes the object readonly:
@@ -47,6 +54,11 @@ export const DEFAULTS = {
   logLevel: "info",
   logFormat: "pretty",
   storage: "sqlite",
+  // Populated in resolveConfig from host/port, because the page this server serves
+  // has to be able to connect back to it.
+  allowedOrigins: [] as readonly string[],
+  maxConnections: 1000,
+  maxConnectionsPerAddress: 20,
 } as const;
 
 // A client that connects and says nothing is assumed to be a human at a
@@ -117,7 +129,14 @@ export function resolveConfig(env: NodeJS.ProcessEnv, cli: CliOptions): ServerCo
     process.exit(1);
   }
 
+  const host = cli.host ?? e.HOST ?? DEFAULTS.host;
+  const port = cli.port ?? e.PORT ?? DEFAULTS.port;
+
   return configure(DEFAULTS, {
+    // The page we serve has to be able to talk to us. Anything else must say so
+    // out loud, via ALLOWED_ORIGINS.
+    allowedOrigins: e.ALLOWED_ORIGINS ?? defaultOrigins(host, port),
+
     // Format is the one setting with a *computed* default: pretty when somebody
     // is watching, JSON when a machine is. Nobody has to choose and nobody has to
     // remember to.
