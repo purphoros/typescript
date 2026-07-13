@@ -23,6 +23,16 @@ import { IncomingMessage } from "node:http";
 import { WebSocketServer, WebSocket } from "ws";
 import { TypedEmitter, RingBuffer, pluck } from "./events";
 import {
+  asError,
+  ChatError,
+  describeThrown,
+  ErrorCode,
+  NotFoundError,
+  PermissionError,
+  StateError,
+  toSafeError,
+} from "./errors";
+import {
   assertNever,
   CATALOG,
   COMMANDS,
@@ -30,7 +40,8 @@ import {
   decodeClientMessage,
   describeState,
   encodeServerMessage,
-  ErrorCode,
+  parsePort,
+  validateNickname,
   type ClientMessage,
   type MessageSummary,
   type RoomName,
@@ -448,15 +459,6 @@ class WsClient extends BaseClient {
 
 // --- Functions -----------------------------------------------------------
 
-// Parse a port from a string, falling back when it is missing or out of range.
-function parsePort(input: string, fallback: Port = DEFAULTS.port): Port {
-  const parsed = parseInt(input, 10);
-  if (isNaN(parsed) || parsed <= 0 || parsed > 65535) {
-    return fallback;
-  }
-  return parsed;
-}
-
 // The port is optional: `??` supplies the default when it is null or undefined.
 function address(host: Host, port?: Port): string {
   return `${host}:${port ?? config.port}`;
@@ -541,10 +543,23 @@ function describeRoom(room: ChatRoom): RoomSummary {
 
 // --- Server state --------------------------------------------------------
 
-const config = configure(
-  DEFAULTS,
-  process.argv[2] !== undefined ? { port: parsePort(process.argv[2]) } : {},
-);
+// A bad port on the command line is an expected failure - humans type things -
+// so parsePort hands back a Result and we deal with it here, in the open. The
+// old version silently substituted the default, which made `npm start 80800`
+// behave exactly like `npm start`, and that is not a kindness.
+function resolvePort(argument: string | undefined): Port {
+  if (argument === undefined) {
+    return DEFAULTS.port;
+  }
+  const parsed = parsePort(argument);
+  if (!parsed.ok) {
+    console.error(`${parsed.error.message} Falling back to ${DEFAULTS.port}.`);
+    return DEFAULTS.port;
+  }
+  return parsed.value;
+}
+
+const config = configure(DEFAULTS, { port: resolvePort(process.argv[2]) });
 
 const rooms = new Map<RoomName, ChatRoom>();
 for (const name of config.rooms) {
@@ -605,8 +620,10 @@ bus.on("upgrade", (id) =>
   log({ type: "system", text: `${id} upgrading to WebSocket → 101 ${statusLine(101)}`, at: Date.now() }));
 bus.on("notice", (text) =>
   log({ type: "system", text, at: Date.now() }));
+// The log is the one audience allowed the whole truth: the stack, not the
+// sanitised sentence the client was given.
 bus.on("failure", (source, error) =>
-  log({ type: "system", text: `${source} error: ${error.message}`, at: Date.now() }));
+  log({ type: "system", text: `${source} failed - ${describeThrown(error)}`, at: Date.now() }));
 
 // Listener 2: the room's memory. Messages are kept so a late joiner can catch up.
 bus.on("message", (message) => {
@@ -873,6 +890,24 @@ function handleRequest(req: HttpRequest): HttpResponse {
     return json(200, [...rooms.values()].map(describeRoom));
   }
 
+  // One room by name. The same NotFoundError the chat side throws - thrown from
+  // the same helper - comes back here as a 404 with the same message, because a
+  // ChatError carries both an ErrorCode and an HTTP status. One failure, one
+  // description of it, two wires.
+  const named = /^\/api\/rooms\/([^/]+)$/.exec(req.path);
+  if (named?.[1] !== undefined && req.method === "GET") {
+    const room = requireRoomNamed(decodeURIComponent(named[1]));
+    return json(200, { ...describeRoom(room), recent: room.recent(10).map(summarize) });
+  }
+
+  // Deliberately broken, and left in on purpose: this is the only honest way to
+  // show what the boundary does with a failure nobody planned for. curl it and
+  // you get a 500 saying "Internal server error" and absolutely nothing else.
+  // The stack trace goes to the log, where the person who can fix it is looking.
+  if (req.path === "/api/crash" && req.method === "GET") {
+    throw new Error("the kind of bug you did not see coming");
+  }
+
   if (req.path === "/api/history" && req.method === "GET") {
     const recent: MessageSummary[] = [...rooms.values()]
       .flatMap((room) => room.recent(10).map(summarize));
@@ -926,7 +961,20 @@ function readHttp(conn: TcpClient): HttpOutcome {
 
   conn.consume(bodyStart + contentLength);
 
-  const response = request === null ? json(400, { error: "Bad Request" }) : handleRequest(request);
+  // The HTTP boundary, and it is the chat boundary wearing different clothes.
+  // handleRequest throws the very same ChatErrors handleMessage does; the only
+  // difference is that here the ChatError's `status` becomes the status line,
+  // where over there its `code` became a ServerMessage.
+  let response: HttpResponse;
+  try {
+    response = request === null ? json(400, { error: "Bad Request" }) : handleRequest(request);
+  } catch (thrown: unknown) {
+    const safe = toSafeError(thrown);
+    if (!(thrown instanceof ChatError)) {
+      bus.emit("failure", `${request?.method ?? "?"} ${request?.path ?? "?"}`, asError(thrown));
+    }
+    response = json(safe.status, { error: safe.message, code: safe.code });
+  }
 
   bus.emit("request", request?.method ?? "?", request?.path ?? "?", response.status);
 
@@ -937,19 +985,46 @@ function readHttp(conn: TcpClient): HttpOutcome {
 
 // --- Message handling ----------------------------------------------------
 
-function fail(client: ChatClient, code: ErrorCode, message: string): void {
-  client.send({ type: "error", code, message });
-}
-
-// Find a client by the name it goes by. Whisper and kick both need this, and
-// both must cope with it not being there.
-function findByLabel(label: string): ChatClient | undefined {
+// Find a client by the name it goes by, or say why not. Whisper and kick both
+// need this, and neither can do anything useful when the person is not here, so
+// the lookup raises rather than handing back an undefined for each caller to
+// re-explain in its own words.
+function requireClient(label: string): ChatClient {
   for (const client of clients.values()) {
     if (client.label === label) {
       return client;
     }
   }
-  return undefined;
+  throw new NotFoundError(`Nobody here is called "${label}".`, ErrorCode.NoSuchTarget);
+}
+
+// The room you are in, or the reason you are not in one.
+function requireRoom(client: ChatClient): ChatRoom {
+  const name = client.room;
+  if (name === undefined) {
+    throw new StateError(`Join a room first, e.g. ${CATALOG.join.example}`);
+  }
+  const room = rooms.get(name);
+  if (room === undefined) {
+    // The client thinks it is somewhere that does not exist. That is our bug,
+    // not theirs - so it is not a ChatError, and the boundary will treat it as
+    // what it is.
+    throw new Error(`invariant: ${client.id} is in unknown room "${name}"`);
+  }
+  return room;
+}
+
+// A room by name, or a 404 with the list of rooms that do exist.
+function requireRoomNamed(name: RoomName): ChatRoom {
+  const room = rooms.get(name);
+  if (room === undefined) {
+    // pluck: one property out of every room, type-checked against ChatRoom.
+    throw new NotFoundError(
+      `No such room "${name}". Try: ${pluck([...rooms.values()], "name").join(", ")}`,
+      ErrorCode.UnknownRoom,
+    );
+  }
+  return room;
 }
 
 // Show a client what it missed.
@@ -963,11 +1038,18 @@ function replay(client: ChatClient, room: ChatRoom, count: number): void {
 
 // One message from one client.
 //
-// This is the chapter in a single function. `message` arrives as a
-// ClientMessage - already decoded, already checked - and the switch narrows it
-// variant by variant, so `message.room` exists in the "join" branch and nowhere
-// else. The assertNever at the bottom is the guarantee: every variant of
-// ClientMessage is handled here, and the compiler has checked that claim.
+// Read what this function no longer contains. There is no `fail(); return;` pair
+// in any branch, no `if (room === undefined)` before the work, no error string
+// written out twice in slightly different words. Every failure leaves by
+// throwing a ChatError, and the boundary in handleLine turns it into exactly one
+// thing: an error message to this client. The happy path is the only path here,
+// which is the entire argument for exceptions - a failure that has one handler
+// should be written once.
+//
+// It throws. That is not in the signature, and TypeScript has no way to put it
+// there. It is the honest cost of the trade, and it is why the *expected*
+// failures a caller has to branch on - decoding, validation - return a Result
+// instead.
 function handleMessage(client: ChatClient, message: ClientMessage): void {
   switch (message.type) {
     case "help":
@@ -983,12 +1065,7 @@ function handleMessage(client: ChatClient, message: ClientMessage): void {
       return;
 
     case "history": {
-      const current = client.room;
-      const room = current !== undefined ? rooms.get(current) : undefined;
-      if (room === undefined) {
-        fail(client, ErrorCode.NotInRoom, `Join a room first, e.g. ${CATALOG.join.example}`);
-        return;
-      }
+      const room = requireRoom(client);
       // `limit` is optional, so it is `number | undefined` here - and the
       // compiler will not let us forget the second case.
       replay(client, room, message.limit ?? room.messageCount);
@@ -996,14 +1073,21 @@ function handleMessage(client: ChatClient, message: ClientMessage): void {
     }
 
     case "nick": {
-      const user = knownUsers.get(message.name);
+      // Two different failures, and they are not the same kind of thing. A name
+      // with a space in it never could have worked - that is a ValidationError,
+      // and validateNickname returns it as a value because the check and the
+      // decision live in the same breath. A well-formed name that nobody has is
+      // a NotFoundError, thrown, because there is nothing to decide.
+      const name = validateNickname(message.name);
+      if (!name.ok) {
+        throw name.error;
+      }
+      const user = knownUsers.get(name.value);
       if (user === undefined) {
-        fail(
-          client,
+        throw new NotFoundError(
+          `Unknown user "${name.value}". Try: ${[...knownUsers.keys()].join(", ")}`,
           ErrorCode.UnknownUser,
-          `Unknown user "${message.name}". Try: ${[...knownUsers.keys()].join(", ")}`,
         );
-        return;
       }
       client.identifyAs(user);
       const role = isAdmin(user) ? ` You are an admin (level ${user.adminLevel}).` : "";
@@ -1012,16 +1096,7 @@ function handleMessage(client: ChatClient, message: ClientMessage): void {
     }
 
     case "join": {
-      const room = rooms.get(message.room);
-      if (room === undefined) {
-        // pluck: one property out of every room, type-checked against ChatRoom.
-        fail(
-          client,
-          ErrorCode.UnknownRoom,
-          `No such room "${message.room}". Try: ${pluck([...rooms.values()], "name").join(", ")}`,
-        );
-        return;
-      }
+      const room = requireRoomNamed(message.room);
       const previous = client.room;
       if (previous !== undefined) {
         rooms.get(previous)?.leave(client.label);
@@ -1037,36 +1112,24 @@ function handleMessage(client: ChatClient, message: ClientMessage): void {
     }
 
     case "leave": {
-      const current = client.room;
-      if (current === undefined) {
-        fail(client, ErrorCode.NotInRoom, "You are not in a room.");
-        return;
-      }
-      rooms.get(current)?.leave(client.label);
+      const room = requireRoom(client);
+      room.leave(client.label);
       client.exitRoom();
-      client.send({ type: "left", user: client.label, room: current });
-      bus.emit("leave", client, current);
+      client.send({ type: "left", user: client.label, room: room.name });
+      bus.emit("leave", client, room.name);
       return;
     }
 
     case "chat": {
-      const room = client.room;
-      if (room === undefined) {
-        fail(client, ErrorCode.NotInRoom, `Join a room first, e.g. ${CATALOG.join.example}`);
-        return;
-      }
+      const room = requireRoom(client);
       // Announce it. The log, the room's history, and the broadcast are all
       // listeners - handleMessage does not know or care that they exist.
-      bus.emit("message", new ChatMessage(client.label, message.text, room));
+      bus.emit("message", new ChatMessage(client.label, message.text, room.name));
       return;
     }
 
     case "whisper": {
-      const target = findByLabel(message.to);
-      if (target === undefined) {
-        fail(client, ErrorCode.NoSuchTarget, `Nobody here is called "${message.to}".`);
-        return;
-      }
+      const target = requireClient(message.to);
       bus.emit("whisper", client, target, message.text);
       return;
     }
@@ -1076,17 +1139,11 @@ function handleMessage(client: ChatClient, message: ClientMessage): void {
       // Two things must be true, and the type guard proves the second: you must
       // have said who you are, and who you are must be an admin.
       if (user === undefined || !isAdmin(user)) {
-        fail(client, ErrorCode.NotPermitted, "Only admins may kick. Identify yourself first.");
-        return;
+        throw new PermissionError("Only admins may kick. Identify yourself first.");
       }
-      const target = findByLabel(message.target);
-      if (target === undefined) {
-        fail(client, ErrorCode.NoSuchTarget, `Nobody here is called "${message.target}".`);
-        return;
-      }
+      const target = requireClient(message.target);
       if (target === client) {
-        fail(client, ErrorCode.NotPermitted, "You cannot kick yourself.");
-        return;
+        throw new PermissionError("You cannot kick yourself.");
       }
       bus.emit("kick", client, target, message.reason);
       return;
@@ -1113,19 +1170,49 @@ function handleMessage(client: ChatClient, message: ClientMessage): void {
   }
 }
 
-// One line off a socket. Decode it, or explain why it could not be decoded.
+// The error boundary. Every line from every client, on either transport, passes
+// through exactly here, and nothing thrown below this point escapes it.
+//
+// This is what stands between a stranger's typo and a dead process. Node will
+// happily take the whole server down for one unhandled throw inside one socket's
+// data handler, which - on a server whose entire job is reading things strangers
+// typed - is not a risk, it is a schedule.
+//
+// Three outcomes, and they are genuinely different:
+//
+//   the message decoded          → handle it
+//   it did not decode            → a Result said so. Tell them why.
+//   something threw              → if it is ours, it was deliberate and safe to
+//                                  repeat. If it is not, it is a bug: log the
+//                                  stack, and tell them nothing.
 function handleLine(client: ChatClient, line: string): void {
-  const decoded = decodeClientMessage(line);
-  switch (decoded.kind) {
-    case "ok":
-      handleMessage(client, decoded.message);
+  try {
+    const decoded = decodeClientMessage(line);
+    if (!decoded.ok) {
+      // An expected failure that arrived as a value. No throw, no catch - the
+      // type said this could happen and here we are handling it.
+      client.send(toErrorMessage(decoded.error));
       return;
-    case "invalid":
-      fail(client, ErrorCode.InvalidMessage, decoded.reason);
-      return;
-    default:
-      return assertNever(decoded);
+    }
+    handleMessage(client, decoded.value);
+  } catch (thrown: unknown) {
+    // `thrown` is `unknown`, and TypeScript is right to insist: JavaScript can
+    // throw a string, a number, null. Narrow before touching it.
+    if (!(thrown instanceof ChatError)) {
+      // Not one of ours. The client gets "Internal server error" and not one
+      // character more; the log gets the stack trace, because someone has to
+      // fix this and it is not them.
+      bus.emit("failure", client.label, asError(thrown));
+    }
+    client.send(toErrorMessage(thrown));
   }
+}
+
+// One error, rendered for a chat client. Whether it was thrown or returned, and
+// whether it was ours or a surprise, it leaves as the same ServerMessage.
+function toErrorMessage(thrown: unknown): ServerMessage {
+  const safe = toSafeError(thrown);
+  return { type: "error", code: safe.code, message: safe.message };
 }
 
 // Everything a client needs when it arrives, whatever transport brought it.
@@ -1302,6 +1389,26 @@ server.on("error", (err: NodeJS.ErrnoException) => {
     process.exit(1);
   }
   throw err;
+});
+
+// The last net, and it is worth being clear about what it is for.
+//
+// It is not a second error boundary. The boundary is in handleLine, where there
+// is still a client to answer and a request to abandon. By the time a throw gets
+// here, nobody knows what was half-done - a room joined but not announced, a
+// buffer consumed but not parsed - and a process running on state it cannot
+// describe is worse than a process that stopped. So: say something useful, then
+// die honestly. The restart is somebody else's job, and they are better at it.
+process.on("uncaughtException", (error: Error) => {
+  console.error(`FATAL - nothing caught this: ${describeThrown(error)}`);
+  process.exit(1);
+});
+
+// A rejected promise with nobody waiting on it. Chapter 12 gives the server
+// enough async to make this reachable; until then it is a tripwire.
+process.on("unhandledRejection", (reason: unknown) => {
+  console.error(`FATAL - a promise rejected with nobody listening: ${describeThrown(reason)}`);
+  process.exit(1);
 });
 
 // Ctrl-C: stop accepting connections, hang up on everyone, then exit.

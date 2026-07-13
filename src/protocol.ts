@@ -16,6 +16,16 @@
 // stops compiling. `assertNever` is what turns "I forgot one" into a build error
 // instead of an `undefined` at three in the morning.
 
+import {
+  err,
+  ok,
+  ProtocolError,
+  ValidationError,
+  type ChatError,
+  type ErrorCode,
+  type Result,
+} from "./errors";
+
 // --- Shared vocabulary ---------------------------------------------------
 
 export type UserId = string;
@@ -47,16 +57,11 @@ export enum ConnectionState {
   Disconnected = "disconnected",
 }
 
-// Why a message was refused. A code is for the program - a browser can switch on
-// it - and the accompanying `message` is for the human.
-export enum ErrorCode {
-  InvalidMessage = "invalid_message",
-  UnknownRoom = "unknown_room",
-  UnknownUser = "unknown_user",
-  NotInRoom = "not_in_room",
-  NoSuchTarget = "no_such_target",
-  NotPermitted = "not_permitted",
-}
+// `ErrorCode` used to live here. Chapter 10 moved it into errors.ts, where the
+// error classes that carry it live: protocol.ts imports errors.ts, and if
+// errors.ts imported back the two modules would take turns being half-loaded.
+// Dependencies point one way - errors ← protocol ← index - and that is not an
+// accident, it is the only arrangement that works.
 
 // > A `const enum` is inlined at compile time: `Direction.Up` becomes the string
 // > "UP" and no object is emitted at all. It is tempting, and it is a trap in a
@@ -238,11 +243,15 @@ export const COMMANDS: readonly CommandInfo[] = Object.values(CATALOG);
 
 // --- Decoding ------------------------------------------------------------
 
-// What came off the wire. The parse either produced a message or it did not, and
-// the caller must deal with both - the same shape as Chapter 6's HttpOutcome.
-export type Decoded =
-  | { kind: "ok"; message: ClientMessage }
-  | { kind: "invalid"; reason: string };
+// Decoding fails constantly and on purpose - anyone can type anything into `nc`
+// - so it is the textbook case for a Result. The failure is in the return type,
+// which means no caller can reach the message without first admitting there
+// might not be one.
+//
+// Chapter 9 returned a hand-rolled `{ kind: "ok" } | { kind: "invalid" }` union
+// here. It was the same idea wearing a worse name; `Result<T, E>` is that union,
+// generic, and it composes with everything else that can fail.
+export type DecodedMessage = Result<ClientMessage, ProtocolError>;
 
 // Raw JSON: keys we have not checked, values we know nothing about. `unknown`
 // rather than `any`, so nothing can be used before it has been proven.
@@ -298,16 +307,22 @@ const DECODERS: DecoderMap = {
 
 const KNOWN_TYPES = Object.keys(DECODERS).join(", ");
 
-function invalid(reason: string): Decoded {
-  return { kind: "invalid", reason };
+function invalid(reason: string): DecodedMessage {
+  return err(new ProtocolError(reason));
 }
 
 // One line off a socket becomes a ClientMessage, or an explanation of why it
 // could not. Everything downstream of here works with a value the compiler
 // trusts, because this is the one place that earned that trust.
-export function decodeClientMessage(raw: string): Decoded {
+//
+// Note that this function does not throw, and is not `try`-ed by its caller
+// except around JSON.parse - the one thing here that throws is someone else's
+// code. Failure is a value all the way out.
+export function decodeClientMessage(raw: string): DecodedMessage {
   let value: unknown;
   try {
+    // The only throwing call in the module, and it is not ours. Catching it
+    // right here is what lets everything below return a Result instead.
     value = JSON.parse(raw);
   } catch {
     return invalid(`expected JSON, e.g. ${CATALOG.chat.example}`);
@@ -339,7 +354,38 @@ export function decodeClientMessage(raw: string): Decoded {
     return invalid(`malformed "${type}" message. Expected ${CATALOG[type as ClientMessageType].example}`);
   }
 
-  return { kind: "ok", message };
+  return ok(message);
+}
+
+// --- Validation ----------------------------------------------------------
+
+// A nickname is well-formed JSON and still not acceptable. That is the
+// difference between a ProtocolError and a ValidationError, and it is worth
+// keeping straight: one means "I could not read you", the other "I read you, and
+// no".
+const NICKNAME = /^[a-z0-9_-]{1,20}$/i;
+
+export function validateNickname(raw: string): Result<string, ChatError> {
+  if (!NICKNAME.test(raw)) {
+    return err(
+      new ValidationError(
+        `"${raw}" is not a usable name: 1-20 characters, letters, digits, _ or - only.`,
+      ),
+    );
+  }
+  return ok(raw);
+}
+
+// The port comes off the command line, which is to say from a human, which is to
+// say it is wrong sometimes. Chapter 9 quietly swapped in the default and said
+// nothing - a bad argument that behaves exactly like no argument is how you lose
+// an afternoon. Now the caller is handed the failure and decides out loud.
+export function parsePort(input: string): Result<number, ChatError> {
+  const port = Number.parseInt(input, 10);
+  if (Number.isNaN(port) || port <= 0 || port > 65535) {
+    return err(new ValidationError(`"${input}" is not a port: expected 1-65535.`));
+  }
+  return ok(port);
 }
 
 // --- Encoding ------------------------------------------------------------
