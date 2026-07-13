@@ -1,223 +1,292 @@
-# Chapter 15 - The Node.js Runtime
+# Chapter 16 - Chat Server Core
 
-The event loop, EventEmitter, Buffers, signals, and file I/O - the runtime this chat server has been standing on since Chapter 5 without ever quite looking down.
+Rooms, the client state machine, and broadcasting. Everything so far has been in service of a chat server; this chapter finally looks hard at the chat.
 
-Most of this chapter's exercises are already done. Graceful shutdown: Chapter 10. The `uncaughtException` and `unhandledRejection` nets: Chapter 10. History on disk with `fs.appendFile`, read back at startup: Chapter 12. `EventEmitter` - we wrote a typed one from scratch in Chapter 8.
+And it finds a bug. A real one, that has been in the code since Chapter 5, that shipped through eleven chapters of increasingly careful type-level work - and that the type system watched me write, twice, and said nothing about.
 
-So this chapter is not a tour. It is the runtime **collecting on two debts**, both of which have been real bugs in our code for ten chapters, and both of which Node has been quietly telling us about the whole time.
+## The bug
 
-## The Event Loop
-
-Node runs your JavaScript on **one thread**.
-
-```
-  ┌─── timers ──── setTimeout, setInterval
-  │
-  ├─── poll ────── I/O callbacks. Your socket "data" handler lives here.
-  │
-  ├─── check ───── setImmediate
-  │
-  └─── close ───── socket.on("close")
-
-  between every phase: microtasks (Promise.then), then process.nextTick
-```
-
-`await` yields, so other clients are served while one of them waits on a disk - that is Chapter 12's whole argument. But a **synchronous** loop that runs for 400ms serves nobody for 400ms. Every socket, every timer, every callback simply waits. From the outside, the server has hung, because for 400ms it has.
-
-So the most useful number a Node process can report about itself is *how late its own timers are running*:
+Rooms stored their membership like this:
 
 ```typescript
-this.probe = setInterval(() => {
-  const now = performance.now();
-  const lag = Math.max(0, now - this.last - PROBE_MS);  // how late were we?
-  this.maxLag = Math.max(this.maxLag, lag);
-  this.last = now;
-}, PROBE_MS);
-
-this.probe.unref();
+room.join(client.label);      // "join"  - handler.ts
+room.leave(client.label);     // "leave" - handler.ts
 ```
 
-Ask to be woken in 50ms; see how late you actually were. Nobody woke us because the thread was busy, and *how* late is exactly how long it was busy.
+`label` is the client's display name:
 
-> **Warning**
+```typescript
+get label(): string {
+  return this.identity?.name ?? this.id;    // the nickname, or the id if unnamed
+}
+```
+
+Read those two together and the bug is right there. **A label is a nickname, and a nickname changes.**
+
+Join a room before picking a name, and the room records `"c1"`. Then take the name `alice`. Then leave - and the room dutifully removes `"alice"`, which was never in it, and keeps `"c1"` **forever**:
+
+```
+  after one client joined, renamed, and left:
+  general.members = 1     <-- LEAKED. Nobody is in there.
+```
+
+The room now reports a member who is not connected, was never really that name, and can never be removed. Every rename leaks another one.
+
+## Why eleven chapters of types did not catch it
+
+```typescript
+export type UserId = string;
+class TcpClient { readonly id: string; }
+get label(): string { ... }
+```
+
+`room.join(client.label)` compiles perfectly, because a label is a `string` and an id is a `string`. **TypeScript is structural**: it compares shapes, and a nickname and an identifier have exactly the same shape. The compiler was never going to help, because we never told it there was anything to help with.
+
+There are two fixes, and this chapter does both. One removes the bug. The other makes it *unrepresentable* - and that is the one worth learning.
+
+## Fix one: rooms hold ids
+
+```typescript
+export class ChatRoom {
+  // Client *ids*, not labels.
+  private members: Set<ClientId> = new Set();
+```
+
+An id is handed out once, at `accept()`, and never changes. Anything that wants a *name* asks the registry, which knows who `c1` is right now:
+
+```typescript
+membersOf(room: ChatRoom): ChatClient[] {
+  const members: ChatClient[] = [];
+  for (const id of room.memberIds) {
+    const client = this.clients.get(id);
+    if (client !== undefined) members.push(client);
+  }
+  return members;
+}
+```
+
+Notice what this buys in the `nick` handler - which is to say, notice the code that **is not there**:
+
+```typescript
+client.identifyAs(user);
+// The room membership does not have to be touched. It is keyed by id, and
+// the id did not change.
+```
+
+## Fix two: make it a compile error
+
+Fixing the four call sites changes nothing structurally. `room.join(someLabel)` would still compile tomorrow. So give the compiler a name it will insist on - a **branded type**:
+
+```typescript
+declare const ClientIdBrand: unique symbol;
+export type ClientId = string & { readonly [ClientIdBrand]: true };
+
+// The only way to make one. Called once, in clients.ts, at accept().
+export function clientId(raw: string): ClientId {
+  return raw as ClientId;
+}
+```
+
+A `ClientId` is a string with an impossible extra property - impossible because a `unique symbol` key cannot be forged. No plain `string` is assignable to it. And the moment `ChatRoom.join` took a `ClientId`, the compiler found the bug for me, in every place it lived:
+
+```
+src/handler.ts(104,44): error TS2345: Argument of type 'string' is not assignable to parameter of type 'ClientId'.
+src/handler.ts(190,47): error TS2345: Argument of type 'string' is not assignable to parameter of type 'ClientId'.
+src/handler.ts(194,19): error TS2345: Argument of type 'string' is not assignable to parameter of type 'ClientId'.
+src/handler.ts(204,20): error TS2345: Argument of type 'string' is not assignable to parameter of type 'ClientId'.
+```
+
+Four sites. Exactly the four.
+
+> **Tip**
 >
-> `.unref()` is not an optimisation, it is the difference between a server that exits and one that does not. A timer holds the event loop open. Without that line, the loop always has one more thing to do - forever, every 50ms - so `server.close()` completes, every client disconnects, and the process sits there being perfectly healthy and refusing to die. It presents as *"our deploys hang"*. Nothing should stay alive merely because something is watching it.
+> The cost is one assertion, in `clientId()`, at the single point where an id is minted. That is the Chapter 13 bargain again: **one line you can audit, buying a rule the compiler enforces everywhere else.** Brand the types that are "just a string" but must never be confused - `UserId` and `RoomName` and `SessionToken` and `Email` - and the class of bug where you pass the right shape and the wrong *meaning* simply stops existing.
+
+## The Client State Machine
+
+Chapter 15's client held two independent optionals:
+
+```typescript
+protected identity?: User;
+protected currentRoom?: RoomName;
+```
+
+Two optionals are **four** combinations, and only three of them mean anything:
+
+| identity | currentRoom | meaning |
+|---|---|---|
+| - | - | connected, said nothing |
+| set | - | has a name, not in a room |
+| set | set | chatting |
+| **-** | **set** | **in a room, but nobody** |
+
+That fourth row was reachable, and it is where the bug lived. So replace both fields with one union:
+
+```typescript
+export type ClientState =
+  | { readonly status: "anonymous" }
+  | { readonly status: "identified"; readonly user: User }
+  | { readonly status: "chatting"; readonly user: User; readonly room: RoomName };
+```
+
+A union cannot hold the fourth row. You are in a room only in the `chatting` state, and `chatting` **carries the user with it** - there is no way to be one without the other, because there is no such value to construct.
+
+`user` and `room` become derived, not stored, so they cannot drift:
+
+```typescript
+get user(): User | undefined {
+  return this.presence.status === "anonymous" ? undefined : this.presence.user;
+}
+
+get room(): RoomName | undefined {
+  return this.presence.status === "chatting" ? this.presence.room : undefined;
+}
+```
+
+And the one transition the machine genuinely forbids:
+
+```typescript
+enterRoom(name: RoomName): void {
+  if (this.presence.status === "anonymous") {
+    throw new StateError(`Say who you are first, e.g. ${CATALOG.nick.example}`,
+                         ErrorCode.NotIdentified);
+  }
+  this.presence = { status: "chatting", user: this.presence.user, room: name };
+}
+```
 
 > **Note**
 >
-> Node ships `perf_hooks.monitorEventLoopDelay`, which sounds exactly like the above, and the first draft of `runtime.ts` used it. On this machine (Node 22, darwin/arm64) its `mean` and `max` sat at ~12ms whether the loop was idle **or blocked solid for 400ms** - while the fifteen lines above reported a max of 351ms for the same block.
+> Read the `join` handler and notice there is no check that the client has a name. There does not need to be one. The rule lives in the state machine: `chatting` carries a `user`, so *a client in a room without a name is not a case somebody forgot to check - it is a value that cannot be built.* That is the difference between validating a rule and encoding one.
 >
-> Whatever it was measuring, it was not the thing this server needs to know. That is less a complaint about the API than the reason this chapter exists: **a metric you have not watched move is not a metric, it is a number.** Block your own event loop on purpose and confirm your monitoring notices - because the day it matters, you will be reading it at 3am and believing it.
+> This is the same move as `assertNever` in Chapter 9 and `Result` in Chapter 10. Push the invariant into a place where breaking it is a type error rather than a code review.
 
-## Debt One: `socket.write()` returns a boolean
+> **Warning**
+>
+> This is a genuine behaviour change: you must now `{"type":"nick","name":"alice"}` before you can `{"type":"join"}`. Previously a client could chat anonymously under `c1`. That was the flexibility that made the fourth row reachable, and a room whose member list reads `c1, c4, w7` was never really a chat room anyway.
 
-We have never once looked at it.
+## Rooms on Demand, and Rooms That Go Away
 
 ```typescript
-this.socket.write(raw);   // returns false when the kernel's buffer is full
+getOrCreateRoom(name: RoomName): ChatRoom {
+  const existing = this.rooms.get(name);
+  if (existing !== undefined) return existing;
+
+  if (this.rooms.size >= this.config.maxRooms) {
+    throw new StateError(`This server holds ${this.config.maxRooms} rooms and they are all taken.`,
+                         ErrorCode.NotPermitted);
+  }
+  const room = new ChatRoom(name, this.config.historyLimit);
+  this.rooms.set(name, room);
+  return room;
+}
 ```
 
-`false` means *the client is not reading as fast as you are writing*. And Node does not drop the surplus - it **queues it, in your process, indefinitely**.
+Rooms come into existence by being walked into. That is what a chat server is for - and it is also, unbounded, how a stranger fills your heap with ten million empty rooms. Chapter 15's rule holds: **anything a stranger can grow, bound.**
 
-So one laptop that suspends mid-conversation, in a busy room, is a memory leak with a heartbeat. Every broadcast appends to a buffer nobody is draining. The client is completely fine. We are the casualty.
+The name is safe to create a *file* from without a second thought, because the schema (Chapter 14) already guarantees it is lowercase letters, digits and hyphens, at most 32 of them. Layers paying each other back.
 
-The fix is to believe the runtime:
+And the last one out turns off the lights:
 
 ```typescript
-const MAX_BACKLOG_BYTES = 1_000_000;
-
-protected accepts(): boolean {
-  if (this.backlog > MAX_BACKLOG_BYTES) {
-    this.dropped = `not reading - ${Math.round(this.backlog / 1024)}KB unsent`;
-    this.markClosing();
-    this.destroy();
-    return false;
-  }
+reapIfEmpty(name: RoomName): boolean {
+  const room = this.rooms.get(name);
+  if (room === undefined || !room.isEmpty || this.isPermanent(name)) return false;
+  this.rooms.delete(name);
   return true;
 }
 ```
 
-`backlog` is a number Node has always kept and we never asked for - `socket.writableLength` for TCP, `ws.bufferedAmount` for WebSocket. Same disease, same cure. A megabyte behind is roughly a thousand messages behind; a client that far behind is not slow, it is gone, and the honest thing is to say so.
+The permanent rooms survive: an empty `general` is not litter, it is a lobby. And note what is **not** deleted - the room's history file. Rooms are cheap; conversations are not. Walk back into `#standup` next week and it is still there. The room object is a handle, not the archive.
 
-Watch it happen. Connect a client, call `pause()` so it never drains its socket, then flood the room:
+Note also that `requireRoomNamed` still exists and is still used - by HTTP. `GET /api/rooms/ghost` must return **404**, not conjure a room. Asking *about* a room and walking *into* one are different verbs, and they get different functions.
 
-```
-[SYSTEM] alice dropped: not reading - 977KB unsent
-```
+## Try It
 
-> **Tip**
->
-> `WsClient.destroy()` calls `ws.terminate()`, not `ws.close()`. `close()` starts a polite closing handshake - which a client that has stopped reading will never complete. You would be waiting for a reply from someone whose defining characteristic is that they are not listening.
-
-## Debt Two: the inbox had no bottom
-
-```typescript
-append(chunk: Buffer): void {
-  this.inbox = Buffer.concat([this.inbox, chunk]);   // ...forever
-}
+```bash
+npm run build && npm start
 ```
 
-Chapter 5 buffers bytes until a complete line arrives. It never asked what happens if one never does. Open a socket, send 500MB with no newline in it, and this server would hold every byte, patiently, waiting for a line ending that was never coming.
-
-```typescript
-const MAX_INBOX_BYTES = 256 * 1024;
-
-append(chunk: Buffer): boolean {
-  this.inbox = Buffer.concat([this.inbox, chunk]);
-  return this.inbox.length <= MAX_INBOX_BYTES;
-}
+```json
+{"type":"join","room":"general"}
+```
+```json
+{"type":"error","code":"not_identified","message":"Say who you are first, e.g. {\"type\":\"nick\",\"name\":\"alice\"}"}
 ```
 
-The *framing* is what makes a bound possible at all: we only ever need enough bytes to hold one complete unit - one JSON line, or one HTTP head plus body. A chat message is capped at 1KB by the schema (Chapter 14). 256KB is enormously generous, and anything past it is not a large message, it is a client that has stopped sending newlines.
+Now the bug, and its absence. Join, rename, leave:
 
-```
-[SYSTEM] c6 dropped: sent 256KB with no complete message
-```
-
-## Buffers, and where memory actually goes
-
-Both bugs are Buffer bugs, and both hide in the same place:
-
-```typescript
-heapUsedMb: mb(memory.heapUsed),   // JavaScript objects
-rssMb: mb(memory.rss),             // everything the OS gave us - Buffers included
+```json
+{"type":"nick","name":"bob"}
+{"type":"join","room":"general"}
+{"type":"nick","name":"alice"}     → everyone in the room sees "bob is now known as alice"
+{"type":"leave"}
 ```
 
-**Buffers live outside the V8 heap.** A server leaking a slow client's unsent mail leaks `rss` while `heapUsed` stays perfectly calm. Report only `heapUsed` - as most dashboards do - and the leak is invisible right up until the OOM killer arrives.
-
-## Signals: SIGTERM is the one that matters
-
-```typescript
-process.on("SIGINT", () => leave("SIGINT"));
-process.on("SIGTERM", () => leave("SIGTERM"));
+```bash
+curl -s http://127.0.0.1:8080/api/rooms
 ```
 
-SIGINT is Ctrl-C: a person, at a terminal, watching. **SIGTERM is what every process supervisor in the world sends first** - systemd, Docker, Kubernetes - and then, after roughly ten seconds, it sends SIGKILL, which cannot be caught, handled, or negotiated with.
+The member count is right. Before this chapter it would have been permanently, invisibly wrong.
 
-A server that handles only SIGINT looks flawless on a laptop and loses data on **every single deploy**: the container stops, SIGTERM arrives, nothing is listening, the default action kills the process, and the writes still in Chapter 12's queue simply never happen. We went to real trouble to flush that queue. Handling only SIGINT would have been a way of doing all that work for the one case that does not matter.
+Rooms on demand, and reaped:
 
-## Environment: `process.env` is untrusted input
-
-It is `Record<string, string | undefined>` - every value a string, every value possibly absent. It arrives from a shell instead of a socket, and it deserves precisely the same treatment, which as of Chapter 14 we know how to give it:
-
-```typescript
-export const EnvSchema = z.object({
-  HOST: z.string().min(1).optional(),
-  PORT: z.coerce.number().int().min(1).max(65535).optional(),
-  DATA_DIR: z.string().min(1).optional(),
-  ROOMS: z.string().min(1)
-    .transform((v) => v.split(",").map((r) => r.trim()).filter(Boolean))
-    .pipe(z.array(z.string().regex(/^[a-z0-9-]+$/)).min(1))
-    .optional(),
-});
+```
+  rooms now: general, random, dev, standup
+  after leaving: general, random, dev      (standup reaped; permanent rooms stay)
 ```
 
-Everything optional: an unset variable is a default, not an error. But a *set* one that is nonsense is fatal, on purpose. `PORT=banana` is not a request to use 8080 - it is a mistake in a deployment, and a server that silently binds to 8080 anyway will be found at 3am by somebody wondering why the load balancer is unhappy. **Fail at startup, loudly, while the person who typed it is still watching.**
+And the cap, tested with no sockets at all - because `Registry` is a class you can just construct, which is what Chapter 11 was for:
 
-Precedence is `argv` → `env` → `DEFAULTS`: specific beats general, immediate beats standing.
+```
+  stopped after creating 97 (total 100)
+  -> not_permitted: This server holds 100 rooms and they are all taken.
+```
 
 ## Putting It Together
 
-Two bugs the runtime had been reporting all along, plus a way to see them. The files are on the `chapter15` branch.
+The membership leak is fixed two ways: rooms key on an immutable id, and the id is a *branded* type. Both are on the `chapter16` branch.
 
-Event-loop lag, measured the only way that works: ask to be woken in 50ms, see how late you actually were. `.unref()` is what lets the process still exit:
+The state machine, as a union. You are in a room only in the `chatting` state, and it carries the user - so "in a room, but nobody" is not a value you can build:
 
 ```typescript
-    this.probe = setInterval(() => {
-      const now = performance.now();
-      const lag = Math.max(0, now - this.last - PROBE_MS);
-      this.maxLag = Math.max(this.maxLag, lag);
-      this.totalLag += lag;
-      this.samples++;
-      this.last = now;
-    }, PROBE_MS);
-
-    // .unref() and the server can still exit.
-    //
-    // A timer holds the event loop open. Without this line the loop always has
-    // one more thing to do - forever, every 50ms - and `server.close()` would
-    // complete, every client would disconnect, and the process would sit there
-    // being perfectly healthy and refusing to die. It is a two-word fix for a
-    // bug that presents as "our deploys hang", and it is the reason a monitoring
-    // timer must never keep a process alive: nothing should stay up merely
-    // because something is watching it.
-    this.probe.unref();
+export type ClientState =
+  | { readonly status: "anonymous" }
+  | { readonly status: "identified"; readonly user: User }
+  | { readonly status: "chatting"; readonly user: User; readonly room: RoomName };
 ```
 
-And backpressure - the bug the runtime had been signalling since Chapter 5. Past a megabyte unsent, the client is not slow, it is gone:
+And the brand. `ClientId` is a string the compiler will not let you confuse with a nickname - which is what made the membership leak a compile error:
 
 ```typescript
-  protected accepts(): boolean {
-    if (this.dropped !== undefined) {
-      return false;
-    }
-    if (this.backlog > MAX_BACKLOG_BYTES) {
-      this.dropped = `not reading - ${Math.round(this.backlog / 1024)}KB unsent`;
-      this.markClosing();
-      this.destroy();
-      return false;
-    }
-    return true;
-  }
+declare const ClientIdBrand: unique symbol;
+export type ClientId = string & { readonly [ClientIdBrand]: true };
+
+// The only way to make one. Called once, in clients.ts, at accept().
+export function clientId(raw: string): ClientId {
+  return raw as ClientId;
+}
 ```
 
 > **Tip**
 >
-> `monitorEventLoopDelay` looked right and read ~12ms whether idle or blocked; the hand-rolled probe above caught a 400ms block. Watch your metrics move before you trust them.
+> The full `src/types.ts`, `src/state.ts` (rooms on demand, reaping) and `src/handler.ts` are on the branch. Note the join handler has no is-this-client-named check - the state machine makes it unnecessary.
 ## Exercise
 
-1. Add an endpoint that blocks the thread for two seconds (`while (Date.now() < end) {}`). Hit it, then immediately hit `/api/health` from another terminal - and notice you cannot, because there is one thread and you are standing on it. Read `eventLoopMaxMs` afterwards.
-2. Delete `.unref()` from `runtime.ts`. Start the server, Ctrl-C, and watch it refuse to exit. Explain, in one sentence, what is still keeping it alive.
-3. Set `MAX_BACKLOG_BYTES` to `50_000_000` and re-run the slow-client experiment while watching `rss` versus `heapUsedMb`. Which one moves? Why is that the answer to "where do Buffers live"?
-4. Handle SIGHUP and reload `ROOMS` from the environment without restarting. What breaks about clients currently in a room that no longer exists - and is that a reason not to do it?
-5. `Buffer.concat` in `append()` copies the whole inbox on every chunk, so a message arriving in N pieces costs O(N²). With a 256KB bound that is fine. Work out at what bound it stops being fine, and what you would use instead.
+1. Delete the brand: make `ClientId` a plain `type ClientId = string`. Everything still compiles - including `room.join(client.label)`. Put it back and re-read the four errors. That is the chapter.
+2. Brand `RoomName` and `UserId` the same way. How many places break? Were any of them wrong?
+3. Add a `{ status: "away"; user: User; room: RoomName }` state. Follow the compiler until it stops complaining, and count how many places it sent you. None of them was a place you had to *remember*.
+4. `reapIfEmpty` keeps the history file. Add a `{"type":"rooms"}` reply that also lists rooms which have an archive but no live room object - the empty rooms you can still walk back into.
+5. A client is dropped for backpressure (Chapter 15) while sitting in a room. Trace what removes it from `room.members`. Now do the same for a client whose socket errors. Are they the same path? Should they be?
 
 ## What's Next
 
-The server now knows what it is doing to the machine, and the machine can no longer be used against it: no unbounded read buffer, no unbounded write queue, no timer holding the door shut, no deploy that quietly drops the last few messages.
+Rooms are keyed by something that cannot change, presence is a state machine that cannot hold a contradiction, and rooms come and go on their own.
 
-Next: **the chat server core** - rooms, the client state machine, and broadcasting. Everything we have built has been in service of a chat server, and it is time to look hard at the chat itself.
+But look at `Registry.knownUsers`: a hard-coded `Map` with `alice` and `bob` in it, where `{"type":"nick","name":"alice"}` makes you an admin because you said so. Every chapter since Chapter 4 has had a comment promising this gets fixed in Chapter 17.
+
+It is Chapter 17. Next: **authentication and sessions** - proving who you are, rather than announcing it.
 
 ---
 
-Source: <https://purphoros.com/howto/typescript/nodejs-runtime>
+Source: <https://purphoros.com/howto/typescript/chat-core>
