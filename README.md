@@ -1,316 +1,246 @@
-# Chapter 04 - Interfaces, Objects & Classes
+# Chapter 05 - Your First TCP Server
 
-Define shapes for data with interfaces, add behavior with classes, and know when to use each - the building blocks for our chat server's types.
+Time to write real networking code. We'll create a TCP server with Node.js, accept connections, read data, and send responses - all using the event-driven model.
 
-## Defining Interfaces for Object Shapes
+## Node.js net Module - Creating a TCP Server
 
-An `interface` describes the shape of an object - what properties it has and what types they are. It's a compile-time contract, erased from the JavaScript output.
+Node.js has a built-in `net` module for low-level TCP networking. No external packages needed. It provides `net.createServer()` which returns a server that listens for incoming TCP connections:
+
+The smallest server that works. This is the *idea*, not the file - `src/index.ts` on this branch is the finished chat server, listed in full at the end of the chapter.
 
 ```typescript
-interface User {
-  id: string;
-  name: string;
-  joinedAt: number;
-}
+import net from "node:net";
 
-// Objects must match the shape exactly
-const alice: User = {
-  id: "u1",
-  name: "alice",
-  joinedAt: Date.now(),
-};
+const server = net.createServer((socket) => {
+  console.log(`Client connected: ${socket.remoteAddress}:${socket.remotePort}`);
 
-// Missing or extra properties are compile errors:
-// const bad: User = { id: "u2", name: "bob" };
-//   ERROR: Property 'joinedAt' is missing
-// const extra: User = { id: "u3", name: "carol", age: 25 };
-//   ERROR: 'age' does not exist in type 'User'
+  socket.write("Welcome to the chat server!\n");
+
+  socket.on("data", (data) => {
+    const message = data.toString().trim();
+    console.log(`Received: ${message}`);
+    socket.write(`Echo: ${message}\n`);
+  });
+
+  socket.on("close", () => {
+    console.log("Client disconnected");
+  });
+
+  socket.on("error", (err) => {
+    console.error(`Socket error: ${err.message}`);
+  });
+});
+
+server.listen(8080, "127.0.0.1", () => {
+  console.log("Server listening on 127.0.0.1:8080");
+});
 ```
+
+Key concepts:
+
+- `net.createServer(callback)` - the callback fires for each new connection, receiving a `socket` object.
+- `socket` is a duplex stream - you can read from it AND write to it. It represents one TCP connection.
+- `socket.write(data)` - sends data to the client.
+- `server.listen(port, host, callback)` - starts listening. The callback fires when the server is ready.
+
+## The Event-Driven Model
+
+Node.js doesn't use threads for concurrency (like Rust's thread pool in Chapter 12). Instead, it uses an **event loop** - a single thread that listens for events and calls your callbacks when they fire.
+
+The `socket.on(event, callback)` pattern registers listeners for different events:
+
+#### socket.on("data", callback)
+
+Fires when the client sends data. The callback receives a `Buffer` - raw bytes. Call `.toString()` to get a string.
+
+#### socket.on("close", callback)
+
+Fires when the connection closes (client disconnects or socket is destroyed).
+
+#### socket.on("error", callback)
+
+Fires on errors (connection reset, timeout, etc.). Always handle this - unhandled socket errors crash the process.
 
 > **Note**
 >
-> `interface` vs `type`: both define object shapes. Interfaces can be **extended** and **merged**(two declarations with the same name combine). Types support unions and intersections. For object shapes, prefer `interface`. For unions and complex types, use `type`.
+> Unlike Rust's Tokio (which multiplexes async tasks on a thread pool), Node.js runs *everything* on one thread. The event loop handles I/O without blocking - while waiting for one client's data, it processes other clients' events. This is why Node.js is great for I/O-heavy workloads (like chat servers) but not for CPU-heavy work.
 
-## Optional Properties and Readonly
-
-```typescript
-interface Message {
-  readonly id: string;       // can't be changed after creation
-  sender: string;
-  text: string;
-  room: string;
-  replyTo?: string;          // optional - may or may not exist
-  editedAt?: number;         // optional
-}
-
-const msg: Message = {
-  id: "m1",
-  sender: "alice",
-  text: "Hello!",
-  room: "general",
-  // replyTo and editedAt omitted - they're optional
-};
-
-// msg.id = "m2";  // ERROR: Cannot assign to 'id' because it is read-only
-msg.text = "Hello, edited!";  // fine - not readonly
-```
-
-`readonly` prevents reassignment after creation. It's a compile-time check only - not enforced at runtime (JavaScript has no concept of readonly properties on plain objects).
-
-`?` makes a property optional. Its type becomes `T | undefined` - you must check for `undefined` before using it.
-
-## Extending Interfaces
+## Reading Data and Writing Responses
 
 ```typescript
-interface User {
-  id: string;
-  name: string;
-}
+socket.on("data", (data: Buffer) => {
+  // data is a Buffer - raw bytes from the client
+  // .toString() converts to a string (UTF-8 by default)
+  const message = data.toString().trim();
 
-// AdminUser has everything User has, plus adminLevel
-interface AdminUser extends User {
-  adminLevel: number;
-  permissions: string[];
-}
+  // Write back to the client
+  socket.write(`You said: ${message}\n`);
 
-const admin: AdminUser = {
-  id: "u1",
-  name: "alice",
-  adminLevel: 2,
-  permissions: ["kick", "ban", "mute"],
-};
-
-// AdminUser IS-A User - you can pass it anywhere a User is expected
-function greet(user: User): string {
-  return `Hello, ${user.name}!`;
-}
-
-greet(admin);  // fine - AdminUser extends User
+  // Check for special commands
+  if (message === "/quit") {
+    socket.write("Goodbye!\n");
+    socket.end();  // close the connection gracefully
+  }
+});
 ```
+
+Key details:
+
+- `data` is a `Buffer` - Node.js's type for binary data. Like Rust's `&[u8]`.
+- `.toString()` converts bytes to a UTF-8 string.
+- `.trim()` removes whitespace and newlines from the ends (clients send `\r\n` or `\n` after each line).
+- `socket.end()` gracefully closes the connection - sends remaining data then closes.
+- `socket.destroy()` immediately closes without flushing - use for error recovery.
+
+## Testing with telnet and nc
+
+Start the server, then connect from another terminal:
+
+```bash
+# Start the server
+npx tsx src/index.ts
+
+# In another terminal - connect with telnet
+telnet 127.0.0.1 8080
+
+# Or with netcat
+nc 127.0.0.1 8080
+
+# Type messages and press Enter - you'll see the echo response
+# Type /quit to disconnect
+```
+
+Try opening multiple connections in different terminals - the server handles them all concurrently via the event loop, no threads needed.
 
 > **Tip**
 >
-> TypeScript uses **structural typing** (duck typing). If an object has all the required properties, it satisfies the interface - even without an explicit `implements`. An `AdminUser` works as a `User` because it has `id` and `name`.
-
-## Classes with Typed Properties and Methods
-
-Classes combine data and behavior. In our chat server, we'll use classes for stateful objects like rooms and connections:
-
-```typescript
-class ChatRoom {
-  name: string;
-  private members: Set<string> = new Set();
-  readonly createdAt: number;
-
-  constructor(name: string) {
-    this.name = name;
-    this.createdAt = Date.now();
-  }
-
-  join(userId: string): void {
-    this.members.add(userId);
-  }
-
-  leave(userId: string): boolean {
-    return this.members.delete(userId);
-  }
-
-  hasMember(userId: string): boolean {
-    return this.members.has(userId);
-  }
-
-  get memberCount(): number {
-    return this.members.size;
-  }
-
-  get memberList(): string[] {
-    return [...this.members];
-  }
-}
-
-const room = new ChatRoom("general");
-room.join("alice");
-room.join("bob");
-console.log(room.memberCount);   // 2
-console.log(room.memberList);    // ["alice", "bob"]
-// room.members;  // ERROR: 'members' is private
-```
-
-## Access Modifiers: public, private, protected
-
-| Modifier | Accessible from | Use for |
-|---|---|---|
-| public | Anywhere (default) | API surface - methods callers use |
-| private | Same class only | Internal state - implementation details |
-| protected | Same class + subclasses | Extension points - things subclasses override |
-| readonly | Anywhere (read), constructor (write) | Immutable after construction |
-
-```typescript
-class Connection {
-  // Constructor parameter shorthand - declares AND initializes properties
-  constructor(
-    public readonly id: string,
-    private socket: unknown,
-    protected authenticated: boolean = false,
-  ) {}
-
-  // public - anyone can call
-  send(data: string): void {
-    console.log(`[${this.id}] Sending: ${data}`);
-  }
-
-  // private - only this class
-  private resetSocket(): void {
-    this.socket = null;
-  }
-
-  // protected - this class + subclasses
-  protected setAuthenticated(value: boolean): void {
-    this.authenticated = value;
-  }
-}
-```
-
-> **Tip**
->
-> The constructor shorthand `constructor(public readonly id: string)` declares the property, sets its visibility, makes it readonly, AND assigns the constructor parameter - all in one line. This is a TypeScript-only feature, not JavaScript.
-
-## Implementing Interfaces
-
-```typescript
-interface Serializable {
-  serialize(): string;
-}
-
-interface Identifiable {
-  readonly id: string;
-}
-
-// A class can implement multiple interfaces
-class ChatMessage implements Serializable, Identifiable {
-  readonly id: string;
-  constructor(
-    public sender: string,
-    public text: string,
-    public room: string,
-  ) {
-    this.id = crypto.randomUUID();
-  }
-
-  serialize(): string {
-    return JSON.stringify({
-      id: this.id,
-      sender: this.sender,
-      text: this.text,
-      room: this.room,
-    });
-  }
-}
-
-// Both interfaces are satisfied
-const msg = new ChatMessage("alice", "Hello!", "general");
-console.log(msg.serialize());
-```
-
-## Interfaces vs Classes - When to Use Which
-
-#### Use Interfaces when:
-
-- Defining data shapes (no behavior)
-- Type-checking function parameters
-- API contracts between modules
-- You need zero runtime overhead
-
-#### Use Classes when:
-
-- Data + behavior together (methods)
-- Need `instanceof` checks at runtime
-- Internal state that should be private
-- Stateful objects (rooms, connections, sessions)
-
-> **Note**
->
-> In our chat server: `interface` for message shapes, event types, and handler signatures. `class` for ChatRoom, Connection, and Server - things with internal state and methods.
+> Every connection gets its own `socket` object. The server callback runs once per connection. Inside the callback, you set up event handlers for that specific socket. Multiple clients are served concurrently - Node.js's event loop interleaves their events automatically.
 
 ## Putting It Together
 
-Interfaces describe shapes; classes give them behaviour and encapsulation. Both are on the `chapter4` branch; here are the pieces this chapter adds.
+Chapters 1-4 built the vocabulary - the domain types, the interfaces, the `ChatRoom` and `ChatMessage` classes. This chapter drives them with a real socket. Rather than reprint the whole file, here are the two pieces this chapter adds; the complete version is `src/index.ts` on the `chapter5` branch, and both blocks below are slices of it.
 
-The domain as interfaces. `AdminUser extends User` and structural typing means an admin can go anywhere a user is expected:
-
-```typescript
-interface Identifiable {
-  readonly id: string;
-}
-
-interface Serializable {
-  serialize(): string;
-}
-
-interface User extends Identifiable {
-  name: string;
-  port: Port;
-  joinedAt: Timestamp;
-}
-
-// An admin IS-A user with more besides. Structural typing means an AdminUser
-// can be passed anywhere a User is expected, with no `implements` needed.
-interface AdminUser extends User {
-  adminLevel: number;
-  permissions: string[];
-}
-
-interface Message extends Identifiable {
-  sender: UserId;
-  text: string;
-  room: RoomName;
-  replyTo?: string;   // optional: string | undefined
-```
-
-And `ChatRoom` - state plus behaviour, with `private` members the outside cannot touch:
+A `Connection` wraps one socket. It gives every client an id, tracks its state and identity, and turns "write a line" into "write bytes and a newline" - so the rest of the server never touches a raw socket:
 
 ```typescript
-class ChatRoom implements Serializable, Identifiable {
+class Connection implements Identifiable {
   readonly id: string;
-  readonly createdAt: Timestamp;
-  private members: Set<UserId> = new Set();
+  readonly address: string;
+  readonly connectedAt: Timestamp;
 
-  constructor(public readonly name: RoomName) {
-    this.id = crypto.randomUUID();
-    this.createdAt = Date.now();
+  private state: ConnectionState = "connecting";
+  private identity?: User;
+  private currentRoom?: RoomName;
+
+  constructor(private readonly socket: net.Socket, sequence: number) {
+    this.id = `c${sequence}`;
+    this.address = `${socket.remoteAddress}:${socket.remotePort}`;
+    this.connectedAt = Date.now();
+    this.state = "connected";
   }
 
-  join(userId: UserId): void {
-    this.members.add(userId);
+  get status(): ConnectionState {
+    return this.state;
   }
 
-  leave(userId: UserId): boolean {
-    return this.members.delete(userId);
+  get user(): User | undefined {
+    return this.identity;
   }
 
-  hasMember(userId: UserId): boolean {
-    return this.members.has(userId);
+  get room(): RoomName | undefined {
+    return this.currentRoom;
+  }
+
+  // Who this connection is, for logging: the chosen nick, else the socket id.
+  get label(): string {
+    return this.identity?.name ?? this.id;
+  }
+
+  // How long this client has been connected, in milliseconds.
+  get uptime(): number {
+    return Date.now() - this.connectedAt;
+  }
+
+  send(line: string): void {
+    this.socket.write(`${line}\n`);
   }
 ```
+
+And the server itself: `net.createServer` hands us one socket per client, and the three events - `data`, `close`, `error` - are the whole event-driven model:
+
+```typescript
+const server = net.createServer((socket) => {
+  const conn = new Connection(socket, ++sequence);
+  clients.set(conn.id, conn);
+
+  emit({ type: "system", text: `${conn.id} connected from ${conn.address}`, at: Date.now() });
+  conn.send(`Welcome! You are ${conn.id}. Type /help for commands.`);
+
+  // `data` is a Buffer - raw bytes. A single chunk may hold several lines, or
+  // half of one; splitting on newline is enough until Chapter 15 does framing.
+  socket.on("data", (data: Buffer) => {
+    for (const raw of data.toString().split("\n")) {
+      const line = parseInput(raw);
+      if (line.length > 0) {
+        handleLine(conn, line);
+      }
+    }
+  });
+
+  socket.on("close", () => {
+    const room = conn.room;
+    if (room !== undefined) {
+      rooms.get(room)?.leave(conn.label);
+    }
+    conn.markClosed();
+    clients.delete(conn.id);
+    emit({ type: "system", text: `${conn.label} disconnected (${clients.size} remaining)`, at: Date.now() });
+  });
+
+  // Always handle this. An unhandled socket error takes the whole process down.
+  socket.on("error", (err: Error) => {
+    emit({ type: "system", text: `${conn.id} error: ${err.message}`, at: Date.now() });
+  });
+});
+
+server.on("error", (err: NodeJS.ErrnoException) => {
+  if (err.code === "EADDRINUSE") {
+    console.error(`Port ${port} is already in use.`);
+    process.exit(1);
+  }
+  throw err;
+});
+
+// Ctrl-C: stop accepting connections, hang up on everyone, then exit.
+process.on("SIGINT", () => {
+  emit({ type: "system", text: "Shutting down", at: Date.now() });
+  for (const conn of clients.values()) {
+    conn.end("Server shutting down.");
+  }
+  server.close(() => process.exit(0));
+});
+```
+
+`socket.on("error")` is not optional: an unhandled socket error takes the whole process down. And one `data` chunk is raw bytes that may hold several lines or half of one - splitting on the newline is enough here; Chapter 15 does proper framing.
 
 > **Tip**
 >
-> The complete, runnable file is `src/index.ts` on the `chapter4` branch. You are not meant to paste it wholesale - build your own as you follow along, and use the reference to check yourself.
+> The complete, runnable file is `src/index.ts` on the `chapter5` branch. You are not meant to paste it wholesale - build your own as you follow along, and use the reference to check yourself.
 
 ## Exercise
 
-1. Define a `Message` interface with `id` (readonly), `sender`, `text`, `room`, and optional `replyTo`. Create a message object and try to modify `id`.
-2. Create `AdminUser extends User` with `adminLevel: number` and `permissions: string[]`. Pass an AdminUser to a function that accepts User - it should work (structural typing).
-3. Build a `ChatRoom` class with private `members: Set<string>`, public `join/leave/hasMember` methods, and a `memberCount` getter. Try accessing `members` from outside - it should be a compile error.
-4. Use the constructor shorthand: `constructor(public readonly id: string, private name: string)`. Verify `id` is accessible and readonly, and `name` is inaccessible from outside.
-5. Create a `Serializable` interface with a `serialize(): string` method. Implement it on both `ChatMessage` and `ChatRoom`.
+1. Run the server and connect with `telnet` or `nc`. Send messages and verify the echo response.
+2. Open multiple connections from different terminals. Verify each gets a unique client ID and they all work concurrently.
+3. Add a `/time` command that responds with the current timestamp.
+4. Add a `/uptime` command that shows how long the client has been connected (use `Date.now() - client.connectedAt`).
+5. Type `/who` from multiple clients and verify the count matches the number of connected terminals.
 
 ## What's Next
 
-You now have interfaces for data shapes and classes for stateful objects. Our chat server will use both - interfaces for messages and events, classes for rooms and connections.
+You have a working TCP server that accepts multiple connections, reads data, sends responses, and tracks clients. The event-driven model handles concurrency without threads.
 
-In the next chapter, we write actual networking code - a TCP server using Node.js's `net` module, accepting connections and exchanging data over the wire.
+In the next chapter, we'll understand HTTP by building a minimal HTTP server on top of TCP - parsing requests and building responses by hand before we move to WebSockets.
 
 ---
 
-Source: <https://purphoros.com/howto/typescript/interfaces-classes>
+Source: <https://purphoros.com/howto/typescript/tcp-server>
