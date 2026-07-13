@@ -1,241 +1,288 @@
-# Chapter 07 - WebSocket Fundamentals
+# Chapter 08 - Generics
 
-HTTP is request-response. WebSocket is a persistent, bidirectional connection - either side can send messages at any time. This is what makes real-time chat possible.
+Write code that works with many types while keeping full type safety. Generics are TypeScript's most powerful tool for building reusable libraries and data structures.
 
-## Why WebSockets Exist
+## Generic Functions
 
-HTTP has a fundamental limitation: the client sends a request, the server sends a response, done. If the server wants to push data to the client (a new chat message, a notification), it can't - there's no open connection to push through.
+A generic function uses a **type parameter** - a placeholder that gets filled in when you call the function:
 
-Workarounds like polling (client asks "any new messages?" every second) waste bandwidth and add latency. WebSocket solves this by keeping the connection open after the initial HTTP handshake:
+```typescript
+// <T> is a type parameter - a placeholder for any type
+function identity<T>(value: T): T {
+  return value;
+}
 
+// TypeScript infers T from the argument
+const num = identity(42);        // T = number, returns number
+const str = identity("hello");   // T = string, returns string
+
+// Or specify T explicitly
+const bool = identity<boolean>(true);
+
+// Practical: first element of any array
+function first<T>(items: T[]): T | undefined {
+  return items[0];
+}
+
+const room = first(["general", "random"]);  // string | undefined
+const code = first([200, 404, 500]);         // number | undefined
 ```
-HTTP (request-response):
-  Client ──▶ Server  "GET /messages"
-  Client ◀── Server  "here are messages"
-  (connection closed)
-  Client ──▶ Server  "any new messages?"   ← polling, wasteful
-  Client ◀── Server  "nope"
 
-WebSocket (persistent, bidirectional):
-  Client ──▶ Server  "HTTP Upgrade to WebSocket"
-  Client ◀── Server  "101 Switching Protocols"
-  (connection stays open)
-  Client ──▶ Server  "hello"          ← either side can send
-  Client ◀── Server  "new message!"   ← at any time
-  Client ◀── Server  "user joined"
-  Client ──▶ Server  "goodbye"
-  (connection closed when either side wants)
+> **Tip**
+>
+> Generics are like function parameters but for types. Just as `function add(a: number, b: number)` parameterizes values, `function first<T>(items: T[]): T` parameterizes the type. The caller provides the type (or TypeScript infers it).
+
+## Generic Interfaces
+
+```typescript
+// A Result type - success or failure with typed data
+interface Result<T, E = string> {
+  ok: boolean;
+  data?: T;
+  error?: E;
+}
+
+// Usage - T is filled in at the call site
+const success: Result<number> = { ok: true, data: 42 };
+const failure: Result<number> = { ok: false, error: "not found" };
+
+// A cache with typed values
+interface Cache<V> {
+  get(key: string): V | undefined;
+  set(key: string, value: V): void;
+  has(key: string): boolean;
+  delete(key: string): boolean;
+  size: number;
+}
 ```
 
-## The WebSocket Handshake
+## Constraints with extends
 
-WebSocket starts as a normal HTTP request with an `Upgrade: websocket` header. The server responds with `101 Switching Protocols`, and the connection switches from HTTP to WebSocket. After that, both sides send binary frames (not HTTP text).
+`extends` limits what types can be used for a type parameter - the generic equivalent of "must have these properties":
 
-```
-Client request:
-  GET / HTTP/1.1
-  Host: localhost:8080
-  Upgrade: websocket
-  Connection: Upgrade
-  Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==
-  Sec-WebSocket-Version: 13
+```typescript
+// T must have a .length property
+function longest<T extends { length: number }>(a: T, b: T): T {
+  return a.length >= b.length ? a : b;
+}
 
-Server response:
-  HTTP/1.1 101 Switching Protocols
-  Upgrade: websocket
-  Connection: Upgrade
-  Sec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=
+longest("hello", "hi");       // string has .length ✓
+longest([1, 2], [1, 2, 3]);   // array has .length ✓
+// longest(10, 20);            // number has no .length ✗
+
+// T must have an id property
+interface HasId {
+  id: string;
+}
+
+function findById<T extends HasId>(items: T[], id: string): T | undefined {
+  return items.find(item => item.id === id);
+}
+
+// keyof - constrain to valid property names
+function getProperty<T, K extends keyof T>(obj: T, key: K): T[K] {
+  return obj[key];
+}
+
+const user = { name: "alice", age: 30 };
+getProperty(user, "name");  // string
+getProperty(user, "age");   // number
+// getProperty(user, "foo"); // ERROR: "foo" is not in keyof typeof user
 ```
 
 > **Note**
 >
-> The `ws` library handles the handshake automatically. You never need to compute `Sec-WebSocket-Accept` yourself. Understanding the handshake helps when debugging connection issues or reading network logs.
+> `keyof T` produces a union of all property names of T. For `{ name: string; age: number }`, `keyof T` is `"name" | "age"`. Combined with generics, it ensures you can only access properties that actually exist.
 
-## The ws Library
-
-`ws` is the most popular WebSocket library for Node.js. It's fast, spec-compliant, and has excellent TypeScript types.
-
-```bash
-npm install ws
-npm install --save-dev @types/ws
-```
-
-The simplest thing `ws` can do - and it is *not* what this chapter builds. Look at the port: this opens a second one, and the whole point of Chapter 6 was that the chat, the web page and the API all arrive on the same one. The real `src/index.ts` runs `ws` in `noServer` mode and hands it sockets we have already accepted and parsed ourselves; it is listed in full at the end of the chapter.
+## Generic Classes
 
 ```typescript
-import { WebSocketServer, WebSocket } from "ws";
+class TypedMap<K, V> {
+  private data = new Map<K, V>();
 
-const wss = new WebSocketServer({ port: 8080 });
+  set(key: K, value: V): void {
+    this.data.set(key, value);
+  }
 
-wss.on("connection", (ws: WebSocket) => {
-  console.log("Client connected");
+  get(key: K): V | undefined {
+    return this.data.get(key);
+  }
 
-  ws.send("Welcome to the chat!");
+  get size(): number {
+    return this.data.size;
+  }
+}
 
-  ws.on("message", (data: Buffer) => {
-    const message = data.toString();
-    console.log(`Received: ${message}`);
-    ws.send(`Echo: ${message}`);
-  });
-
-  ws.on("close", () => {
-    console.log("Client disconnected");
-  });
-});
-
-console.log("WebSocket server on ws://127.0.0.1:8080");
+// Type-safe: keys are strings, values are numbers
+const scores = new TypedMap<string, number>();
+scores.set("alice", 100);
+scores.set("bob", 85);
+// scores.set(42, "wrong"); // ERROR: number not assignable to string
 ```
 
-The API mirrors Chapter 5's TCP server - same event model, different protocol:
+## Utility Types
 
-- `WebSocketServer` - listens for WebSocket connections (handles the HTTP upgrade).
-- `ws.send(data)` - send a message to the client.
-- `ws.on("message")` - receive a message from the client.
-- `ws.on("close")` - connection closed.
-- `wss.clients` - a Set of all connected WebSocket instances.
-
-## Broadcasting to All Clients
+TypeScript has built-in generic types for common transformations:
 
 ```typescript
-// Broadcast a message to every connected client
-function broadcast(wss: WebSocketServer, message: string, exclude?: WebSocket): void {
-  for (const client of wss.clients) {
-    if (client !== exclude && client.readyState === WebSocket.OPEN) {
-      client.send(message);
+interface User {
+  id: string;
+  name: string;
+  email: string;
+  isAdmin: boolean;
+}
+
+// Partial<T> - all properties become optional
+type UserUpdate = Partial<User>;
+// { id?: string; name?: string; email?: string; isAdmin?: boolean }
+
+// Required<T> - all properties become required
+type StrictUser = Required<UserUpdate>;
+
+// Pick<T, K> - select specific properties
+type UserPreview = Pick<User, "id" | "name">;
+// { id: string; name: string }
+
+// Omit<T, K> - remove specific properties
+type UserWithoutEmail = Omit<User, "email">;
+// { id: string; name: string; isAdmin: boolean }
+
+// Record<K, V> - object with known keys and typed values
+type RoomMap = Record<string, string[]>;
+// { [key: string]: string[] }
+
+// Readonly<T> - all properties become readonly
+type FrozenUser = Readonly<User>;
+```
+
+| Utility | What it does | Use case |
+|---|---|---|
+| Partial<T> | All properties optional | Update/patch operations |
+| Required<T> | All properties required | Ensure complete data |
+| Pick<T, K> | Select properties | API responses, previews |
+| Omit<T, K> | Remove properties | Hide sensitive fields |
+| Record<K, V> | Object with typed keys/values | Lookup tables, maps |
+| Readonly<T> | All properties readonly | Immutable config |
+
+## Applying Generics: A Typed Event Emitter
+
+Node.js's `EventEmitter` is untyped - you can emit any event name with any data. Let's build a type-safe version using generics:
+
+A first attempt, and the one you will find in most tutorials. It is *not* `src/events.ts` on this branch - read the Note underneath it, and then the real listing at the end. This version reaches for `any` twice, and Chapter 3 was right about that.
+
+```typescript
+// The event map defines: event name → handler signature.
+// This MUST be a `type`, not an `interface` - see the warning below.
+type ChatEvents = {
+  message: (sender: string, text: string) => void;
+  join: (user: string, room: string) => void;
+  leave: (user: string, room: string) => void;
+  error: (error: Error) => void;
+};
+
+// Generic typed emitter - T is the event map
+class TypedEmitter<T extends Record<string, (...args: any[]) => void>> {
+  private handlers = new Map<keyof T, Set<Function>>();
+
+  on<K extends keyof T>(event: K, handler: T[K]): void {
+    if (!this.handlers.has(event)) {
+      this.handlers.set(event, new Set());
+    }
+    this.handlers.get(event)!.add(handler);
+  }
+
+  emit<K extends keyof T>(event: K, ...args: Parameters<T[K]>): void {
+    const handlers = this.handlers.get(event);
+    if (handlers) {
+      for (const handler of handlers) {
+        (handler as Function)(...args);
+      }
     }
   }
 }
 
-wss.on("connection", (ws) => {
-  broadcast(wss, "A new user joined!", ws);
+// Usage - fully type-safe
+const chat = new TypedEmitter<ChatEvents>();
 
-  ws.on("message", (data) => {
-    const text = data.toString();
-    broadcast(wss, text);  // send to everyone including sender
-  });
+chat.on("message", (sender, text) => {
+  // sender: string, text: string - inferred from ChatEvents
+  console.log(`${sender}: ${text}`);
 });
-```
 
-`wss.clients` is a `Set<WebSocket>` containing every connected client. Check `readyState === WebSocket.OPEN` before sending - a client might be mid-disconnect.
-
-## Testing WebSocket Connections
-
-You can test with a browser console, a CLI tool, or a Node.js client:
-
-```bash
-# Install wscat - a CLI WebSocket client
-npm install -g wscat
-
-# Connect to your server
-wscat -c ws://127.0.0.1:8080
-
-# Type messages and press Enter
-# Open multiple terminals with wscat to test broadcasting
-```
-
-```typescript
-// Or from a browser console:
-const ws = new WebSocket("ws://127.0.0.1:8080");
-ws.onmessage = (event) => console.log("Server:", event.data);
-ws.onopen = () => ws.send("Hello from browser!");
+chat.emit("message", "alice", "Hello!");     // ✓ correct types
+// chat.emit("message", 42);                 // ✗ ERROR: number not string
+// chat.emit("unknown", "data");             // ✗ ERROR: "unknown" not in ChatEvents
 ```
 
 > **Tip**
 >
-> `wscat` is the WebSocket equivalent of `telnet` or `nc` for TCP. It's the fastest way to test a WebSocket server from the command line.
+> `Parameters<T[K]>` extracts the parameter types of a function type. If `T[K]` is `(sender: string, text: string) => void`, then `Parameters<T[K]>` is `[string, string]`. This is how `emit` knows exactly what arguments to accept for each event.
 
-## Attaching ws to a Server You Already Have
+> **Warning**
+>
+> The event map has to be a `type`, not an `interface`. Write `interface ChatEvents { ... }` and `new TypedEmitter<ChatEvents>()` fails to compile:
+>
+> ```
+> error TS2344: Type 'ChatEvents' does not satisfy the constraint
+>   'Record<string, (...args: any[]) => void>'.
+>   Index signature for type 'string' is missing in type 'ChatEvents'.
+> ```
+>
+> A type alias for an object gets an *implicit index signature*; an interface does not, because an interface can be reopened and merged later, so TypeScript cannot promise its keys are all strings mapping to handlers. `Record<string, ...>` demands exactly that promise. The two declarations look interchangeable and are not - this is the one place the difference bites.
 
-`new WebSocketServer({ port: 8080 })` is the quick way in: `ws` opens the port, runs an HTTP server behind the scenes, and answers the upgrade itself. It is perfect when WebSocket is *all* you serve.
-
-Our server is not in that position. It already owns port 8080 - Chapter 5 put a TCP chat protocol there, and Chapter 6 taught it HTTP. Handing that port to `ws` would evict both. So we use the other mode:
-
-```typescript
-// noServer: ws opens no port and listens for nothing. It only ever receives
-// sockets we have already accepted, parsed, and decided to upgrade.
-const wss = new WebSocketServer({ noServer: true });
-
-// ...once our own parser has seen `Upgrade: websocket` on a request:
-wss.handleUpgrade(request, socket, head, (ws) => {
-  wss.emit("connection", ws, request);
-});
-```
-
-`handleUpgrade` takes the raw socket, computes `Sec-WebSocket-Accept`, writes the `101`, and owns the connection from then on. Two details matter:
-
-- **Detach your own listeners first.** The socket was yours a moment ago and your `data` handler is still attached. Leave it there and you will try to read WebSocket frames as chat text. Remove it before handing over.
-- **Pass the leftover bytes as `head`.** A fast client can send its first WebSocket frame in the same packet as the handshake. Whatever is in your buffer after the request belongs to `ws`.
-
-This is the arrangement every real Node server uses, because a WebSocket endpoint almost always sits beside HTTP routes on one port.
+> **Note**
+>
+> The emitter above uses `any` twice - in the constraint, and in the `Function` casts inside `emit`. Chapter 3 said never to use `any`, and it was right. Our `src/events.ts` below constrains with `(...args: never[]) => void` instead: parameters are contravariant, so `never` accepts every concrete handler signature while still refusing a non-function. It says "some function, I don't care which" without switching off type checking for the people who write the handlers.
 
 ## Putting It Together
 
-`ws` normally opens its own port. We do not want a second port - Chapter 6 went to some trouble to serve everything on one - so `ws` runs in `noServer` mode and we hand it sockets we have already accepted and parsed ourselves. The complete file is `src/index.ts` on the `chapter7` branch; here is the handoff.
+The two generic tools this chapter builds live in `src/events.ts`, and the server on the `chapter8` branch is wired through them. Here is the heart of each; the complete files are on the branch.
 
-In `noServer` mode `ws` listens to nothing. It only ever receives sockets we give it:
+`TypedEmitter<T>` is parameterised by an event map, so `on` and `emit` are checked against it - `emit("mesage", ...)` with a typo does not compile:
 
 ```typescript
-// noServer: `ws` opens no port and does no listening. It only ever receives
-// sockets we have already accepted, parsed, and decided to upgrade.
-const wss = new WebSocketServer({ noServer: true });
+export class TypedEmitter<T extends EventMap> {
+  private readonly listeners = new Map<keyof T, Set<StoredListener>>();
 
-wss.on("connection", (ws: WebSocket, request: IncomingMessage) => {
-  const client = new WsClient(ws, ++sequence, request.socket.remoteAddress ?? "unknown");
-  welcome(client);
+  // `K extends keyof T` ties the handler to the event: pass "message" and the
+  // compiler demands exactly T["message"], with its parameter names and types.
+  on<K extends keyof T>(event: K, listener: T[K]): this {
+    let set = this.listeners.get(event);
+    if (set === undefined) {
+      set = new Set();
+      this.listeners.set(event, set);
+    }
+    set.add(listener);
+    return this;
+  }
 ```
 
-When a parsed HTTP request turns out to be a WebSocket upgrade, we detach our own listeners, rebuild a genuine `IncomingMessage` from the request we parsed by hand in Chapter 6, and let `ws` take the socket from there:
+And `pluck` extracts one property from every item, with the key checked against the element type, so `pluck(rooms, "nmae")` is a build error:
 
 ```typescript
-        case "upgrade": {
-          // The socket stops being ours. Detach every listener before handing
-          // it over, or we would keep trying to read WebSocket frames as text.
-          socket.off("data", onData);
-          socket.off("close", onClose);
-          socket.off("error", onError);
-          clearTimeout(greeting);
-
-          // A genuine IncomingMessage, built from the request we parsed by
-          // hand in Chapter 6. No cast, no lie: `ws` gets what it expects.
-          const request = new IncomingMessage(socket);
-          request.method = outcome.request.method;
-          request.url = outcome.request.path;
-          request.httpVersion = "1.1";
-          request.headers = Object.fromEntries(outcome.request.headers);
-
-          emit({
-            type: "system",
-            text: `${conn.id} upgrading to WebSocket → 101 ${statusLine(101)}`,
-            at: Date.now(),
-          });
-
-          // ws computes Sec-WebSocket-Accept, writes the 101, and owns the
-          // socket from here on.
-          wss.handleUpgrade(request, socket, outcome.head, (ws) => {
-            wss.emit("connection", ws, request);
-          });
-          return;
-        }
+export function pluck<T, K extends keyof T>(items: readonly T[], key: K): T[K][] {
+  return items.map((item) => item[key]);
+}
 ```
 
 > **Tip**
 >
-> The complete, runnable file is `src/index.ts` on the `chapter7` branch. You are not meant to paste it wholesale - build your own as you follow along, and use the reference to check yourself.
+> The complete, runnable file is `src/events.ts` on the `chapter8` branch. You are not meant to paste it wholesale - build your own as you follow along, and use the reference to check yourself.
 
 ## Exercise
 
-1. Start the server and connect with `wscat -c ws://127.0.0.1:8080`. Send messages and verify the echo.
-2. Open two `wscat` terminals. Type in one - verify the message appears in the other (broadcasting).
-3. Add `/nick`, `/who`, `/help`, and `/quit` commands.
-4. Add a `/time` command and an `/uptime` command (how long the client has been connected).
-5. Try connecting from a browser console with `new WebSocket("ws://127.0.0.1:8080")`. The same server handles both CLI and browser clients.
+1. Write a generic `function last<T>(items: T[]): T | undefined` that returns the last element. Test with string and number arrays.
+2. Create a generic `Cache<V>` class with `get`, `set`, `has`, and `delete` methods. Use it with `Cache<string>` and `Cache<number>`.
+3. Use `Partial<User>` for an update function: `function updateUser(id: string, changes: Partial<User>): User`.
+4. Add a `"disconnect"` event to `ChatEvents` with a `(userId: string, reason: string)` handler. Register and emit it.
+5. Use `keyof` + generic constraint to write `function pluck<T, K extends keyof T>(items: T[], key: K): T[K][]` that extracts one property from an array of objects.
 
 ## What's Next
 
-You have a working WebSocket chat server - persistent connections, real-time broadcasting, and commands. This is the core of our chat application.
+You now have generics - type parameters, constraints, generic classes, utility types, and a typed event emitter. These are the tools for building reusable, type-safe code.
 
-In the next chapter, we learn **generics** - TypeScript's tool for writing flexible, reusable code. We'll build a typed event emitter that powers our chat server's internal messaging.
+In the next chapter, we learn **enums and discriminated unions** - modeling the different message types our chat server handles, with exhaustive pattern matching.
 
 ---
 
-Source: <https://purphoros.com/howto/typescript/websocket>
+Source: <https://purphoros.com/howto/typescript/generics>
