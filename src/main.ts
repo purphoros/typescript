@@ -1,73 +1,81 @@
-// The entry point. It builds a config, loads what the last run wrote down,
-// constructs a server, and starts it.
+// The entry point: parse the command line, build a config, load what the last run
+// wrote down, and start.
 //
-// Note the `await` at the top level, outside any function. That is legal here
-// only because Chapter 11 made this package genuinely ESM - a CommonJS module
-// cannot do it, because `require()` is synchronous and has nowhere to put the
-// waiting. It is a small thing that quietly justifies the whole `"type":
-// "module"` change.
+// Note the `await` at the top level, outside any function. That is legal only
+// because Chapter 11 made this package genuinely ESM - a CommonJS module cannot do
+// it, because `require()` is synchronous and has nowhere to put the waiting.
 
-import { fromEnvironment } from "./config.js";
+import { createRequire } from "node:module";
+import { parseCli } from "./cli.js";
+import { resolveConfig, usingDefaultSecret } from "./config.js";
 import { describeThrown } from "./errors.js";
+import { Logger } from "./logger.js";
 import { ChatServer } from "./server.js";
 
-// argv beats env beats defaults. A bad value in the environment is fatal, on
-// purpose - see config.ts.
-const config = fromEnvironment(process.env, process.argv);
-const server = new ChatServer(config);
+// The version comes from package.json, and from nowhere else. A version string
+// typed into a source file is a version string that is wrong the moment somebody
+// runs `npm version patch` - and `--version` lying is worse than `--version` not
+// existing, because somebody will use it to decide whether a bug is fixed.
+const version = (createRequire(import.meta.url)("../package.json") as { version: string }).version;
+
+// --help and --version are *successes*. They are not the program failing to run,
+// they are the program doing exactly what was asked and having nothing left to do.
+// Exit code 0. A CI script that runs `chat-server --version` should not fail.
+const cli = parseCli(process.argv.slice(2), version);
+if (cli.kind === "exit") {
+  (cli.code === 0 ? process.stdout : process.stderr).write(`${cli.message}\n`);
+  process.exit(cli.code);
+}
+
+const config = resolveConfig(process.env, cli.options);
+const logger = new Logger({ level: config.logLevel, format: config.logFormat });
+const server = new ChatServer(config, logger);
+
+if (usingDefaultSecret(config)) {
+  // Loudly, every single time. A warning you see on every start is a warning you
+  // will eventually act on; a silent fallback is one you will ship.
+  logger.warn("JWT_SECRET is not set - using the development default. Do not deploy this.");
+}
 
 // Read the archive back before accepting a single connection. A client that
-// connects and immediately asks for history must not race the disk - so we do
-// not start listening until the disk has answered.
+// connects and immediately asks for history must not race the disk.
 await server.load();
 
 // The last net. Not a second error boundary: by the time a throw arrives here,
 // nobody knows what was half-done, and a process running on state it cannot
 // describe is worse than a process that stopped.
 process.on("uncaughtException", (error: Error) => {
-  console.error(`FATAL - nothing caught this: ${describeThrown(error)}`);
+  logger.error("nothing caught this", { fatal: true, error: describeThrown(error) });
   process.exit(1);
 });
 
-// Now genuinely reachable, which it was not before this chapter. Every `void
-// promise.catch(...)` in the codebase exists to keep it that way - this net is
-// the proof that something was forgotten, not a strategy for forgetting things.
 process.on("unhandledRejection", (reason: unknown) => {
-  console.error(`FATAL - a promise rejected with nobody listening: ${describeThrown(reason)}`);
+  logger.error("a promise rejected with nobody listening", { fatal: true, error: describeThrown(reason) });
   process.exit(1);
 });
 
 // Two signals, one door.
 //
 // SIGINT is Ctrl-C: a person, at a terminal, watching. SIGTERM is what every
-// process supervisor in the world sends first - systemd, Docker, Kubernetes -
-// and then, after a grace period of about ten seconds, it sends SIGKILL, which
-// cannot be caught, handled, or negotiated with.
-//
-// A server that handles only SIGINT looks perfect on a laptop and loses data on
-// every single deploy: the container stops, SIGTERM arrives, nothing is
-// listening, the default action kills the process, and the writes still in the
-// queue simply never happen. Chapter 12 went to considerable trouble to flush
-// that queue, and handling only SIGINT would have been a way of doing all that
-// work for the one case that does not matter.
-//
-// The flag is not defensive programming. A second Ctrl-C from an impatient human
-// is an ordinary Tuesday, and closing an already-closing server is an error.
+// process supervisor in the world sends first - systemd, Docker, Kubernetes - and
+// then, about ten seconds later, SIGKILL, which cannot be caught or negotiated
+// with. A server that handles only SIGINT looks flawless on a laptop and loses
+// data on every single deploy.
 let leaving = false;
 
 const leave = (signal: NodeJS.Signals): void => {
   if (leaving) {
-    console.error(`${signal} again - abandoning any writes still in the queue.`);
+    logger.warn("signal again - abandoning any writes still in the queue", { signal });
     process.exit(1);
   }
   leaving = true;
-  console.log(`${signal} received.`);
+  logger.info("shutting down", { signal });
 
   void server
     .shutdown()
     .then(() => process.exit(0))
     .catch((thrown: unknown) => {
-      console.error(`Shutdown failed: ${describeThrown(thrown)}`);
+      logger.error("shutdown failed", { error: describeThrown(thrown) });
       process.exit(1);
     });
 };
@@ -76,7 +84,24 @@ process.on("SIGINT", () => leave("SIGINT"));
 process.on("SIGTERM", () => leave("SIGTERM"));
 
 server.listen(() => {
-  for (const line of server.banner()) {
-    console.log(line);
+  // The resolved configuration, once, at startup - because the single most common
+  // production question is "what is it actually running with", and the answer
+  // should not require reading three files and a deploy script to reconstruct.
+  //
+  // The secret is not in it. See the redaction in logger.ts, which would have
+  // caught it anyway.
+  logger.info("listening", {
+    host: config.host,
+    port: config.port,
+    rooms: config.rooms,
+    dataDir: config.dataDir,
+    logLevel: config.logLevel,
+    version,
+  });
+
+  if (logger.enabled("debug")) {
+    for (const line of server.banner()) {
+      logger.debug(line);
+    }
   }
 });

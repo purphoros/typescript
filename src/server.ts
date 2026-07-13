@@ -26,6 +26,7 @@ import { ChatMessage } from "./model.js";
 import { Accounts, Sessions } from "./auth.js";
 import { Registry } from "./state.js";
 import { Metrics, Runtime } from "./runtime.js";
+import { Logger } from "./logger.js";
 import { TcpClient, WsClient } from "./clients.js";
 import type { PeerKind } from "./types.js";
 
@@ -45,10 +46,13 @@ export class ChatServer {
   private readonly wss: WebSocketServer;
   private readonly server: net.Server;
 
-  constructor(readonly config: ServerConfig) {
+  constructor(
+    readonly config: ServerConfig,
+    readonly logger: Logger = new Logger({ level: config.logLevel, format: config.logFormat }),
+  ) {
     this.registry = new Registry(config);
     this.history = new FileHistory(config.dataDir, this.metrics);
-    this.bus = createBus(this.registry, this.history);
+    this.bus = createBus(this.registry, this.history, this.logger);
     this.handler = new MessageHandler(
       this.registry,
       this.bus,
@@ -69,7 +73,7 @@ export class ChatServer {
     this.server = net.createServer((socket) => this.acceptTcp(socket));
     this.server.on("error", (err: NodeJS.ErrnoException) => {
       if (err.code === "EADDRINUSE") {
-        console.error(`Port ${this.config.port} is already in use.`);
+        this.logger.error("port is already in use", { port: this.config.port });
         process.exit(1);
       }
       throw err;

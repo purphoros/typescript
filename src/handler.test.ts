@@ -9,6 +9,7 @@ import { rm } from "node:fs/promises";
 import { MessageHandler } from "./handler.js";
 import { Registry } from "./state.js";
 import { createBus } from "./bus.js";
+import { Logger } from "./logger.js";
 import { FileHistory } from "./history.js";
 import { Accounts, Sessions } from "./auth.js";
 import { Metrics } from "./runtime.js";
@@ -27,7 +28,10 @@ async function build() {
   const accounts = new Accounts(metrics);
   await accounts.seedDefaults();
   const sessions = new Sessions();
-  const bus = createBus(registry, history);
+  // A logger that writes nowhere. Tests should assert on behaviour, not on noise -
+  // and a test suite that prints 400 log lines is a test suite nobody reads.
+  const logger = new Logger({ level: "error", format: "json", write: () => {} });
+  const bus = createBus(registry, history, logger);
   const handler = new MessageHandler(registry, bus, history, accounts, sessions, config);
   return { handler, registry, sessions, config };
 }

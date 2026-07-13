@@ -8,6 +8,7 @@
 
 import { TypedEmitter } from "./events.js";
 import { asError, describeThrown } from "./errors.js";
+import type { Fields, Logger } from "./logger.js";
 import { assertNever, type RoomName, type ServerMessage, type Timestamp, type UserId } from "./protocol.js";
 import { summarize } from "./views.js";
 import type { FileHistory } from "./history.js";
@@ -96,38 +97,57 @@ export function statusLine(code: number): string {
 // Build a bus and subscribe everything that cares. The registry and the history
 // are parameters rather than imports, which is what lets Chapter 19 build a bus
 // over a throwaway registry and assert on what it broadcast.
-export function createBus(registry: Registry, history: FileHistory): Bus {
+export function createBus(registry: Registry, history: FileHistory, logger: Logger): Bus {
   const bus: Bus = new TypedEmitter<ServerEvents>();
-  const log = (event: ChatEvent): void => console.log(formatEvent(event));
 
-  // Listener 1: the log. Every event becomes a ChatEvent record and is printed.
+  // Listener 1: the log.
+  //
+  // Every line now carries *fields* as well as a sentence. `formatEvent` is still
+  // here and still produces the human sentence - it is the `msg` - but the room,
+  // the user and the code travel alongside it as data. That is the difference
+  // between a log you read and a log you can query: `msg` is for the person,
+  // everything after it is for the machine, and six months from now the machine
+  // is the one doing the looking.
+  const log = (event: ChatEvent, fields: Fields = {}): void => {
+    logger.info(formatEvent(event), fields);
+  };
+
   bus.on("connect", (client) =>
-    log({ type: "system", text: `${client.id} connected [${client.transport}]`, at: Date.now() }));
+    logger.info(`${client.id} connected`, { client: client.id, transport: client.transport }));
   bus.on("disconnect", (client, remaining) =>
-    log({ type: "system", text: `${client.label} disconnected (${remaining} remaining)`, at: Date.now() }));
+    logger.info(`${client.label} disconnected`, { client: client.id, user: client.label, remaining }));
   bus.on("join", (client, room) =>
-    log({ type: "join", user: client.label, room, at: Date.now() }));
+    log({ type: "join", user: client.label, room, at: Date.now() }, { client: client.id, user: client.label, room }));
   bus.on("leave", (client, room) =>
-    log({ type: "leave", user: client.label, room, at: Date.now() }));
+    log({ type: "leave", user: client.label, room, at: Date.now() }, { client: client.id, user: client.label, room }));
+
+  // A chat message is logged at DEBUG, not INFO, and that is a decision rather
+  // than a detail. In production this is the highest-volume event on the server,
+  // and it is also the one thing a chat server exists to keep private. `--log-level
+  // info` means the operator sees who joined what and nothing they said.
   bus.on("message", (message) =>
-    log({ type: "message", user: message.sender, room: message.room, text: message.text, at: message.at }));
-  // The log records *that* a whisper happened. It does not record what it said.
+    logger.debug(formatEvent({ type: "message", user: message.sender, room: message.room, text: message.text, at: message.at }),
+      { user: message.sender, room: message.room, bytes: message.text.length }));
+
+  // The log records *that* a whisper happened. It does not record what it said -
+  // and now it cannot, because the text is not passed.
   bus.on("whisper", (from, to) =>
-    log({ type: "whisper", from: from.label, to: to.label, at: Date.now() }));
+    logger.info(`${from.label} whispered to ${to.label}`, { from: from.label, to: to.label }));
   bus.on("kick", (by, target, reason) =>
-    log({ type: "kick", by: by.label, target: target.label, reason, at: Date.now() }));
+    logger.warn(`${by.label} kicked ${target.label}`, { by: by.label, target: target.label, reason }));
   bus.on("rename", (_client, from, to) =>
-    log({ type: "rename", from, to, at: Date.now() }));
+    logger.info(`${from} is now known as ${to}`, { from, to }));
   bus.on("request", (method, path, status) =>
-    log({ type: "system", text: `${method} ${path} → ${status} ${statusLine(status)}`, at: Date.now() }));
+    logger.info(`${method} ${path} → ${status}`, { method, path, status, reason: statusLine(status) }));
   bus.on("upgrade", (id) =>
-    log({ type: "system", text: `${id} upgrading to WebSocket → 101 ${statusLine(101)}`, at: Date.now() }));
-  bus.on("notice", (text) =>
-    log({ type: "system", text, at: Date.now() }));
+    logger.info(`${id} upgrading to WebSocket`, { client: id, status: 101 }));
+  bus.on("notice", (text) => logger.info(text));
+
   // The log is the one audience allowed the whole truth: the stack, not the
-  // sanitised sentence the client was given.
+  // sanitised sentence the client was given. And it is an *error*, which means it
+  // is what an alert fires on.
   bus.on("failure", (source, error) =>
-    log({ type: "system", text: `${source} failed - ${describeThrown(error)}`, at: Date.now() }));
+    logger.error(`${source} failed`, { source, error: describeThrown(error) }));
 
   // Listener 2: the room's memory. Messages are kept so a late joiner can catch
   // up without anyone waiting for a disk.

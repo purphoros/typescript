@@ -100,6 +100,8 @@ export const EnvSchema = z.object({
   JWT_SECRET: z.string().min(16).optional(),
   TOKEN_TTL_SECONDS: z.coerce.number().int().positive().max(60 * 60 * 24 * 30).optional(),
   NODE_ENV: z.enum(["development", "production", "test"]).optional(),
+  LOG_LEVEL: z.enum(["debug", "info", "warn", "error"]).optional(),
+  LOG_FORMAT: z.enum(["pretty", "json"]).optional(),
   PORT: z.coerce.number().int().min(1).max(65535).optional(),
   DATA_DIR: z.string().min(1).optional(),
   HISTORY_LIMIT: z.coerce.number().int().positive().max(10_000).optional(),

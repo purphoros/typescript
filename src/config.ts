@@ -2,6 +2,8 @@
 
 import { parsePort, type RoomName } from "./protocol.js";
 import { EnvSchema } from "./schemas.js";
+import { defaultFormat, type LogFormat, type LogLevel } from "./logger.js";
+import type { CliOptions } from "./cli.js";
 import type { Host, Port } from "./types.js";
 
 // `Readonly<T>` marks every property immutable, so nothing can reassign the
@@ -18,6 +20,8 @@ export type ServerConfig = Readonly<{
   // The HMAC key every token is signed with. Anyone who has it can mint an admin.
   jwtSecret: string;
   tokenTtlSeconds: number;
+  logLevel: LogLevel;
+  logFormat: LogFormat;
 }>;
 
 // `as const` gives every field its literal type and makes the object readonly:
@@ -36,6 +40,8 @@ export const DEFAULTS = {
   // default" for a signing key is a backdoor with good manners.
   jwtSecret: "development-secret-not-for-production",
   tokenTtlSeconds: 60 * 60 * 24,   // 24 hours
+  logLevel: "info",
+  logFormat: "pretty",
 } as const;
 
 // A client that connects and says nothing is assumed to be a human at a
@@ -83,7 +89,7 @@ export function address(host: Host, port: Port): string {
 // server that silently binds to 8080 anyway will be found by somebody at 3am
 // wondering why the load balancer is unhappy. Fail at startup, loudly, where the
 // person who typed it is still watching.
-export function fromEnvironment(env: NodeJS.ProcessEnv, argv: readonly string[]): ServerConfig {
+export function resolveConfig(env: NodeJS.ProcessEnv, cli: CliOptions): ServerConfig {
   const parsed = EnvSchema.safeParse(env);
   if (!parsed.success) {
     const detail = parsed.error.issues
@@ -99,21 +105,20 @@ export function fromEnvironment(env: NodeJS.ProcessEnv, argv: readonly string[])
   //
   // A signing secret with a default is not a default, it is a published private
   // key: every deployment that forgets to set it shares one, and anyone who has
-  // read this file can mint themselves an admin token for any of them. So in
-  // production, its absence is fatal - the server does not start, and says why.
-  //
-  // In development it falls back, loudly. The noise is the feature: a warning you
-  // see every single time you start the server is a warning you will eventually
-  // act on, and a silent fallback is one you will ship.
+  // read this file can mint an admin token for any of them. So in production, its
+  // absence is fatal - the server does not start, and says why.
   if (e.NODE_ENV === "production" && e.JWT_SECRET === undefined) {
     console.error("JWT_SECRET is required in production. Refusing to start with a public default.");
     process.exit(1);
   }
-  if (e.JWT_SECRET === undefined) {
-    console.warn("⚠  JWT_SECRET is not set. Using the development default - do not deploy this.");
-  }
 
   return configure(DEFAULTS, {
+    // Format is the one setting with a *computed* default: pretty when somebody
+    // is watching, JSON when a machine is. Nobody has to choose and nobody has to
+    // remember to.
+    logFormat: defaultFormat(),
+
+    // Environment: what this deployment always wants.
     ...(e.HOST !== undefined ? { host: e.HOST } : {}),
     ...(e.PORT !== undefined ? { port: e.PORT } : {}),
     ...(e.DATA_DIR !== undefined ? { dataDir: e.DATA_DIR } : {}),
@@ -121,7 +126,25 @@ export function fromEnvironment(env: NodeJS.ProcessEnv, argv: readonly string[])
     ...(e.ROOMS !== undefined ? { rooms: e.ROOMS } : {}),
     ...(e.JWT_SECRET !== undefined ? { jwtSecret: e.JWT_SECRET } : {}),
     ...(e.TOKEN_TTL_SECONDS !== undefined ? { tokenTtlSeconds: e.TOKEN_TTL_SECONDS } : {}),
-    // argv last: it beats everything, because you typed it thirty seconds ago.
-    ...(argv[2] !== undefined ? { port: resolvePort(argv[2]) } : {}),
+    ...(e.LOG_LEVEL !== undefined ? { logLevel: e.LOG_LEVEL } : {}),
+    ...(e.LOG_FORMAT !== undefined ? { logFormat: e.LOG_FORMAT } : {}),
+
+    // Command line last, so it beats everything. You typed it thirty seconds ago;
+    // the environment was set by a deploy last March. Specific beats general, and
+    // immediate beats standing - which is not a convention to memorise, it is the
+    // order of how *deliberate* each source is.
+    ...(cli.host !== undefined ? { host: cli.host } : {}),
+    ...(cli.port !== undefined ? { port: cli.port } : {}),
+    ...(cli.rooms !== undefined ? { rooms: cli.rooms } : {}),
+    ...(cli.dataDir !== undefined ? { dataDir: cli.dataDir } : {}),
+    ...(cli.logLevel !== undefined ? { logLevel: cli.logLevel } : {}),
+    ...(cli.logFormat !== undefined ? { logFormat: cli.logFormat } : {}),
   });
+}
+
+// Whether the development JWT default is in play. main.ts warns about it *through
+// the logger*, which did not exist when config.ts was written - so config reports
+// the fact and lets the caller decide how to say it.
+export function usingDefaultSecret(config: ServerConfig): boolean {
+  return config.jwtSecret === DEFAULTS.jwtSecret;
 }
