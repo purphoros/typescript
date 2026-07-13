@@ -55,7 +55,18 @@ async function loggedIn(h: MessageHandler, c: FakeClient, name: string, password
 
 describe("MessageHandler", () => {
   let ctx: Awaited<ReturnType<typeof build>>;
-  beforeEach(async () => { ctx = await build(); });
+
+  // Clean up *before* as well as after.
+  //
+  // afterEach alone is not enough, and this bit me: a previous run that was
+  // interrupted leaves data-test-handler/ on disk, the next run's first test
+  // reads a room with history already in it, and the failure has nothing to do
+  // with the change you just made. A test that depends on the last run having
+  // exited cleanly is a test that will fail on somebody else's machine.
+  beforeEach(async () => {
+    await rm(DATA, { recursive: true, force: true });
+    ctx = await build();
+  });
   afterEach(async () => { await rm(DATA, { recursive: true, force: true }); });
 
   it("refuses everything before you have proved who you are", async () => {
