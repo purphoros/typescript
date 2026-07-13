@@ -14,12 +14,15 @@
 import net from "node:net";
 import { IncomingMessage } from "node:http";
 import { WebSocketServer, WebSocket } from "ws";
+import { Serializer } from "./async.js";
 import { GREETING_DELAY_MS, address, type ServerConfig } from "./config.js";
 import { asError } from "./errors.js";
 import { assertNever, CATALOG } from "./protocol.js";
 import { createBus, type Bus } from "./bus.js";
+import { FileHistory } from "./history.js";
 import { HttpService, HTTP_REQUEST_LINE } from "./http.js";
 import { MessageHandler } from "./handler.js";
+import { ChatMessage } from "./model.js";
 import { Registry } from "./state.js";
 import { TcpClient, WsClient } from "./clients.js";
 import type { PeerKind } from "./types.js";
@@ -27,6 +30,7 @@ import type { PeerKind } from "./types.js";
 export class ChatServer {
   readonly registry: Registry;
   readonly bus: Bus;
+  readonly history: FileHistory;
 
   private readonly handler: MessageHandler;
   private readonly http: HttpService;
@@ -35,9 +39,10 @@ export class ChatServer {
 
   constructor(readonly config: ServerConfig) {
     this.registry = new Registry(config);
-    this.bus = createBus(this.registry);
-    this.handler = new MessageHandler(this.registry, this.bus);
-    this.http = new HttpService(this.registry, this.bus);
+    this.history = new FileHistory(config.dataDir);
+    this.bus = createBus(this.registry, this.history);
+    this.handler = new MessageHandler(this.registry, this.bus, this.history);
+    this.http = new HttpService(this.registry, this.bus, this.history);
 
     // noServer: `ws` opens no port and does no listening. It only ever receives
     // sockets we have already accepted, parsed, and decided to upgrade.
@@ -56,17 +61,64 @@ export class ChatServer {
     });
   }
 
+  // Rehydrate every room from disk, before a single client can connect.
+  //
+  // Promise.allSettled, and the choice matters. Promise.all fails fast: one
+  // corrupt `dev.jsonl` and the whole server refuses to start, taking `general`
+  // and `random` down with it over a room nobody was using. That is a worse
+  // outcome than starting with an empty `dev` and saying so out loud.
+  //
+  // allSettled is the combinator for "do all of these, tell me how each went,
+  // and do not editorialise" - it never rejects, so the caller has to look at
+  // every result and decide. Which is exactly the decision being made here.
+  async load(): Promise<void> {
+    await this.history.open();
+
+    const rooms = [...this.registry.rooms.values()];
+    const results = await Promise.allSettled(
+      rooms.map((room) => this.history.recent(room.name, this.config.historyLimit)),
+    );
+
+    results.forEach((result, index) => {
+      const room = rooms[index];
+      if (room === undefined) {
+        return;
+      }
+      if (result.status === "rejected") {
+        // Best effort. This room starts empty, and the operator finds out why.
+        this.bus.emit("failure", `load ${room.name}`, asError(result.reason));
+        return;
+      }
+      for (const message of result.value) {
+        room.remember(ChatMessage.restore(message));
+      }
+      if (result.value.length > 0) {
+        this.bus.emit("notice", `${room.name}: recovered ${result.value.length} message(s) from disk`);
+      }
+    });
+  }
+
   listen(onReady: () => void): void {
     this.server.listen(this.config.port, this.config.host, onReady);
   }
 
-  // Stop accepting connections, hang up on everyone, then hand back.
-  shutdown(done: () => void): void {
+  // Stop accepting connections, hang up on everyone, wait for the disk, then
+  // hand back.
+  //
+  // The `await` on flush() is the entire reason this is async. Chapter 11's
+  // shutdown called process.exit() as soon as the socket closed - and a queued
+  // append that had not reached the disk yet simply died with the process.
+  // "Durable" means the write finished, and finishing takes time, and you have
+  // to wait for it. This is what waiting looks like.
+  async shutdown(): Promise<void> {
     this.bus.emit("notice", "Shutting down");
     for (const client of this.registry.clients.values()) {
       client.end({ type: "system", text: "Server shutting down." });
     }
-    this.server.close(done);
+
+    await new Promise<void>((resolve) => this.server.close(() => resolve()));
+    await this.history.flush();
+    this.bus.emit("notice", "History flushed. Goodbye.");
   }
 
   get url(): string {
@@ -87,11 +139,25 @@ export class ChatServer {
     // `ws` reassembles frames, so a message arrives whole: one frame, one JSON
     // object. No buffering here - that work was only ever needed because raw TCP
     // has no message boundaries.
+    //
+    // But ordering is still ours to keep. `ws.on("message")` is a synchronous
+    // callback that cannot await, so without this queue two frames arriving back
+    // to back would both start handleLine and race - and a client that sent
+    // {"join"} and then {"chat"} could be told it is not in a room.
+    const queue = new Serializer();
+
     ws.on("message", (data: Buffer) => {
       const text = data.toString("utf8").trim();
-      if (text.length > 0) {
-        this.handler.handleLine(client, text);
+      if (text.length === 0) {
+        return;
       }
+      // `void` says the Promise is deliberately not awaited; `.catch` says
+      // nothing escapes. handleLine already handles everything it can, so this
+      // only fires if sending the error message itself failed - which is exactly
+      // the case that would otherwise be an unhandled rejection.
+      void queue
+        .run(() => this.handler.handleLine(client, text))
+        .catch((thrown: unknown) => this.bus.emit("failure", client.id, asError(thrown)));
     });
 
     ws.on("close", () => {
@@ -121,6 +187,19 @@ export class ChatServer {
   private acceptTcp(socket: net.Socket): void {
     const conn = new TcpClient(socket, this.registry.nextSequence());
 
+    // Everything downstream of here can now await, and that turns out to be a
+    // problem this connection has to solve for itself.
+    //
+    // `socket.on("data")` is a synchronous callback. It cannot await, and Node
+    // will happily fire it again while the previous one is still suspended at an
+    // `await` - so two chunks arriving back to back would both be reading and
+    // consuming the *same* buffer, concurrently, and a half-parsed HTTP request
+    // would be read twice.
+    //
+    // The queue restores what a synchronous `for` loop used to give for free:
+    // chunk two is not looked at until chunk one is completely dealt with.
+    const queue = new Serializer();
+
     // A browser or curl sends its request immediately, so we can read it and
     // know. A person at a terminal sends nothing until they type - so if the
     // line never comes, assume a human and greet them.
@@ -132,68 +211,19 @@ export class ChatServer {
       }
     }, GREETING_DELAY_MS);
 
+    const detach = (): void => {
+      socket.off("data", onData);
+      socket.off("close", onClose);
+      socket.off("error", onError);
+    };
+
+    // Buffer first, synchronously - the bytes must be captured before anything
+    // yields - then queue the work that may wait.
     const onData = (chunk: Buffer): void => {
       conn.append(chunk);
-
-      if (conn.mode === "unknown") {
-        const detected = this.sniff(conn);
-        if (detected === undefined) {
-          return; // not even one line yet
-        }
-        clearTimeout(greeting);
-        conn.becomes(detected);
-        if (detected === "chat") {
-          conn.markConnected();
-          this.handler.welcome(conn);
-        }
-      }
-
-      if (conn.mode === "http") {
-        const outcome = this.http.read(conn);
-        switch (outcome.kind) {
-          case "incomplete":
-          case "handled":
-            return;
-
-          case "upgrade": {
-            // The socket stops being ours. Detach every listener before handing
-            // it over, or we would keep trying to read WebSocket frames as text.
-            socket.off("data", onData);
-            socket.off("close", onClose);
-            socket.off("error", onError);
-            clearTimeout(greeting);
-
-            // A genuine IncomingMessage, built from the request we parsed by
-            // hand in Chapter 6. No cast, no lie: `ws` gets what it expects.
-            const request = new IncomingMessage(socket);
-            request.method = outcome.request.method;
-            request.url = outcome.request.path;
-            request.httpVersion = "1.1";
-            request.headers = Object.fromEntries(outcome.request.headers);
-
-            this.bus.emit("upgrade", conn.id);
-
-            // ws computes Sec-WebSocket-Accept, writes the 101, and owns the
-            // socket from here on.
-            this.wss.handleUpgrade(request, socket, outcome.head, (ws) => {
-              this.wss.emit("connection", ws, request);
-            });
-            return;
-          }
-
-          default:
-            return assertNever(outcome);
-        }
-      }
-
-      // One line, one JSON object. The framing from Chapter 5 is what makes that
-      // sentence true.
-      for (const line of conn.takeLines()) {
-        const text = line.trim();
-        if (text.length > 0) {
-          this.handler.handleLine(conn, text);
-        }
-      }
+      void queue
+        .run(() => this.process(conn, socket, greeting, detach))
+        .catch((thrown: unknown) => this.bus.emit("failure", conn.id, asError(thrown)));
     };
 
     const onClose = (): void => {
@@ -212,6 +242,78 @@ export class ChatServer {
     socket.on("data", onData);
     socket.on("close", onClose);
     socket.on("error", onError);
+  }
+
+  // Whatever is in the buffer, dealt with completely. Runs one at a time per
+  // connection - see the Serializer above.
+  private async process(
+    conn: TcpClient,
+    socket: net.Socket,
+    greeting: NodeJS.Timeout,
+    detach: () => void,
+  ): Promise<void> {
+    if (conn.mode === "unknown") {
+      const detected = this.sniff(conn);
+      if (detected === undefined) {
+        return; // not even one line yet
+      }
+      clearTimeout(greeting);
+      conn.becomes(detected);
+      if (detected === "chat") {
+        conn.markConnected();
+        this.handler.welcome(conn);
+      }
+    }
+
+    if (conn.mode === "http") {
+      const outcome = await this.http.read(conn);
+      switch (outcome.kind) {
+        case "incomplete":
+        case "handled":
+          return;
+
+        case "upgrade": {
+          // The socket stops being ours. Detach every listener before handing it
+          // over, or we would keep trying to read WebSocket frames as text.
+          detach();
+          clearTimeout(greeting);
+
+          // A genuine IncomingMessage, built from the request we parsed by hand
+          // in Chapter 6. No cast, no lie: `ws` gets what it expects.
+          const request = new IncomingMessage(socket);
+          request.method = outcome.request.method;
+          request.url = outcome.request.path;
+          request.httpVersion = "1.1";
+          request.headers = Object.fromEntries(outcome.request.headers);
+
+          this.bus.emit("upgrade", conn.id);
+
+          // ws computes Sec-WebSocket-Accept, writes the 101, and owns the
+          // socket from here on.
+          this.wss.handleUpgrade(request, socket, outcome.head, (ws) => {
+            this.wss.emit("connection", ws, request);
+          });
+          return;
+        }
+
+        default:
+          return assertNever(outcome);
+      }
+    }
+
+    // One line, one JSON object. The framing from Chapter 5 is what makes that
+    // sentence true.
+    //
+    // `await` inside the loop, and deliberately so: these are messages from one
+    // client, in the order that client sent them, and running them concurrently
+    // would be reordering somebody's conversation. This is the case where
+    // sequential is not a missed optimisation - it is the requirement.
+    for (const line of conn.takeLines()) {
+      const text = line.trim();
+      if (text.length > 0) {
+        await this.handler.handleLine(conn, text);
+      }
+    }
   }
 
   // What to print once it is up. The server knows its own address; index.ts

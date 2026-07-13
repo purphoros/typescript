@@ -10,6 +10,7 @@ import { statusLine, type Bus } from "./bus.js";
 import { COMMANDS, type MessageSummary } from "./protocol.js";
 import { chatPage } from "./page.js";
 import { describeRoom, summarize } from "./views.js";
+import type { FileHistory } from "./history.js";
 import type { Registry } from "./state.js";
 import type { TcpClient } from "./clients.js";
 
@@ -112,6 +113,7 @@ export class HttpService {
   constructor(
     private readonly registry: Registry,
     private readonly bus: Bus,
+    private readonly history: FileHistory,
   ) {}
 
   // The server's own state, served over HTTP. The chat rooms and the web page
@@ -119,7 +121,7 @@ export class HttpService {
   //
   // This may throw, and does: requireRoomNamed raises the very same
   // NotFoundError the chat side raises. The boundary below turns it into a 404.
-  private route(req: HttpRequest): HttpResponse {
+  private async route(req: HttpRequest): Promise<HttpResponse> {
     const { registry } = this;
 
     if (req.path === "/" && req.method === "GET") {
@@ -153,12 +155,26 @@ export class HttpService {
     const named = /^\/api\/rooms\/([^/]+)$/.exec(req.path);
     if (named?.[1] !== undefined && req.method === "GET") {
       const room = registry.requireRoomNamed(decodeURIComponent(named[1]));
-      return json(200, { ...describeRoom(room), recent: room.recent(10).map(summarize) });
+      return json(200, { ...describeRoom(room), recent: await this.history.recent(room.name, 10) });
     }
 
+    // Every room's archive, read concurrently.
+    //
+    // Promise.all is the point here. The sequential version - `for (const room
+    // of rooms) { out.push(await read(room)) }` - reads three files one after
+    // another and takes as long as all three added up, for no reason: none of
+    // them depends on any other. Promise.all starts all three and waits for the
+    // slowest. Three files is not much; three hundred is the difference between
+    // a page load and a timeout.
+    //
+    // It fails fast, and here that is correct: this endpoint promises the whole
+    // archive, and two thirds of the archive is not a smaller success, it is a
+    // wrong answer delivered confidently.
     if (req.path === "/api/history" && req.method === "GET") {
-      const recent: MessageSummary[] = [...registry.rooms.values()]
-        .flatMap((room) => room.recent(10).map(summarize));
+      const perRoom = await Promise.all(
+        [...registry.rooms.keys()].map((room) => this.history.recent(room, 10)),
+      );
+      const recent: MessageSummary[] = perRoom.flat();
       return json(200, recent);
     }
 
@@ -184,9 +200,14 @@ export class HttpService {
   // route() throws the very same ChatErrors handleMessage does; the only
   // difference is that here the ChatError's `status` becomes the status line,
   // where over there its `code` became a ServerMessage.
-  private respond(request: HttpRequest | null): HttpResponse {
+  private async respond(request: HttpRequest | null): Promise<HttpResponse> {
     try {
-      return request === null ? json(400, { error: "Bad Request" }) : this.route(request);
+      // `await` here is not decoration. Drop it and `route` returns a Promise
+      // that this try/catch cannot see into - a rejection would sail straight
+      // past the catch and out through the process's unhandledRejection net.
+      // "return await" inside a try is one of the few places the redundant-
+      // looking await is doing essential work.
+      return request === null ? json(400, { error: "Bad Request" }) : await this.route(request);
     } catch (thrown: unknown) {
       const safe = toSafeError(thrown);
       if (!(thrown instanceof ChatError)) {
@@ -203,7 +224,7 @@ export class HttpService {
   // Consume as much of the buffer as forms a complete request. Either the
   // request is still arriving, or it has been answered, or it wants to become a
   // WebSocket and the caller must hand the socket over.
-  read(conn: TcpClient): HttpOutcome {
+  async read(conn: TcpClient): Promise<HttpOutcome> {
     const buffered = conn.pending;
     const headerEnd = buffered.indexOf(HEADERS_END);
     if (headerEnd === -1) {
@@ -237,7 +258,7 @@ export class HttpService {
 
     conn.consume(bodyStart + contentLength);
 
-    const response = this.respond(request);
+    const response = await this.respond(request);
     this.bus.emit("request", request?.method ?? "?", request?.path ?? "?", response.status);
 
     conn.write(serializeResponse(response));

@@ -25,6 +25,8 @@ export { Registry } from "./state.js";
 export { MessageHandler } from "./handler.js";
 export { HttpService } from "./http.js";
 export { ChatRoom, ChatMessage } from "./model.js";
+export { FileHistory } from "./history.js";
+export { Serializer, withTimeout, delay } from "./async.js";
 export { BaseClient, TcpClient, WsClient } from "./clients.js";
 export { TypedEmitter, RingBuffer, pluck } from "./events.js";
 export { createBus, formatEvent, statusLine } from "./bus.js";
@@ -39,6 +41,7 @@ export {
   NotFoundError,
   PermissionError,
   StateError,
+  TimeoutError,
   ErrorCode,
   ok,
   err,

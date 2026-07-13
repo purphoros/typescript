@@ -6,7 +6,7 @@
 // clients) sits above it rather than inside it.
 
 import { RingBuffer } from "./events.js";
-import type { RoomName, Timestamp, UserId } from "./protocol.js";
+import type { MessageSummary, RoomName, Timestamp, UserId } from "./protocol.js";
 import type { Identifiable, Message, Serializable } from "./types.js";
 
 // State plus behaviour: a room owns its membership and its history, and decides
@@ -71,9 +71,22 @@ export class ChatMessage implements Message, Serializable {
     public text: string,
     public room: RoomName,
     public readonly replyTo?: string,
+    at: Timestamp = Date.now(),
   ) {
     this.id = crypto.randomUUID();
-    this.at = Date.now();
+    this.at = at;
+  }
+
+  // A message read back from disk did not happen just now.
+  //
+  // This exists because of a bug that only showed up by running the thing: the
+  // first version rebuilt the archive with `new ChatMessage(sender, text, room)`
+  // at startup, and `at` defaulted to Date.now(). Every restart quietly restamped
+  // the entire history with the boot time - the file on disk was right, and
+  // everything the server said about it was wrong. Persistence means preserving
+  // *when*, not just what.
+  static restore(summary: MessageSummary): ChatMessage {
+    return new ChatMessage(summary.sender, summary.text, summary.room, undefined, summary.at);
   }
 
   serialize(): string {

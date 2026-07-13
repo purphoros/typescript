@@ -7,8 +7,10 @@
 // listeners below could be deleted and handler.ts would still compile.
 
 import { TypedEmitter } from "./events.js";
-import { describeThrown } from "./errors.js";
+import { asError, describeThrown } from "./errors.js";
 import { assertNever, type RoomName, type ServerMessage, type Timestamp, type UserId } from "./protocol.js";
+import { summarize } from "./views.js";
+import type { FileHistory } from "./history.js";
 import type { ChatMessage } from "./model.js";
 import type { Registry } from "./state.js";
 import type { ChatClient } from "./types.js";
@@ -88,10 +90,10 @@ export function statusLine(code: number): string {
   }
 }
 
-// Build a bus and subscribe everything that cares. The registry is a parameter
-// rather than an import, which is what lets Chapter 19 build a bus over a
-// throwaway registry and assert on what it broadcast.
-export function createBus(registry: Registry): Bus {
+// Build a bus and subscribe everything that cares. The registry and the history
+// are parameters rather than imports, which is what lets Chapter 19 build a bus
+// over a throwaway registry and assert on what it broadcast.
+export function createBus(registry: Registry, history: FileHistory): Bus {
   const bus: Bus = new TypedEmitter<ServerEvents>();
   const log = (event: ChatEvent): void => console.log(formatEvent(event));
 
@@ -122,9 +124,38 @@ export function createBus(registry: Registry): Bus {
   bus.on("failure", (source, error) =>
     log({ type: "system", text: `${source} failed - ${describeThrown(error)}`, at: Date.now() }));
 
-  // Listener 2: the room's memory. Messages are kept so a late joiner can catch up.
+  // Listener 2: the room's memory. Messages are kept so a late joiner can catch
+  // up without anyone waiting for a disk.
   bus.on("message", (message) => {
     registry.rooms.get(message.room)?.remember(message);
+  });
+
+  // Listener 2b: the archive. And this is the most instructive line in the
+  // chapter, so it is worth being slow about.
+  //
+  // A listener's signature is `(message: ChatMessage) => void`. It returns
+  // nothing, and the emitter that calls it is synchronous - it cannot await, it
+  // has no idea what a Promise is, and it will not wait for one. But an `async`
+  // listener is still assignable here, because `Promise<void>` is assignable to
+  // `void`. TypeScript allows it deliberately, and it is the single easiest way
+  // to lose data in Node:
+  //
+  //     bus.on("message", async (m) => { await history.append(m); });   // NO
+  //
+  // That compiles. It even works, right up until the write fails - and then
+  // nobody is holding the Promise, the rejection is unhandled, and Node kills
+  // the process. The main.ts net catches it and exits, which is correct and is
+  // also your chat server going down because one disk write failed.
+  //
+  // So the listener stays synchronous and owns its own failure. `void` says the
+  // Promise is deliberately not awaited, and `.catch` is the promise that
+  // nothing escapes. Fire-and-forget is a legitimate choice - a chat message is
+  // delivered whether or not it was archived - but it is only legitimate when
+  // the forgetting is *explicit*.
+  bus.on("message", (message) => {
+    void history
+      .append(summarize(message))
+      .catch((thrown: unknown) => bus.emit("failure", `archive ${message.room}`, asError(thrown)));
   });
 
   // Listener 3: the wire. This is what actually delivers chat to other people.

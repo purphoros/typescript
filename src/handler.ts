@@ -26,6 +26,7 @@ import { ChatMessage, type ChatRoom } from "./model.js";
 import { isAdmin, type ChatClient } from "./types.js";
 import { describeClient, describeRoom, summarize } from "./views.js";
 import type { Bus } from "./bus.js";
+import type { FileHistory } from "./history.js";
 import type { Registry } from "./state.js";
 
 function formatDuration(ms: number): string {
@@ -42,17 +43,25 @@ export function toErrorMessage(thrown: unknown): ServerMessage {
 }
 
 export class MessageHandler {
-  // The registry and the bus arrive as constructor arguments rather than
-  // imports. That one change is what makes this class a unit: give it a
+  // The registry, the bus and the history arrive as constructor arguments rather
+  // than imports. That one change is what makes this class a unit: give it a
   // different registry and it manages a different world, which is precisely what
   // a test wants to do.
   constructor(
     private readonly registry: Registry,
     private readonly bus: Bus,
+    private readonly history: FileHistory,
   ) {}
 
   // The error boundary. Every line from every client, on either transport,
   // passes through exactly here, and nothing thrown below it escapes.
+  //
+  // It is `async` now, and the try/catch did not have to change one character.
+  // That is the actual gift of async/await, and it is easy to walk past: an
+  // `await` that rejects throws at the await, so the same `catch` that has been
+  // handling synchronous failures since Chapter 10 handles a disk that is on
+  // fire. Compare the `.then().catch()` version, where the error path is a
+  // different mechanism in a different place from the success path.
   //
   // Three outcomes, and they are genuinely different:
   //
@@ -61,14 +70,14 @@ export class MessageHandler {
   //   something threw       → if it is ours, it was deliberate and safe to
   //                           repeat. If not, it is a bug: log the stack, and
   //                           tell them nothing.
-  handleLine(client: ChatClient, line: string): void {
+  async handleLine(client: ChatClient, line: string): Promise<void> {
     try {
       const decoded = decodeClientMessage(line);
       if (!decoded.ok) {
         client.send(toErrorMessage(decoded.error));
         return;
       }
-      this.handleMessage(client, decoded.value);
+      await this.handleMessage(client, decoded.value);
     } catch (thrown: unknown) {
       if (!(thrown instanceof ChatError)) {
         this.bus.emit("failure", client.label, asError(thrown));
@@ -100,7 +109,8 @@ export class MessageHandler {
     this.bus.emit("disconnect", client, this.registry.clients.size);
   }
 
-  // Show a client what it missed.
+  // Show a client what it missed, from memory. Nobody waits for a disk to join a
+  // room - this is the hot path, and it is synchronous on purpose.
   private replay(client: ChatClient, room: ChatRoom, count: number): void {
     client.send({
       type: "history",
@@ -116,7 +126,7 @@ export class MessageHandler {
   // is the only path here. And assertNever at the bottom is the guarantee that
   // every ClientMessage variant is handled - add a thirteenth and this stops
   // compiling.
-  private handleMessage(client: ChatClient, message: ClientMessage): void {
+  private async handleMessage(client: ChatClient, message: ClientMessage): Promise<void> {
     const { registry, bus } = this;
 
     switch (message.type) {
@@ -133,8 +143,21 @@ export class MessageHandler {
         return;
 
       case "history": {
+        // The one place in the whole server that waits.
+        //
+        // Join replay comes from the RingBuffer - fast, in memory, no I/O. But
+        // an explicit history request may ask for more than memory holds, so it
+        // reads the archive. That is the entire justification for this chapter
+        // existing: the deep query is on a disk, and a disk takes time.
+        //
+        // If this throws - a bad disk, a permissions error, a timeout - the
+        // `await` rethrows it into handleLine's catch, which is the same catch
+        // that has been handling synchronous failures since Chapter 10. Nothing
+        // about the error path had to be rebuilt for async.
         const room = registry.requireRoom(client);
-        this.replay(client, room, message.limit ?? room.messageCount);
+        const limit = message.limit ?? room.messageCount;
+        const messages = await this.history.recent(room.name, limit);
+        client.send({ type: "history", room: room.name, messages });
         return;
       }
 

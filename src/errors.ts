@@ -57,6 +57,7 @@ export enum ErrorCode {
   NotInRoom = "not_in_room",
   NoSuchTarget = "no_such_target",
   NotPermitted = "not_permitted",
+  Timeout = "timeout",
   Internal = "internal",
 }
 
@@ -117,6 +118,16 @@ export class PermissionError extends ChatError {
 export class StateError extends ChatError {
   constructor(message: string, code: ErrorCode = ErrorCode.NotInRoom) {
     super(message, code, 409);
+  }
+}
+
+// We waited, and it did not come back. Note what this does *not* mean: the work
+// is not cancelled and may still succeed - a Promise cannot be un-started. All
+// this says is that we have stopped waiting, which is the only thing we ever had
+// the power to do. See withTimeout in async.ts.
+export class TimeoutError extends ChatError {
+  constructor(message: string) {
+    super(message, ErrorCode.Timeout, 504);
   }
 }
 

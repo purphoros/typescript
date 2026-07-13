@@ -10,6 +10,7 @@ export type ServerConfig = Readonly<{
   port: Port;
   rooms: readonly RoomName[];
   historyLimit: number;
+  dataDir: string;
 }>;
 
 // `as const` gives every field its literal type and makes the object readonly:
@@ -18,7 +19,10 @@ export const DEFAULTS = {
   host: "127.0.0.1",
   port: 8080,
   rooms: ["general", "random", "dev"],
+  // How many messages a room keeps in memory. Beyond this, a history request
+  // goes to disk - which is the whole reason Chapter 12 has anything to await.
   historyLimit: 50,
+  dataDir: "data",
 } as const;
 
 // A client that connects and says nothing is assumed to be a human at a
