@@ -8,33 +8,35 @@ A hands-on guide to learning TypeScript by incrementally building a WebSocket-ba
 
 | # | Chapter | Topic |
 |---|---------|-------|
-| 01 | [Hello, TypeScript](docs/Chapter1.md) | Installing the toolchain, first project, how TypeScript compiles to JavaScript |
-| 02 | [TypeScript Fundamentals](docs/Chapter2.md) | Variables, functions, primitives, type annotations |
-| 03 | [The Type System](docs/Chapter3.md) | Structural typing, inference, narrowing |
-| 04 | [Interfaces, Objects & Classes](docs/Chapter4.md) | Object shapes, access modifiers, inheritance |
-| 05 | [Your First TCP Server](docs/Chapter5.md) | Raw sockets with the `net` module |
-| 06 | [Understanding HTTP](docs/Chapter6.md) | Requests, responses, and the HTTP server |
-| 07 | [WebSocket Fundamentals](docs/Chapter7.md) | The upgrade handshake and framing |
-| 08 | [Generics](docs/Chapter8.md) | Reusable, type-safe abstractions |
-| 09 | [Enums & Discriminated Unions](docs/Chapter9.md) | Modeling message protocols |
-| 10 | [Error Handling](docs/Chapter10.md) | Errors, results, and failure modes |
-| 11 | [Modules & Project Structure](docs/Chapter11.md) | Imports, exports, organizing the codebase |
-| 12 | [Async/Await & Promises](docs/Chapter12.md) | Asynchronous control flow |
-| 13 | [Advanced Types](docs/Chapter13.md) | Mapped, conditional, and utility types |
-| 14 | [JSON & Validation](docs/Chapter14.md) | Parsing and validating untrusted input |
-| 15 | [The Node.js Runtime](docs/Chapter15.md) | Event loop, streams, buffers |
-| 16 | [Chat Server Core](docs/Chapter16.md) | Rooms, clients, and broadcast |
-| 17 | [Authentication & Sessions](docs/Chapter17.md) | Identity and session handling |
-| 18 | [Decorators & Metadata](docs/Chapter18.md) | Decorators and reflection |
-| 19 | [Testing](docs/Chapter19.md) | Unit and integration tests |
-| 20 | [Logging, Config & CLI](docs/Chapter20.md) | _Not yet published_ |
-| 21 | [Database Persistence](docs/Chapter21.md) | _Not yet published_ |
-| 22 | [REST API](docs/Chapter22.md) | _Not yet published_ |
-| 23 | [Real-Time Features](docs/Chapter23.md) | _Not yet published_ |
-| 24 | [Security & Hardening](docs/Chapter24.md) | _Not yet published_ |
-| 25 | [Packaging & Deployment](docs/Chapter25.md) | _Not yet published_ |
+| 01 | [Hello, TypeScript](https://github.com/purphoros/typescript/blob/chapter1/README.md) | Installing the toolchain, first project, how TypeScript compiles to JavaScript |
+| 02 | [TypeScript Fundamentals](https://github.com/purphoros/typescript/blob/chapter2/README.md) | Variables, functions, primitives, type annotations |
+| 03 | [The Type System](https://github.com/purphoros/typescript/blob/chapter3/README.md) | Structural typing, inference, narrowing |
+| 04 | [Interfaces, Objects & Classes](https://github.com/purphoros/typescript/blob/chapter4/README.md) | Object shapes, access modifiers, inheritance |
+| 05 | [Your First TCP Server](https://github.com/purphoros/typescript/blob/chapter5/README.md) | Raw sockets with the `net` module |
+| 06 | [Understanding HTTP](https://github.com/purphoros/typescript/blob/chapter6/README.md) | Requests, responses, and the HTTP server |
+| 07 | [WebSocket Fundamentals](https://github.com/purphoros/typescript/blob/chapter7/README.md) | The upgrade handshake and framing |
+| 08 | [Generics](https://github.com/purphoros/typescript/blob/chapter8/README.md) | Reusable, type-safe abstractions |
+| 09 | [Enums & Discriminated Unions](https://github.com/purphoros/typescript/blob/chapter9/README.md) | Modeling message protocols |
+| 10 | [Error Handling](https://github.com/purphoros/typescript/blob/chapter10/README.md) | Errors, results, and failure modes |
+| 11 | [Modules & Project Structure](https://github.com/purphoros/typescript/blob/chapter11/README.md) | Imports, exports, organizing the codebase |
+| 12 | [Async/Await & Promises](https://github.com/purphoros/typescript/blob/chapter12/README.md) | Asynchronous control flow |
+| 13 | [Advanced Types](https://github.com/purphoros/typescript/blob/chapter13/README.md) | Mapped, conditional, and utility types |
+| 14 | [JSON & Validation](https://github.com/purphoros/typescript/blob/chapter14/README.md) | Parsing and validating untrusted input |
+| 15 | [The Node.js Runtime](https://github.com/purphoros/typescript/blob/chapter15/README.md) | Event loop, streams, buffers |
+| 16 | [Chat Server Core](https://github.com/purphoros/typescript/blob/chapter16/README.md) | Rooms, clients, and broadcast |
+| 17 | [Authentication & Sessions](https://github.com/purphoros/typescript/blob/chapter17/README.md) | Identity and session handling |
+| 18 | [Decorators & Metadata](https://github.com/purphoros/typescript/blob/chapter18/README.md) | Decorators and reflection |
+| 19 | [Testing](https://github.com/purphoros/typescript/blob/chapter19/README.md) | Unit and integration tests |
+| 20 | [Logging, Config & CLI](https://github.com/purphoros/typescript/blob/chapter20/README.md) | Structured logging, config precedence, a real CLI with `parseArgs` |
+| 21 | [Database Persistence](https://github.com/purphoros/typescript/blob/chapter21/README.md) | SQLite, migrations, indexes, transactions, bound parameters |
+| 22 | [REST API](https://github.com/purphoros/typescript/blob/chapter22/README.md) | Bearer auth on HTTP, cursor pagination, status codes that mean things |
+| 23 | [Real-Time Features](https://github.com/purphoros/typescript/blob/chapter23/README.md) | Heartbeats, presence, typing indicators, and reaping the dead |
+| 24 | [Security & Hardening](https://github.com/purphoros/typescript/blob/chapter24/README.md) | Cross-site WebSocket hijacking, CSP, connection limits |
+| 25 | [Packaging & Deployment](https://github.com/purphoros/typescript/blob/chapter25/README.md) | Multi-stage Docker, non-root, CI, and what npm was about to publish |
 
-Chapters 20-25 are listed in the upstream table of contents but have not been written yet; their files are placeholders that link back to the source.
+Each chapter lives on its own branch, built on the one before it - `chapter1` through `chapter25` - so you can check one out and run exactly the code that chapter describes. The chapter text is that branch's `README.md`.
+
+Chapters 20-25 have not been published upstream. They were written for this repository from the chapter titles; the code is real and verified, and each says so at the top.
 
 ---
 
