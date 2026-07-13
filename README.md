@@ -1,260 +1,316 @@
-# Chapter 03 - The Type System
+# Chapter 04 - Interfaces, Objects & Classes
 
-Union types, narrowing, literal types, type aliases, and type guards - the tools that make TypeScript more than "JavaScript with annotations."
+Define shapes for data with interfaces, add behavior with classes, and know when to use each - the building blocks for our chat server's types.
 
-## Type Inference - When You Don't Need Annotations
+## Defining Interfaces for Object Shapes
 
-TypeScript infers types from context. You don't need to annotate everything - the compiler figures it out from the value, the return statement, or how a variable is used:
-
-```typescript
-// Inferred from the value
-const port = 8080;           // type: number (not just "number" - literally 8080, see below)
-const host = "localhost";    // type: "localhost" (literal type!)
-let count = 0;               // type: number (let widens the type)
-
-// Inferred from the return statement
-function double(n: number) {
-  return n * 2;              // return type inferred as number
-}
-
-// Inferred from array contents
-const rooms = ["general", "random"];  // type: string[]
-const mixed = [1, "two", true];       // type: (string | number | boolean)[]
-```
-
-> **Tip**
->
-> `const` declarations get **literal types**: `const port = 8080` has type `8080`, not `number`. `let` declarations get widened types: `let port = 8080` has type `number`. This is because `let` can be reassigned - the compiler keeps the type broad.
-
-## Union Types and Narrowing
-
-A **union type** says "this value can be one of several types." It's written with `|`:
+An `interface` describes the shape of an object - what properties it has and what types they are. It's a compile-time contract, erased from the JavaScript output.
 
 ```typescript
-// This value can be a string or a number
-type MessageId = string | number;
-
-let id: MessageId = "abc-123";
-id = 42;  // also fine
-
-// Function that accepts multiple types
-function formatId(id: string | number): string {
-  // Can't call string methods directly - id might be a number!
-  // id.toUpperCase(); // ERROR
-
-  // "Narrowing" - check the type at runtime, compiler refines the type
-  if (typeof id === "string") {
-    return id.toUpperCase();  // OK - TypeScript knows id is string here
-  } else {
-    return `#${id}`;          // OK - TypeScript knows id is number here
-  }
+interface User {
+  id: string;
+  name: string;
+  joinedAt: number;
 }
-```
 
-**Narrowing** is TypeScript's killer feature. When you check the type with `typeof`, `instanceof`, or a property check, the compiler refines the type inside that branch. You get autocompletion and type safety that follows your runtime logic.
+// Objects must match the shape exactly
+const alice: User = {
+  id: "u1",
+  name: "alice",
+  joinedAt: Date.now(),
+};
+
+// Missing or extra properties are compile errors:
+// const bad: User = { id: "u2", name: "bob" };
+//   ERROR: Property 'joinedAt' is missing
+// const extra: User = { id: "u3", name: "carol", age: 25 };
+//   ERROR: 'age' does not exist in type 'User'
+```
 
 > **Note**
 >
-> Narrowing is what makes unions usable. You declare the variants in the type, then distinguish them with an ordinary runtime check - `typeof`, `instanceof`, a property test. The compiler follows that check and refines the type inside each branch, so the safety falls out of code you would have written anyway.
+> `interface` vs `type`: both define object shapes. Interfaces can be **extended** and **merged**(two declarations with the same name combine). Types support unions and intersections. For object shapes, prefer `interface`. For unions and complex types, use `type`.
 
-## Literal Types and as const
-
-A literal type is a type that represents a specific value, not just a category:
+## Optional Properties and Readonly
 
 ```typescript
-// Literal types - exact values, not just categories
-type Direction = "north" | "south" | "east" | "west";
-type StatusCode = 200 | 404 | 500;
-type Toggle = true | false;  // same as boolean, but explicit
-
-function move(dir: Direction): void {
-  console.log(`Moving ${dir}`);
+interface Message {
+  readonly id: string;       // can't be changed after creation
+  sender: string;
+  text: string;
+  room: string;
+  replyTo?: string;          // optional - may or may not exist
+  editedAt?: number;         // optional
 }
 
-move("north");  // OK
-// move("up");  // ERROR: "up" is not assignable to Direction
+const msg: Message = {
+  id: "m1",
+  sender: "alice",
+  text: "Hello!",
+  room: "general",
+  // replyTo and editedAt omitted - they're optional
+};
 
-// as const - makes an object/array deeply readonly with literal types
-const config = {
-  host: "localhost",
-  port: 8080,
-  rooms: ["general", "dev"],
-} as const;
+// msg.id = "m2";  // ERROR: Cannot assign to 'id' because it is read-only
+msg.text = "Hello, edited!";  // fine - not readonly
+```
 
-// config.host has type "localhost" (not string)
-// config.port has type 8080 (not number)
-// config.rooms has type readonly ["general", "dev"] (not string[])
-// config.port = 3000;  // ERROR: Cannot assign to 'port' because it is read-only
+`readonly` prevents reassignment after creation. It's a compile-time check only - not enforced at runtime (JavaScript has no concept of readonly properties on plain objects).
+
+`?` makes a property optional. Its type becomes `T | undefined` - you must check for `undefined` before using it.
+
+## Extending Interfaces
+
+```typescript
+interface User {
+  id: string;
+  name: string;
+}
+
+// AdminUser has everything User has, plus adminLevel
+interface AdminUser extends User {
+  adminLevel: number;
+  permissions: string[];
+}
+
+const admin: AdminUser = {
+  id: "u1",
+  name: "alice",
+  adminLevel: 2,
+  permissions: ["kick", "ban", "mute"],
+};
+
+// AdminUser IS-A User - you can pass it anywhere a User is expected
+function greet(user: User): string {
+  return `Hello, ${user.name}!`;
+}
+
+greet(admin);  // fine - AdminUser extends User
 ```
 
 > **Tip**
 >
-> `as const` is powerful for configuration objects and lookup tables. It gives you the narrowest possible types and prevents accidental mutation. Use it whenever you have a fixed set of values known at compile time.
+> TypeScript uses **structural typing** (duck typing). If an object has all the required properties, it satisfies the interface - even without an explicit `implements`. An `AdminUser` works as a `User` because it has `id` and `name`.
 
-## Type Aliases with type
+## Classes with Typed Properties and Methods
 
-`type` creates a name for any type - unions, objects, tuples, functions:
+Classes combine data and behavior. In our chat server, we'll use classes for stateful objects like rooms and connections:
 
 ```typescript
-// Simple alias
-type Port = number;
-type Host = string;
-
-// Union alias
-type MessageId = string | number;
-
-// Object shape
-type User = {
+class ChatRoom {
   name: string;
-  port: number;
-  isAdmin: boolean;
-};
+  private members: Set<string> = new Set();
+  readonly createdAt: number;
 
-// Function type
-type MessageHandler = (sender: string, text: string) => void;
+  constructor(name: string) {
+    this.name = name;
+    this.createdAt = Date.now();
+  }
 
-// Tuple alias
-type HostPort = [string, number];
+  join(userId: string): void {
+    this.members.add(userId);
+  }
 
-// Using the aliases
-const user: User = { name: "alice", port: 8080, isAdmin: false };
-const handler: MessageHandler = (sender, text) => {
-  console.log(`${sender}: ${text}`);
-};
+  leave(userId: string): boolean {
+    return this.members.delete(userId);
+  }
+
+  hasMember(userId: string): boolean {
+    return this.members.has(userId);
+  }
+
+  get memberCount(): number {
+    return this.members.size;
+  }
+
+  get memberList(): string[] {
+    return [...this.members];
+  }
+}
+
+const room = new ChatRoom("general");
+room.join("alice");
+room.join("bob");
+console.log(room.memberCount);   // 2
+console.log(room.memberList);    // ["alice", "bob"]
+// room.members;  // ERROR: 'members' is private
 ```
 
-Type aliases are **erased at runtime** - like all TypeScript types. `type User =...` doesn't create a class or a constructor. It's just a name the compiler uses for checking. The JavaScript output has no trace of it.
+## Access Modifiers: public, private, protected
 
-## The unknown and never Types
-
-Two special types that sit at opposite ends of the type system:
+| Modifier | Accessible from | Use for |
+|---|---|---|
+| public | Anywhere (default) | API surface - methods callers use |
+| private | Same class only | Internal state - implementation details |
+| protected | Same class + subclasses | Extension points - things subclasses override |
+| readonly | Anywhere (read), constructor (write) | Immutable after construction |
 
 ```typescript
-// unknown - "I don't know what this is yet"
-// You MUST narrow it before using it. Safe alternative to 'any'.
-function handleInput(data: unknown): string {
-  // data.toUpperCase();  // ERROR - can't use unknown directly
+class Connection {
+  // Constructor parameter shorthand - declares AND initializes properties
+  constructor(
+    public readonly id: string,
+    private socket: unknown,
+    protected authenticated: boolean = false,
+  ) {}
 
-  if (typeof data === "string") {
-    return data.toUpperCase();  // OK - narrowed to string
+  // public - anyone can call
+  send(data: string): void {
+    console.log(`[${this.id}] Sending: ${data}`);
   }
-  if (typeof data === "number") {
-    return data.toString();     // OK - narrowed to number
+
+  // private - only this class
+  private resetSocket(): void {
+    this.socket = null;
   }
-  return String(data);          // fallback
-}
 
-// never - "this can never happen"
-// Used for exhaustive checks and functions that never return.
-function assertNever(value: never): never {
-  throw new Error(`Unexpected value: ${value}`);
-}
-
-type Command = "join" | "leave" | "msg";
-
-function handle(cmd: Command): string {
-  switch (cmd) {
-    case "join": return "Joining...";
-    case "leave": return "Leaving...";
-    case "msg": return "Messaging...";
-    default: return assertNever(cmd);  // compiler error if a case is missing
+  // protected - this class + subclasses
+  protected setAuthenticated(value: boolean): void {
+    this.authenticated = value;
   }
 }
 ```
 
-> **Warning**
+> **Tip**
 >
-> Never use `any`. It disables all type checking - TypeScript becomes JavaScript. Use `unknown` instead and narrow it. `any` is an escape hatch that should be avoided in strict TypeScript code.
+> The constructor shorthand `constructor(public readonly id: string)` declares the property, sets its visibility, makes it readonly, AND assigns the constructor parameter - all in one line. This is a TypeScript-only feature, not JavaScript.
 
-## Type Guards: typeof, instanceof, in
-
-Type guards are runtime checks that the compiler uses to narrow types in branches:
+## Implementing Interfaces
 
 ```typescript
-// typeof - for primitives (string, number, boolean)
-function process(value: string | number): string {
-  if (typeof value === "string") {
-    return value.trim();     // string methods available
+interface Serializable {
+  serialize(): string;
+}
+
+interface Identifiable {
+  readonly id: string;
+}
+
+// A class can implement multiple interfaces
+class ChatMessage implements Serializable, Identifiable {
+  readonly id: string;
+  constructor(
+    public sender: string,
+    public text: string,
+    public room: string,
+  ) {
+    this.id = crypto.randomUUID();
   }
-  return value.toFixed(2);   // number methods available
-}
 
-// instanceof - for class instances
-class ChatError extends Error {
-  code: number;
-  constructor(message: string, code: number) {
-    super(message);
-    this.code = code;
+  serialize(): string {
+    return JSON.stringify({
+      id: this.id,
+      sender: this.sender,
+      text: this.text,
+      room: this.room,
+    });
   }
 }
 
-function handleError(err: unknown): void {
-  if (err instanceof ChatError) {
-    console.log(`Chat error ${err.code}: ${err.message}`);
-  } else if (err instanceof Error) {
-    console.log(`Error: ${err.message}`);
-  } else {
-    console.log(`Unknown error: ${err}`);
-  }
-}
-
-// "in" operator - check if a property exists on an object
-type TextMessage = { type: "text"; content: string };
-type ImageMessage = { type: "image"; url: string };
-type Message = TextMessage | ImageMessage;
-
-function displayMessage(msg: Message): string {
-  if ("content" in msg) {
-    return msg.content;  // TypeScript knows this is TextMessage
-  }
-  return `[Image: ${msg.url}]`;  // TypeScript knows this is ImageMessage
-}
-
-// Custom type guard - a function that returns "value is Type"
-function isTextMessage(msg: Message): msg is TextMessage {
-  return msg.type === "text";
-}
-
-if (isTextMessage(someMessage)) {
-  console.log(someMessage.content);  // narrowed to TextMessage
-}
+// Both interfaces are satisfied
+const msg = new ChatMessage("alice", "Hello!", "general");
+console.log(msg.serialize());
 ```
+
+## Interfaces vs Classes - When to Use Which
+
+#### Use Interfaces when:
+
+- Defining data shapes (no behavior)
+- Type-checking function parameters
+- API contracts between modules
+- You need zero runtime overhead
+
+#### Use Classes when:
+
+- Data + behavior together (methods)
+- Need `instanceof` checks at runtime
+- Internal state that should be private
+- Stateful objects (rooms, connections, sessions)
+
+> **Note**
+>
+> In our chat server: `interface` for message shapes, event types, and handler signatures. `class` for ChatRoom, Connection, and Server - things with internal state and methods.
 
 ## Putting It Together
 
-This chapter is about the type system, and the server on the `chapter3` branch puts it to work. The clearest example is exhaustive narrowing over a union.
+Interfaces describe shapes; classes give them behaviour and encapsulation. Both are on the `chapter4` branch; here are the pieces this chapter adds.
 
-`ConnectionState` is a union of three string literals, and `describeState` switches over it. The `default` calls `assertNever`, so if you add a fourth state and forget a case, the switch stops compiling:
+The domain as interfaces. `AdminUser extends User` and structural typing means an admin can go anywhere a user is expected:
 
 ```typescript
-function describeState(state: ConnectionState): string {
-  switch (state) {
-    case "connecting":   return "handshake in progress";
-    case "connected":    return "ready to send and receive";
-    case "disconnected": return "socket closed";
-    default:             return assertNever(state);
-  }
+interface Identifiable {
+  readonly id: string;
 }
+
+interface Serializable {
+  serialize(): string;
+}
+
+interface User extends Identifiable {
+  name: string;
+  port: Port;
+  joinedAt: Timestamp;
+}
+
+// An admin IS-A user with more besides. Structural typing means an AdminUser
+// can be passed anywhere a User is expected, with no `implements` needed.
+interface AdminUser extends User {
+  adminLevel: number;
+  permissions: string[];
+}
+
+interface Message extends Identifiable {
+  sender: UserId;
+  text: string;
+  room: RoomName;
+  replyTo?: string;   // optional: string | undefined
+```
+
+And `ChatRoom` - state plus behaviour, with `private` members the outside cannot touch:
+
+```typescript
+class ChatRoom implements Serializable, Identifiable {
+  readonly id: string;
+  readonly createdAt: Timestamp;
+  private members: Set<UserId> = new Set();
+
+  constructor(public readonly name: RoomName) {
+    this.id = crypto.randomUUID();
+    this.createdAt = Date.now();
+  }
+
+  join(userId: UserId): void {
+    this.members.add(userId);
+  }
+
+  leave(userId: UserId): boolean {
+    return this.members.delete(userId);
+  }
+
+  hasMember(userId: UserId): boolean {
+    return this.members.has(userId);
+  }
 ```
 
 > **Tip**
 >
-> The complete, runnable file is `src/index.ts` on the `chapter3` branch. You are not meant to paste it wholesale - build your own as you follow along, and use the reference to check yourself.
+> The complete, runnable file is `src/index.ts` on the `chapter4` branch. You are not meant to paste it wholesale - build your own as you follow along, and use the reference to check yourself.
 
 ## Exercise
 
-1. Create a `type ConnectionState = "connecting" | "connected" | "disconnected"`. Write a function that takes a `ConnectionState` and returns a description. Use `switch` with an `assertNever` default to ensure exhaustiveness.
-2. Write a function `parseInput(input: unknown): string` that safely handles string, number, boolean, null, and undefined inputs. Use `typeof` guards.
-3. Create a `ChatEvent` union with "message", "join", "leave", and "system" variants. Write a `formatEvent` function that formats each type differently. Add a new variant and see what the compiler says.
-4. Use `as const` on a config object. Try to modify a property and read the compiler error.
-5. Write a custom type guard `isAdmin(user: User): user is AdminUser` and use it in an `if` statement.
+1. Define a `Message` interface with `id` (readonly), `sender`, `text`, `room`, and optional `replyTo`. Create a message object and try to modify `id`.
+2. Create `AdminUser extends User` with `adminLevel: number` and `permissions: string[]`. Pass an AdminUser to a function that accepts User - it should work (structural typing).
+3. Build a `ChatRoom` class with private `members: Set<string>`, public `join/leave/hasMember` methods, and a `memberCount` getter. Try accessing `members` from outside - it should be a compile error.
+4. Use the constructor shorthand: `constructor(public readonly id: string, private name: string)`. Verify `id` is accessible and readonly, and `name` is inaccessible from outside.
+5. Create a `Serializable` interface with a `serialize(): string` method. Implement it on both `ChatMessage` and `ChatRoom`.
 
 ## What's Next
 
-You now have TypeScript's type system at your disposal - unions, narrowing, literal types, type guards, and discriminated unions. These are the tools that catch bugs at compile time.
+You now have interfaces for data shapes and classes for stateful objects. Our chat server will use both - interfaces for messages and events, classes for rooms and connections.
 
-In the next chapter, we learn **interfaces, objects, and classes** - how to define shapes for data, add methods, and build the structures our chat server needs.
+In the next chapter, we write actual networking code - a TCP server using Node.js's `net` module, accepting connections and exchanging data over the wire.
 
 ---
 
-Source: <https://purphoros.com/howto/typescript/type-system>
+Source: <https://purphoros.com/howto/typescript/interfaces-classes>
