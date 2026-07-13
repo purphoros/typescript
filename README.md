@@ -55,7 +55,7 @@ function formatId(id: string | number): string {
 
 > **Note**
 >
-> This is TypeScript's answer to Rust's `match` on enums. Instead of declaring variants at the type level, you declare a union and narrow it at runtime. Both approaches give you exhaustive type safety - just with different syntax.
+> Narrowing is what makes unions usable. You declare the variants in the type, then distinguish them with an ordinary runtime check - `typeof`, `instanceof`, a property test. The compiler follows that check and refines the type inside each branch, so the safety falls out of code you would have written anyway.
 
 ## Literal Types and as const
 
