@@ -16,6 +16,8 @@
 // stops compiling. `assertNever` is what turns "I forgot one" into a build error
 // instead of an `undefined` at three in the morning.
 
+import { z } from "zod";
+import { ClientMessageSchema, PortSchema } from "./schemas.js";
 import {
   err,
   ok,
@@ -73,24 +75,24 @@ export enum ConnectionState {
 
 // --- Client → Server -----------------------------------------------------
 
-// Everything a client is allowed to say. Anything else is a protocol error.
-export type ClientMessage =
-  | { type: "chat"; text: string }
-  | { type: "whisper"; to: UserId; text: string }
-  | { type: "join"; room: RoomName }
-  | { type: "leave" }
-  | { type: "nick"; name: string }
-  | { type: "who" }
-  | { type: "rooms" }
-  | { type: "history"; limit?: number }
-  | { type: "kick"; target: UserId; reason: string }
-  | { type: "status" }
-  | { type: "help" }
-  | { type: "quit" };
+// Everything a client is allowed to say - and this type is no longer written
+// down anywhere. It is *read out of the schema*.
+//
+// z.infer is the whole chapter in one line. schemas.ts describes the messages
+// once; the runtime check and the compile-time type are both derived from that
+// one description, so they cannot disagree. Add a field to a variant in
+// schemas.ts and it appears here, in every switch, in the browser page's mental
+// model, and in the validator, simultaneously - because they are all the same
+// statement.
+//
+// What this replaces: a 12-arm union declared by hand, plus a 60-line DECODERS
+// map that checked it field by field, plus the standing obligation to keep those
+// two in step forever.
+export type ClientMessage = z.infer<typeof ClientMessageSchema>;
 
 // The name of a variant: "chat" | "whisper" | "join" | ... Indexing a union by a
-// key it shares gives the union of that key's types, which here is the set of
-// every legal discriminant. Nothing has to list them a second time.
+// key it shares gives the union of that key's types. Still true, still derived,
+// and now derived from something that is itself derived.
 export type ClientMessageType = ClientMessage["type"];
 
 // --- Server → Client -----------------------------------------------------
@@ -247,145 +249,99 @@ export const COMMANDS: readonly CommandInfo[] = Object.values(CATALOG);
 // - so it is the textbook case for a Result. The failure is in the return type,
 // which means no caller can reach the message without first admitting there
 // might not be one.
-//
-// Chapter 9 returned a hand-rolled `{ kind: "ok" } | { kind: "invalid" }` union
-// here. It was the same idea wearing a worse name; `Result<T, E>` is that union,
-// generic, and it composes with everything else that can fail.
-export type DecodedMessage = Result<ClientMessage, ProtocolError>;
+export type DecodedMessage = Result<ClientMessage, ChatError>;
 
-// Raw JSON: keys we have not checked, values we know nothing about. `unknown`
-// rather than `any`, so nothing can be used before it has been proven.
-type Fields = Record<string, unknown>;
-
-function isRecord(value: unknown): value is Fields {
+function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
-function isString(value: unknown): value is string {
-  return typeof value === "string";
+// Zod tells us *what* went wrong. Chapter 10 drew a line that is worth keeping,
+// so this decides which of the two things it was.
+//
+//   ProtocolError    "I could not read you."  The shape is wrong: a missing
+//                    field, a number where a string goes, a `type` nobody has
+//                    heard of, a key that should not be there.
+//
+//   ValidationError  "I read you, and no."  The shape is right and the content
+//                    is not: a nickname with a space in it, a 4,000-character
+//                    message, a history limit of -3.
+//
+// The distinction is not pedantry. One means the client's *code* is broken and a
+// developer needs to look at it; the other means the client's *user* typed
+// something we will not accept, and they can simply try again. They deserve
+// different codes because they have different audiences - which is exactly the
+// argument ErrorCode was invented for.
+const STRUCTURAL: ReadonlySet<string> = new Set([
+  "invalid_type",            // wrong primitive, or a field that is not there
+  "invalid_union",           // no variant matched - usually an unknown `type`
+  "invalid_value",           // a literal that is not the literal
+  "invalid_key",
+  "unrecognized_keys",       // a field we have never heard of, e.g. "txet"
+]);
+
+// One Zod issue, as a sentence. `path` is how Zod says *where*: ["text"] means
+// the text field, [] means the message as a whole.
+function describeIssue(issue: z.core.$ZodIssue): string {
+  const where = issue.path.length > 0 ? `${issue.path.join(".")}: ` : "";
+  return `${where}${issue.message}`;
 }
 
-// `Extract<ClientMessage, { type: K }>` picks the one variant whose discriminant
-// is K, so a decoder for "join" can only return a join message - it could not
-// accidentally build a chat one. Returning null means "the type was right, the
-// fields were not".
-type Decoder<K extends ClientMessageType> = (fields: Fields) => Extract<ClientMessage, { type: K }> | null;
+function toChatError(error: z.ZodError, value: unknown): ChatError {
+  const detail = error.issues.map(describeIssue).join("; ");
 
-// One decoder per variant, and the mapped type insists on all of them.
-type DecoderMap = { [K in ClientMessageType]: Decoder<K> };
+  // If the client told us which message it *meant*, show it the shape it should
+  // have sent. CATALOG is keyed by every variant, so this cannot go stale.
+  const type = isRecord(value) && typeof value.type === "string" ? value.type : undefined;
+  const hint =
+    type !== undefined && Object.hasOwn(CATALOG, type)
+      ? ` Expected ${CATALOG[type as ClientMessageType].example}`
+      : "";
 
-// Each decoder *rebuilds* the message from fields it has checked rather than
-// waving the parsed JSON through with `as ClientMessage`. A cast there would be
-// a lie: JSON.parse returns whatever was on the socket, and asserting it has the
-// right shape does not make it so. This is the difference between a type that is
-// true and a type that is merely claimed.
-const DECODERS: DecoderMap = {
-  chat: (f) => (isString(f.text) ? { type: "chat", text: f.text } : null),
-  whisper: (f) =>
-    isString(f.to) && isString(f.text) ? { type: "whisper", to: f.to, text: f.text } : null,
-  join: (f) => (isString(f.room) ? { type: "join", room: f.room } : null),
-  leave: () => ({ type: "leave" }),
-  nick: (f) => (isString(f.name) ? { type: "nick", name: f.name } : null),
-  who: () => ({ type: "who" }),
-  rooms: () => ({ type: "rooms" }),
-  history: (f) => {
-    if (f.limit === undefined) {
-      return { type: "history" };
-    }
-    // A limit that is a string, or NaN, or -3, is not a limit.
-    if (typeof f.limit !== "number" || !Number.isInteger(f.limit) || f.limit <= 0) {
-      return null;
-    }
-    return { type: "history", limit: f.limit };
-  },
-  kick: (f) =>
-    isString(f.target) && isString(f.reason) ? { type: "kick", target: f.target, reason: f.reason } : null,
-  status: () => ({ type: "status" }),
-  help: () => ({ type: "help" }),
-  quit: () => ({ type: "quit" }),
-};
+  const structural = error.issues.some((issue) => STRUCTURAL.has(issue.code));
+  const message = `${detail}.${hint}`;
 
-const KNOWN_TYPES = Object.keys(DECODERS).join(", ");
-
-function invalid(reason: string): DecodedMessage {
-  return err(new ProtocolError(reason));
+  return structural ? new ProtocolError(message) : new ValidationError(message);
 }
 
 // One line off a socket becomes a ClientMessage, or an explanation of why it
 // could not. Everything downstream of here works with a value the compiler
 // trusts, because this is the one place that earned that trust.
 //
-// Note that this function does not throw, and is not `try`-ed by its caller
-// except around JSON.parse - the one thing here that throws is someone else's
-// code. Failure is a value all the way out.
+// Note what safeParse returns: not the object that arrived, but a *new* one built
+// from the fields it verified. That was the whole argument against `as
+// ClientMessage` in Chapter 9, and it is why a schema is a validator rather than
+// a very detailed assertion.
 export function decodeClientMessage(raw: string): DecodedMessage {
   let value: unknown;
   try {
-    // The only throwing call in the module, and it is not ours. Catching it
-    // right here is what lets everything below return a Result instead.
+    // Still the only throwing call in the module, and still not ours.
     value = JSON.parse(raw);
   } catch {
-    return invalid(`expected JSON, e.g. ${CATALOG.chat.example}`);
+    return err(new ProtocolError(`expected JSON, e.g. ${CATALOG.chat.example}`));
   }
 
-  if (!isRecord(value)) {
-    return invalid("expected a JSON object");
+  const parsed = ClientMessageSchema.safeParse(value);
+  if (!parsed.success) {
+    return err(toChatError(parsed.error, value));
   }
-
-  const type = value.type;
-  if (!isString(type)) {
-    return invalid('every message needs a "type" field');
-  }
-
-  // hasOwn, not `in`: "toString" is *in* every object, and dispatching on it
-  // would hand us Object.prototype.toString to call as a decoder.
-  if (!Object.hasOwn(DECODERS, type)) {
-    return invalid(`unknown message type "${type}". Known types: ${KNOWN_TYPES}`);
-  }
-
-  // Widen on the way out. Each decoder in the map returns its *own* variant -
-  // that is the point of the map - but once the key is only known to be some
-  // ClientMessageType, the thing it returns is only known to be some
-  // ClientMessage. Annotating the plain function type says exactly that, and is
-  // the last of the narrowing: everything past here is typed.
-  const decode: (fields: Fields) => ClientMessage | null = DECODERS[type as ClientMessageType];
-  const message = decode(value);
-  if (message === null) {
-    return invalid(`malformed "${type}" message. Expected ${CATALOG[type as ClientMessageType].example}`);
-  }
-
-  return ok(message);
+  return ok(parsed.data);
 }
 
 // --- Validation ----------------------------------------------------------
 
-// A nickname is well-formed JSON and still not acceptable. That is the
-// difference between a ProtocolError and a ValidationError, and it is worth
-// keeping straight: one means "I could not read you", the other "I read you, and
-// no".
-const NICKNAME = /^[a-z0-9_-]{1,20}$/i;
-
-export function validateNickname(raw: string): Result<string, ChatError> {
-  if (!NICKNAME.test(raw)) {
-    return err(
-      new ValidationError(
-        `"${raw}" is not a usable name: 1-20 characters, letters, digits, _ or - only.`,
-      ),
-    );
-  }
-  return ok(raw);
-}
+// `validateNickname` used to live here: a regex, applied by the handler, three
+// modules away from the type that described the field it constrained. It is gone.
+// The rule is on the field now, in schemas.ts, where a nickname is defined - so
+// nothing can accept a nickname without also enforcing what one is.
 
 // The port comes off the command line, which is to say from a human, which is to
-// say it is wrong sometimes. Chapter 9 quietly swapped in the default and said
-// nothing - a bad argument that behaves exactly like no argument is how you lose
-// an afternoon. Now the caller is handed the failure and decides out loud.
+// say it is wrong sometimes. The caller is handed the failure and decides out loud.
 export function parsePort(input: string): Result<number, ChatError> {
-  const port = Number.parseInt(input, 10);
-  if (Number.isNaN(port) || port <= 0 || port > 65535) {
+  const parsed = PortSchema.safeParse(input);
+  if (!parsed.success) {
     return err(new ValidationError(`"${input}" is not a port: expected 1-65535.`));
   }
-  return ok(port);
+  return ok(parsed.data);
 }
 
 // --- Encoding ------------------------------------------------------------

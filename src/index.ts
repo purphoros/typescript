@@ -34,6 +34,7 @@ export { configure, resolvePort, DEFAULTS } from "./config.js";
 export { isAdmin } from "./types.js";
 export { chatPage } from "./page.js";
 export { Router } from "./router.js";
+export { ClientMessageSchema, PortSchema } from "./schemas.js";
 
 export {
   ChatError,
@@ -59,7 +60,6 @@ export {
   decodeClientMessage,
   encodeServerMessage,
   describeState,
-  validateNickname,
   parsePort,
 } from "./protocol.js";
 

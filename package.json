@@ -27,7 +27,8 @@
     "typescript": "^7.0.2"
   },
   "dependencies": {
-    "ws": "^8.21.0"
+    "ws": "^8.21.0",
+    "zod": "^4.4.3"
   },
   "type": "module",
   "types": "dist/index.d.ts",

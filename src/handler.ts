@@ -18,7 +18,6 @@ import {
   COMMANDS,
   decodeClientMessage,
   describeState,
-  validateNickname,
   type ClientMessage,
   type ServerMessage,
 } from "./protocol.js";
@@ -162,19 +161,19 @@ export class MessageHandler {
       }
 
       case "nick": {
-        // Two different failures, and they are not the same kind of thing. A
-        // name with a space in it never could have worked - a ValidationError,
-        // returned as a value because the check and the decision live in the
-        // same breath. A well-formed name that nobody has is a NotFoundError,
-        // thrown, because there is nothing to decide.
-        const name = validateNickname(message.name);
-        if (!name.ok) {
-          throw name.error;
-        }
-        const user = registry.knownUsers.get(name.value);
+        // `message.name` is already known to be a well-formed nickname - 1-20
+        // characters, letters, digits, _ or - - because the schema said so before
+        // this function was ever called. Chapter 10 checked that here, with
+        // validateNickname; the check has not disappeared, it has moved to the
+        // field it constrains, which is the only place it can never be forgotten.
+        //
+        // What is left is the one question a schema cannot answer: is there a
+        // person by that name? A ValidationError means the name is not a name.
+        // This is a NotFoundError, and it means the name is fine and nobody has it.
+        const user = registry.knownUsers.get(message.name);
         if (user === undefined) {
           throw new NotFoundError(
-            `Unknown user "${name.value}". Try: ${[...registry.knownUsers.keys()].join(", ")}`,
+            `Unknown user "${message.name}". Try: ${[...registry.knownUsers.keys()].join(", ")}`,
             ErrorCode.UnknownUser,
           );
         }
