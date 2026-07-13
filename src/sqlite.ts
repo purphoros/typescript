@@ -86,6 +86,7 @@ export class SqliteStorage implements Storage, Measured {
   // is most of the cost of a small query.
   private insertMessage!: StatementSync;
   private selectRecent!: StatementSync;
+  private selectPage!: StatementSync;
   private searchMessages!: StatementSync;
   private selectAccount!: StatementSync;
   private upsertAccount!: StatementSync;
@@ -131,6 +132,17 @@ export class SqliteStorage implements Storage, Measured {
       SELECT room, sender, text, at FROM (
         SELECT room, sender, text, at FROM messages
         WHERE room = ? ORDER BY at DESC LIMIT ?
+      ) ORDER BY at ASC
+    `);
+
+    // Cursor pagination. `at < ?` walks the same (room, at) index backwards from
+    // a point in time, so page 2 costs exactly what page 1 did - which is the
+    // thing OFFSET cannot promise, because OFFSET has to count past the rows it
+    // is skipping.
+    this.selectPage = this.db.prepare(`
+      SELECT room, sender, text, at FROM (
+        SELECT room, sender, text, at FROM messages
+        WHERE room = ? AND at < ? ORDER BY at DESC LIMIT ?
       ) ORDER BY at ASC
     `);
 
@@ -207,13 +219,14 @@ export class SqliteStorage implements Storage, Measured {
     }
   }
 
-  statements(): {
-    insertMessage: StatementSync; selectRecent: StatementSync; searchMessages: StatementSync;
-    selectAccount: StatementSync; upsertAccount: StatementSync; selectNames: StatementSync;
-  } {
+  // The prepared statements, handed out to the two stores below. No explicit
+  // return type: it would be a second list of the same fields, and a second list
+  // is a second thing to forget to update.
+  statements() {
     return {
       insertMessage: this.insertMessage,
       selectRecent: this.selectRecent,
+      selectPage: this.selectPage,
       searchMessages: this.searchMessages,
       selectAccount: this.selectAccount,
       upsertAccount: this.upsertAccount,
@@ -267,6 +280,13 @@ class SqliteMessages implements MessageStore, Measured {
   @timed("sqlite")
   async recent(room: RoomName, limit: number): Promise<MessageSummary[]> {
     const rows = this.storage.statements().selectRecent.all(room, limit) as unknown as MessageRow[];
+    return rows.map(toSummary);
+  }
+
+  @timed("sqlite")
+  async page(room: RoomName, limit: number, before?: number): Promise<MessageSummary[]> {
+    const cursor = before ?? Number.MAX_SAFE_INTEGER;
+    const rows = this.storage.statements().selectPage.all(room, cursor, limit) as unknown as MessageRow[];
     return rows.map(toSummary);
   }
 

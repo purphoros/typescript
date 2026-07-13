@@ -7,13 +7,7 @@
 
 import { asError, ChatError, toSafeError } from "./errors.js";
 import { statusLine, type Bus } from "./bus.js";
-import { COMMANDS, type MessageSummary } from "./protocol.js";
-import { chatPage } from "./page.js";
-import { describeRoom, summarize } from "./views.js";
-import type { MessageStore } from "./store.js";
-import type { Metrics, Runtime } from "./runtime.js";
-import type { Registry } from "./state.js";
-import { Router } from "./router.js";
+import type { Rest } from "./rest.js";
 import type { TcpClient } from "./clients.js";
 
 // One parsed HTTP request. Header names are lowercased: HTTP header names are
@@ -112,129 +106,17 @@ export function isWebSocketUpgrade(req: HttpRequest): boolean {
 }
 
 export class HttpService {
-  private readonly router: Router;
-
+  // The routes moved to rest.ts. What is left here is what this module was always
+  // actually about: turning bytes into an HttpRequest and an HttpResponse back
+  // into bytes. Parsing is not routing, and for six chapters they lived in one
+  // file because there was not enough of either to notice.
   constructor(
-    private readonly registry: Registry,
+    private readonly rest: Rest,
     private readonly bus: Bus,
-    private readonly messages: MessageStore,
-    private readonly runtime: Runtime,
-    private readonly metrics: Metrics,
-  ) {
-    this.router = this.buildRoutes();
-  }
-
-  // The server's own state, served over HTTP. The chat rooms and the web page
-  // are the same rooms - one process, three protocols.
-  //
-  // Chapter 12 wrote this as a chain of `if (req.path === "..." && req.method
-  // === "GET")`, with one hand-rolled regex for the room route and a `named[1]`
-  // that the compiler had no opinion about. The routes are a table now, and the
-  // parameters are typed - `params.room` is a string because the *pattern* says
-  // so, and `params.rooom` does not compile.
-  //
-  // These handlers may throw, and do: requireRoomNamed raises the very same
-  // NotFoundError the chat side raises. The boundary below turns it into a 404.
-  private buildRoutes(): Router {
-    const { registry, messages: store, runtime, metrics } = this;
-
-    return new Router()
-      .on("GET", "/", () => html(200, chatPage(registry.clients.size, registry.rooms.size)))
-
-      .on("GET", "/api/status", () =>
-        json(200, {
-          status: "running",
-          uptime: process.uptime(),
-          clients: registry.clients.size,
-          rooms: registry.rooms.size,
-        }))
-
-      // What the process itself is doing. The interesting number is
-      // eventLoopMeanMs: Node runs one thread, so if that climbs, everything is
-      // slow for everyone and no amount of `async` will help.
-      .on("GET", "/api/health", () => {
-        const snapshot = runtime.snapshot();
-        runtime.reset();
-        return json(200, {
-          ...snapshot,
-          clients: registry.clients.size,
-          rooms: registry.rooms.size,
-          // The one number that says whether we are leaking a slow client's
-          // unsent mail into our own heap. See MAX_BACKLOG_BYTES in clients.ts.
-          backlogBytes: [...registry.clients.values()].reduce((sum, c) => sum + c.backlog, 0),
-          // Gathered by @timed. Chapter 15 could tell you the loop was blocked;
-          // this tells you by what.
-          operations: metrics.snapshot(),
-        });
-      })
-
-      // The protocol, served from the protocol. CATALOG is a Record keyed by
-      // every ClientMessage variant, so this endpoint cannot describe a message
-      // the server does not accept, nor omit one it does.
-      .on("GET", "/api/protocol", () => json(200, { clientMessages: COMMANDS }))
-
-      .on("GET", "/api/rooms", () => json(200, [...registry.rooms.values()].map(describeRoom)))
-
-      // The route that earns the chapter.
-      //
-      // `params.room` is a `string`, and it is a string because the pattern
-      // "/api/rooms/:room" says it is - PathParams read the name out of the
-      // literal type. There is no regex, no capture group, no `[1]`, and nothing
-      // to keep in sync. Rename the parameter in the pattern and this line stops
-      // compiling, which is exactly what should happen.
-      .on("GET", "/api/rooms/:room", async (_req, params) => {
-        const room = registry.requireRoomNamed(params.room);
-        return json(200, { ...describeRoom(room), recent: await store.recent(room.name, 10) });
-      })
-
-      // Every room's archive, read concurrently.
-      //
-      // Promise.all is the point here. The sequential version - `for (const room
-      // of rooms) { out.push(await read(room)) }` - reads the files one after
-      // another and takes as long as all of them added up, for no reason: none
-      // depends on any other. It fails fast, and here that is correct: this
-      // endpoint promises the whole archive, and two thirds of an archive is not
-      // a smaller success, it is a wrong answer delivered confidently.
-      .on("GET", "/api/history", async () => {
-        const perRoom = await Promise.all(
-          [...registry.rooms.keys()].map((room) => store.recent(room, 10)),
-        );
-        const recent: MessageSummary[] = perRoom.flat();
-        return json(200, recent);
-      })
-
-      // Deliberately broken, and left in on purpose: the only honest way to show
-      // what the boundary does with a failure nobody planned for. curl it and you
-      // get a 500 saying "Internal server error" and absolutely nothing else. The
-      // stack goes to the log, where the person who can fix it is looking.
-      .on("GET", "/api/crash", () => {
-        throw new Error("the kind of bug you did not see coming");
-      })
-
-      .on("POST", "/api/echo", (req) =>
-        json(200, { echo: req.body ?? "", bytes: Buffer.byteLength(req.body ?? "") }));
-  }
+  ) {}
 
   private async route(req: HttpRequest): Promise<HttpResponse> {
-    const matched = this.router.match(req.method, req.path);
-    if (matched !== undefined) {
-      return await matched.handler(req, matched.params);
-    }
-
-    // No handler. But "no handler" has two causes, and they are not the same
-    // answer: a path nobody has ever heard of is a 404, and a path that exists
-    // with a verb it does not accept is a 405 - and the client is entitled to be
-    // told which verbs it *should* have used.
-    const allowed = this.router.methodsFor(req.path);
-    if (allowed.length > 0) {
-      return {
-        status: 405,
-        headers: { "Content-Type": "application/json", Allow: allowed.join(", ") },
-        body: JSON.stringify({ error: `Use ${allowed.join(" or ")}`, path: req.path }, null, 2),
-      };
-    }
-
-    return json(404, { error: "Not Found", path: req.path });
+    return await this.rest.handle(req);
   }
 
   // The HTTP boundary, and it is the chat boundary wearing different clothes.
@@ -258,7 +140,20 @@ export class HttpService {
           asError(thrown),
         );
       }
-      return json(safe.status, { error: safe.message, code: safe.code });
+
+      // A 401 without WWW-Authenticate is not a 401, it is a 401-shaped noise. The
+      // header is what tells the client *how* to authenticate - and it is the
+      // difference between `curl --user` working and a human reading your source.
+      const headers: Record<string, string> = { "Content-Type": "application/json" };
+      if (safe.status === 401) {
+        headers["WWW-Authenticate"] = "Bearer";
+      }
+
+      return {
+        status: safe.status,
+        headers,
+        body: JSON.stringify({ error: safe.message, code: safe.code }, null, 2),
+      };
     }
   }
 

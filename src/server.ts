@@ -25,6 +25,7 @@ import { SqliteStorage } from "./sqlite.js";
 import type { MessageStore, Storage } from "./store.js";
 import { MemoryAccounts } from "./store.js";
 import { HttpService, HTTP_REQUEST_LINE } from "./http.js";
+import { Rest } from "./rest.js";
 import { MessageHandler } from "./handler.js";
 import { ChatMessage } from "./model.js";
 import { Accounts, Sessions } from "./auth.js";
@@ -70,7 +71,17 @@ export class ChatServer {
       this.sessions,
       config,
     );
-    this.http = new HttpService(this.registry, this.bus, this.messages, this.runtime, this.metrics);
+    const rest = new Rest({
+      registry: this.registry,
+      bus: this.bus,
+      messages: this.messages,
+      accounts: this.accounts,
+      sessions: this.sessions,
+      runtime: this.runtime,
+      metrics: this.metrics,
+      config,
+    });
+    this.http = new HttpService(rest, this.bus);
 
     // noServer: `ws` opens no port and does no listening. It only ever receives
     // sockets we have already accepted, parsed, and decided to upgrade.

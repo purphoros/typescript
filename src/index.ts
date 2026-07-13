@@ -24,6 +24,7 @@ export { ChatServer } from "./server.js";
 export { Registry } from "./state.js";
 export { MessageHandler } from "./handler.js";
 export { HttpService } from "./http.js";
+export { Rest } from "./rest.js";
 export { ChatRoom, ChatMessage } from "./model.js";
 export { FileHistory } from "./history.js";
 export { SqliteStorage } from "./sqlite.js";

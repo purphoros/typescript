@@ -142,6 +142,13 @@ export class FileHistory implements MessageStore, Measured {
     return all.slice(-limit);
   }
 
+  // Same answer, and it has to read the whole file to give it.
+  async page(room: RoomName, limit: number, before?: number): Promise<MessageSummary[]> {
+    const all = await this.read(room);
+    const upto = before === undefined ? all : all.filter((m) => m.at < before);
+    return upto.slice(-limit);
+  }
+
   // And this is where it stops being a difference of degree. A JSONL file has no
   // way to find text except to look at all of it - there is no index, and there is
   // nowhere to put one.

@@ -36,6 +36,14 @@ export interface MessageStore {
   // every day the server runs.
   recent(room: RoomName, limit: number): Promise<MessageSummary[]>;
 
+  // A page of history, oldest first, ending strictly before `before`.
+  //
+  // A *cursor*, not an offset. `LIMIT 20 OFFSET 40` looks equivalent and is not:
+  // messages arrive while somebody is paging, every row shifts down, and page 3
+  // shows you two rows you already read on page 2. A cursor says "before this
+  // moment", which does not move.
+  page(room: RoomName, limit: number, before?: number): Promise<MessageSummary[]>;
+
   // Free text, which a JSONL file can only answer by reading every byte it has.
   // This is the method that makes a database worth having, and - because the
   // query is text a stranger typed - it is also the one that would be an SQL

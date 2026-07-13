@@ -64,11 +64,21 @@ export type PathParams<P extends string> = {
 
 // --- The router ----------------------------------------------------------
 
-// A handler for one route. `P` is the *literal* pattern, which is what lets
-// PathParams<P> compute anything at all - pass a `string` and you get `{}`.
-export type RouteHandler<P extends string> = (
+// A handler for one route.
+//
+// `P` is the *literal* pattern, which is what lets PathParams<P> compute anything
+// at all - pass a `string` and you get `{}`.
+//
+// `C` is the route's **context**, and it is Chapter 22's whole trick. A public
+// router is a `Router<void>` and its handlers get nothing. An authenticated router
+// is a `Router<Session>` and its handlers are *handed* a session - which means an
+// authenticated handler cannot forget to check for one, because it could not have
+// been called without one. The check is not a line of code somebody has to
+// remember to write. It is the type of the argument.
+export type RouteHandler<P extends string, C> = (
   request: HttpRequest,
   params: PathParams<P>,
+  context: C,
 ) => HttpResponse | Promise<HttpResponse>;
 
 // How the handler is stored once its pattern has been forgotten.
@@ -100,25 +110,26 @@ export type RouteHandler<P extends string> = (
 // The regex it replaces had the opposite arrangement - no assertion anywhere,
 // and `named[1]` unverified at every call site that touched it. One assertion
 // you can point at beats twenty you cannot.
-type StoredHandler = (
+type StoredHandler<C> = (
   request: HttpRequest,
   params: Record<string, string>,
+  context: C,
 ) => HttpResponse | Promise<HttpResponse>;
 
-interface Route {
+interface Route<C> {
   readonly method: HttpMethod;
   readonly segments: readonly string[];
-  readonly handler: StoredHandler;
+  readonly handler: StoredHandler<C>;
 }
 
-export class Router {
-  private readonly routes: Route[] = [];
+export class Router<C = void> {
+  private readonly routes: Route<C>[] = [];
 
   // Generic over `P`, and `P extends string` with no default is what makes
   // TypeScript infer the *literal* "/api/rooms/:room" rather than widening it to
   // `string`. Widen it and PathParams<string> is `{}`, the parameters vanish, and
   // the whole exercise quietly stops working while still compiling.
-  on<P extends string>(method: HttpMethod, pattern: P, handler: RouteHandler<P>): this {
+  on<P extends string>(method: HttpMethod, pattern: P, handler: RouteHandler<P, C>): this {
     this.routes.push({
       method,
       segments: pattern.split("/"),
@@ -126,7 +137,7 @@ export class Router {
       // invariant that makes it safe - and note that it is *here*, once, in code
       // nobody has to touch again, rather than at every route that wanted a
       // parameter.
-      handler: handler as StoredHandler,
+      handler: handler as StoredHandler<C>,
     });
     return this;
   }
@@ -136,7 +147,7 @@ export class Router {
   // Runtime matching, which the types cannot do for us: this is the part that has
   // to look at an actual string that arrived over a socket. The types described
   // the *shape*; only this can say whether a given string has it.
-  private capture(route: Route, parts: readonly string[]): Record<string, string> | undefined {
+  private capture(route: Route<C>, parts: readonly string[]): Record<string, string> | undefined {
     if (route.segments.length !== parts.length) {
       return undefined;
     }
@@ -167,7 +178,7 @@ export class Router {
 
   // Returns undefined when nothing matched. What to do about that is the
   // caller's decision, not the router's - and it is not always a 404. See below.
-  match(method: string, path: string): { handler: StoredHandler; params: Record<string, string> } | undefined {
+  match(method: string, path: string): { handler: StoredHandler<C>; params: Record<string, string> } | undefined {
     const parts = path.split("/");
 
     for (const route of this.routes) {
