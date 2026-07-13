@@ -1,0 +1,28 @@
+# Everything the build does not need, and two things it must never have.
+#
+# The build context is uploaded to the daemon before the first line of the
+# Dockerfile runs, so a fat context is slow even when every layer is cached.
+
+node_modules
+dist
+data
+data-test-*
+
+.git
+.github
+*.md
+
+.claude
+.env
+.env.*
+
+# And the two that matter:
+#
+#   .env - a secret, which would be baked into an image layer forever. Deleting it
+#          in a later RUN does not remove it; layers are immutable and anybody with
+#          the image can read it back out. There is no un-committing a secret into
+#          a container image.
+#
+#   .git - the entire history of the repository, including every secret anybody
+#          has ever committed and then removed. Shipping it is how a rotated key
+#          gets un-rotated.

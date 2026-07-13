@@ -1,0 +1,12 @@
+{
+  // The build excludes tests - nobody wants 33 compiled .test.js files in a
+  // container. But a test is *code*, and code that does not typecheck is code
+  // that is lying to you.
+  //
+  // So: two configs. tsconfig.json builds what ships. This one checks everything,
+  // emits nothing, and is what `npm run typecheck` actually runs.
+  "extends": "./tsconfig.json",
+  "compilerOptions": { "noEmit": true },
+  "include": ["src/**/*"],
+  "exclude": ["dist", "node_modules"]
+}
