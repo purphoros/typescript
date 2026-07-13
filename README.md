@@ -1,308 +1,560 @@
-# Chapter 18 - Decorators & Metadata
+# Chapter 19 - Testing
 
-Add behaviour to classes and methods declaratively. Decorators are TypeScript's metaprogramming tool - the machinery behind NestJS, Angular and TypeORM.
+Every chapter of this tutorial has ended the same way: run the server, open `nc`, type JSON at it, read what came back. That works. It does not scale, it is not repeatable, and it only ever tests what I remembered to type.
 
-This chapter's own advice, further down, is that our chat server wants **middleware**, not decorators. That advice is correct, and this chapter takes it: the Chapter 17 chain stays exactly where it is. What follows is decorators used for the one thing they are genuinely better at - and an honest account of what they cost.
+Chapter 11 made a promise about this, and it is time to collect.
 
-## Standard decorators, not the ones in most tutorials
+```bash
+npm install --save-dev vitest
+npm test
+```
 
-Nearly every decorator tutorial - including this chapter's first listing - shows you this:
+```
+ Test Files  6 passed (6)
+      Tests  56 passed (56)
+```
+
+## The test double that fakes only the wire
+
+`MessageHandler` accepts a `ChatClient` - an **interface**. It has no `node:net`, no `ws`, no Buffer. That was Chapter 11's whole argument, and this is what it was for:
 
 ```typescript
-function log(target: any, key: string, descriptor: PropertyDescriptor) {
-  const original = descriptor.value;
-  descriptor.value = function (...args: any[]) { ... };
+export class FakeClient extends BaseClient {
+  readonly outbox: ServerMessage[] = [];
+
+  send(message: ServerMessage): void { this.outbox.push(message); }
+  end(message: ServerMessage): void  { this.outbox.push(message); this.markClosing(); }
+  get backlog(): number { return 0; }        // never behind: there is no wire
+  protected destroy(): void { this.markClosed(); }
 }
 ```
 
-That is the **legacy** decorator. It requires `"experimentalDecorators": true`, it is built on a TC39 proposal that was **abandoned**, and it has `any` in it twice - which Chapter 3 had opinions about.
+**Look at what it extends.** `FakeClient` is a subclass of the real `BaseClient`, so it inherits the real state machine, the real `label`, the real transitions - everything from Chapter 16 that decides whether you may enter a room. Only the two methods that put bytes on a wire are replaced.
 
-TypeScript 5.0 ships the **standard** decorator: Stage 3, on its way into JavaScript itself, **no compiler flag**, and properly typed.
-
-```typescript
-function logged<T, A extends unknown[], R>(
-  original: (this: T, ...args: A) => R,
-  context: ClassMethodDecoratorContext<T, (this: T, ...args: A) => R>,
-): (this: T, ...args: A) => R {
-  return function (this: T, ...args: A): R {
-    console.log(`-> ${String(context.name)}(${args.join(", ")})`);
-    const result = original.apply(this, args);
-    console.log(`<- ${String(context.name)} returned ${String(result)}`);
-    return result;
-  };
-}
-
-class Calculator {
-  @logged
-  add(a: number, b: number): number { return a + b; }
-}
-```
-
-A decorator is just a **function that receives the method and returns a replacement**. No `descriptor`, no mutation, no `any` - and the compiler now checks that the decorator is applied to a method whose shape it can actually handle.
-
-> **Note**
->
-> `context.name` is the method's own name, supplied by the runtime. That is the whole "metadata" story for our purposes, and it matters more than it looks: rename the method and the metric renames itself. No stringly-typed duplication to drift.
->
-> This project's `tsconfig.json` has **no** `experimentalDecorators`, and both `tsc` and `tsx` (esbuild) run the above as written. Verify it yourself before you take my word for it - esbuild's support for standard decorators is newer than its support for the legacy ones, and a tutorial from 2022 will tell you it does not work.
-
-## Where they actually earn their keep here
-
-Chapter 15 gave the server the ability to notice that it was slow. It gave it **no way at all to notice what was slow.**
-
-That is a cross-cutting concern attached to specific methods - which is precisely the criterion this chapter names for reaching for a decorator. So:
+That distinction is the difference between a useful test double and a useless one. **Reimplement the logic in your fake and you are testing your fake.** Fake only the *edge*, and everything above it is the code that actually ships.
 
 ```typescript
-@timed("history")
-append(message: MessageSummary): Promise<void> { ... }
+it("delivers a message from one client to another", async () => {
+  const alice = arrive(handler, 1);
+  const bob = arrive(handler, 2);
+  await loggedIn(handler, alice, "alice", "correct-horse");
+  await loggedIn(handler, bob, "bob", "hunter2");
+  await say(handler, alice, { type: "join", room: "general" });
+  await say(handler, bob, { type: "join", room: "general" });
+  bob.clear();
 
-@timed("history")
-async read(room: RoomName): Promise<MessageSummary[]> { ... }
+  await say(handler, alice, { type: "chat", text: "hello everyone" });
 
-@timed("accounts")
-async login(name: string, password: string): Promise<Result<Account, ChatError>> { ... }
+  expect(bob.last("chat")?.sender).toBe("alice");
+});
 ```
 
-Three lines. Nothing inside `FileHistory` or `Accounts` learned what a metric is, and `/api/health` grew a section:
-
-```json
-"operations": {
-  "history.read":   { "count": 4, "failures": 0, "meanMs": 0.25,  "maxMs": 0.39 },
-  "history.append": { "count": 5, "failures": 0, "meanMs": 1.36,  "maxMs": 1.42 },
-  "accounts.login": { "count": 2, "failures": 0, "meanMs": 28.46, "maxMs": 28.85 }
-}
-```
-
-That `28.46ms` is scrypt being slow **on purpose**. Which means this number is now a security tripwire: if `accounts.login.meanMs` ever drops toward zero, somebody has "optimised" the password hash and the passwords are no longer safe.
-
-## The bug in almost every hand-rolled @timed
-
-```typescript
-const started = performance.now();
-const result = original.apply(this, args);
-this.metrics.record(label, performance.now() - started, true);   // WRONG
-return result;
-```
-
-If the method is `async`, **it has not finished**. It has handed back a Promise, and that subtraction measures how long it took to *start* - which is approximately zero and completely useless. This is the single most common bug in decorators people write themselves, and its symptom is beautiful sub-millisecond timings for operations that take a second.
-
-So: if you got a Promise, measure when it **settles**.
-
-```typescript
-if (result instanceof Promise) {
-  const measured = result.then(
-    (value: unknown) => { this.metrics.record(label, elapsed(), true);  return value; },
-    (thrown: unknown) => { this.metrics.record(label, elapsed(), false); throw thrown; },
-  );
-  return measured as R;
-}
-```
-
-The `as R` is the one assertion in the file. Inside that branch we have *proved* `R` is a Promise - but TypeScript cannot narrow a generic type **parameter** from an `instanceof` on its value; `R` is still `R`. The cast restates what the branch just established. (Chapter 13's bargain, one more time: one line you can point at.)
-
-## The awkward truth nobody mentions
-
-**A decorator runs at class-definition time, when no instance exists.** It cannot be handed a dependency.
-
-That leaves three options: reach for a global (and Chapter 11 spent a chapter arguing against exactly that), take the dependency as an argument (at which point it is not really a decorator), or **require the instance to carry it**.
-
-We require the instance to carry it, and we make the compiler enforce it:
-
-```typescript
-export interface Measured {
-  readonly metrics: Metrics;
-}
-
-export function timed<T extends Measured, A extends unknown[], R>(subject: string) { ... }
-```
-
-Put `@timed` on a class with no `metrics` field and it does not compile. The dependency is still injected - `new FileHistory(config.dataDir, this.metrics)` - the decorator simply reads it off `this`.
-
-That is a real constraint, and it is worth saying plainly: **a decorator is coupled to the shape of the thing it decorates.** Middleware is not. That is most of the argument between them.
-
-## The failure a decorator cannot see
-
-Look again at the output above:
-
-```
-"accounts.login": { "count": 2, "failures": 0, ... }
-```
-
-**One of those two logins was wrong.** The password was `"wrong"`, the server refused it, and the decorator recorded a success.
-
-It is not a bug in the decorator. `login()` returns a `Result<Account, ChatError>` - Chapter 10's whole point was that an *expected* failure is a **value**, not an exception. So the method returned normally, carrying a failure inside it, and `@timed` - which watches for throws - saw a function that worked.
-
-Two good decisions, meeting, and producing a wrong number.
-
-This is what cross-cutting abstractions cost: `@timed` knows about *methods*, and it does not know about *your* idea of failure. To count those, it would have to be taught what a `Result` is - and now it is not a general-purpose decorator any more, it is a `Result`-aware decorator, and the seam has leaked. There is no clever fix. There is only knowing.
-
-## Decorators vs Middleware
-
-| | Decorators | Middleware |
-|---|---|---|
-| Attached to | a specific method, at definition time | a pipeline, at runtime |
-| Order | fixed by source position | a list you can reorder |
-| Dependencies | must come off `this` or a global | passed in, ordinarily |
-| Composes over | one class's methods | anything with the same signature |
-| Knows about | the method's shape | the message's shape |
-
-The Chapter 17 chain - `rateLimit → requireAuth → handler` - stays. It processes a **stream of messages**, its behaviour is independent of any class, and the order is an argument we wanted to be able to have at runtime. Rewriting it as decorators would fix its order at source position, couple every check to the handler class, and buy nothing.
-
-`@timed` goes on methods, because it is *about* methods.
+Real login. Real scrypt. Real JWT. Real rooms, real broadcast, real middleware chain. **No port.** The whole file runs in 600ms.
 
 > **Tip**
 >
-> The honest test: **can this behaviour be reordered, or turned off, at runtime?** If yes, it is middleware. If it is inherent to the method - "this method is the one that touches the disk, and touching the disk is worth timing" - it is a decorator. If you find yourself building a registry so that decorators can be composed and reordered, you have written middleware with worse error messages.
+> The first draft of that test failed, and it was right to. I built `FakeClient` directly instead of calling `handler.welcome(client)` - so the client was never in the registry, received no broadcasts, and could not be whispered to. Which is *exactly* what would happen to a real socket the server had not been introduced to. The fake was faithful enough to reproduce a bug in my test setup, which is a good sign about the fake.
+
+## The tests worth having are regressions for bugs you shipped
+
+Anyone can write `expect(2 + 2).toBe(4)`. The tests that earn their keep are the ones that would have caught the bugs this tutorial **actually shipped and had to fix**.
+
+**Chapter 16 - the membership leak.** Rooms keyed membership on `client.label`, which is a nickname, which changes:
+
+```typescript
+it("does not leak room membership when a client renames", async () => {
+  const client = arrive(handler, 1);
+
+  await loggedIn(handler, client, "bob", "hunter2");
+  await say(handler, client, { type: "join", room: "general" });
+  expect(registry.rooms.get("general")?.memberCount).toBe(1);
+
+  await loggedIn(handler, client, "alice", "correct-horse");   // rename, in place
+  expect(registry.rooms.get("general")?.memberCount).toBe(1);  // not 2
+
+  await say(handler, client, { type: "leave" });
+  expect(registry.rooms.get("general")?.memberCount).toBe(0);  // not 1
+});
+```
+
+**Chapter 12 - the restamped archive.** `load()` rebuilt history with `new ChatMessage(...)`, whose constructor stamps `Date.now()`, so every restart relabelled the entire archive with the boot time:
+
+```typescript
+it("restores a message with its ORIGINAL timestamp", () => {
+  const then = 1_600_000_000_000;
+  const restored = ChatMessage.restore({ sender: "alice", text: "old", room: "general", at: then });
+  expect(restored.at).toBe(then);
+});
+```
+
+**Chapter 12 - ordering.** `await` took away what a `for` loop gave for free:
+
+```typescript
+it("runs tasks strictly in the order they were submitted", async () => {
+  const queue = new Serializer();
+  const order: number[] = [];
+  const results = [30, 5, 20, 1].map((ms, i) =>
+    queue.run(async () => { await delay(ms); order.push(i); }),
+  );
+  await Promise.all(results);
+  expect(order).toEqual([0, 1, 2, 3]);   // NOT [3, 1, 2, 0]
+});
+```
+
+And a test for a fact that surprises people:
+
+```typescript
+it("does NOT cancel the loser - a Promise cannot be un-started", async () => {
+  let finished = false;
+  const work = delay(60).then(() => { finished = true; return "done"; });
+  await expect(withTimeout(work, 10, "x")).rejects.toThrow(TimeoutError);
+  expect(finished).toBe(false);   // not yet
+  await delay(80);
+  expect(finished).toBe(true);    // it kept running. Nobody was listening.
+});
+```
+
+> **Note**
+>
+> **Prove your regression tests can fail.** I reintroduced both bugs - put `client.label` back into `room.leave`, took `ChatMessage.restore` back out - and re-ran the suite:
+>
+> ```
+> × MessageHandler > does not leak room membership when a client renames
+> × ChatRoom > restores a message with its ORIGINAL timestamp
+> ```
+>
+> Then restored the fixes and got 56 green. A regression test you have never watched fail is a test you are trusting on faith. It takes ninety seconds to check, and the alternative is a suite full of assertions that were quietly rewritten into tautologies during a refactor.
+
+## The security tests
+
+These are the ones that would actually stop a breach:
+
+```typescript
+it("refuses the alg:none forgery", () => {
+  const forged =
+    b64({ alg: "none", typ: "JWT" }) + "." +
+    b64({ sub: "u1", name: "alice", admin: true, iat: 0, exp: 9999999999 }) + ".";
+  expect(verify(forged, SECRET).ok).toBe(false);
+});
+
+it("gives the same answer for a wrong password and an unknown user", async () => {
+  await say(handler, a, { type: "login", name: "alice",   password: "wrong" });
+  await say(handler, b, { type: "login", name: "mallory", password: "wrong" });
+  expect(a.last("error")?.message).toBe(b.last("error")?.message);
+});
+
+it("is not encrypted - anyone holding it can read every claim", () => {
+  const payload = JSON.parse(Buffer.from(token.split(".")[1]!, "base64url").toString());
+  expect(payload.name).toBe("alice");   // this is the point, not a bug
+});
+```
+
+That last one is a test asserting a **weakness**, on purpose. It is executable documentation: it will fail the day somebody "fixes" it by encrypting the payload, and the failure will make them read the comment explaining why it is not encrypted.
+
+## What tests cannot do
+
+Chapter 17 built a constant-time signature comparison. Now go and replace it:
+
+```typescript
+if (signature === expected) { ... }   // instead of timingSafeEqual
+```
+
+**Every test in this suite still passes.** All 56.
+
+You have reintroduced a timing side channel - a real, exploitable vulnerability - and the test suite is bright green, because a test asserts *what* a function returns and this bug is about *how long it took*. No assertion you are likely to write will ever catch it.
+
+This is not an argument against testing. It is an argument against believing a green suite means the code is correct. **A test suite tells you the things you thought to check are still true.** It does not tell you the code is safe. Some properties - timing, memory growth, what a stranger can make your server hold - are simply not in the shape a test has.
+
+## Interlude: the test runner does not compile your code the way your compiler does
+
+Adding the tests broke the tests, and the failure said this:
+
+```
+SyntaxError: Invalid or unexpected token
+```
+
+No file. No line. No clue. It took bisecting the import graph to find that the offending token was `@timed` - the decorator added one chapter ago.
+
+Vitest transforms TypeScript with **esbuild**, whose default target is `esnext`. `esnext` is assumed to support decorators *natively*, so esbuild helpfully left `@timed` exactly where it found it - and Node 22 does not support decorators natively. Meanwhile `tsc`, which does `npm run build`, had been compiling them away all along.
+
+```typescript
+// vitest.config.ts
+export default defineConfig({
+  esbuild: { target: "es2022" },   // a target WITHOUT decorators, so they get lowered
+  test: { include: ["src/**/*.test.ts"] },
+});
+```
+
+The build and the tests now agree about what the language is. That is the actual lesson, and it is worth more than the fix: **your test runner has its own compiler, and it does not necessarily agree with yours.**
+
+(Worth knowing: newer Vite builds on rolldown/oxc rather than esbuild, and that pipeline does not lower standard decorators at all. This project pins the esbuild line for exactly that reason.)
 
 ## Putting It Together
 
-`src/decorators.ts`
+`src/testing.ts` - the double.
 
 ```typescript
-// Decorators, and an honest account of where they belong.
+// A client that is not attached to anything.
 //
-// This chapter's own advice - and it is right - is that our chat server wants
-// *middleware*, not decorators. Chapter 17 built a chain, `rateLimit →
-// requireAuth → handler`, and it is the correct shape: we process a stream of
-// messages, the behaviour is independent of any class, and the order has to be
-// changeable at runtime. None of that is what a decorator is for, and rewriting
-// it as one would be a downgrade with better branding.
+// This is Chapter 11's promise, collected. `MessageHandler` accepts a
+// `ChatClient` - an interface - so a client that never touches a socket is
+// indistinguishable, to the handler, from a browser tab.
 //
-// So this file does not replace the middleware. It does the thing decorators are
-// genuinely good at, which the chapter names precisely: **cross-cutting behaviour
-// attached to a specific method**.
+// Note what it *extends*. `FakeClient` is a subclass of the real `BaseClient`, so
+// it inherits the real state machine, the real `label`, the real transitions -
+// everything from Chapter 16 that decides whether you may enter a room. Only the
+// two methods that put bytes on a wire are replaced.
 //
-// Chapter 15 gave the server the ability to notice it was slow. It gave it no
-// way at all to notice *what* was slow. `@timed` wraps the handful of operations
-// that can actually take time - scrypt, by design; the disk, by nature - and
-// nothing about FileHistory or Accounts had to learn what a metric is.
+// That distinction is the whole difference between a useful test double and a
+// useless one. Reimplement the logic in your fake and you are testing your fake.
+// Fake only the *edge* - the socket - and everything above it is the code that
+// actually ships.
 
-import { performance } from "node:perf_hooks";
-import type { Metrics } from "./runtime.js";
+import { BaseClient } from "./clients.js";
+import { ConnectionState, type ServerMessage, type ServerMessageType } from "./protocol.js";
+import { clientId } from "./types.js";
 
-// --- Standard decorators, not legacy ones --------------------------------
-//
-// Nearly every decorator tutorial you will find - including this chapter's own
-// first listing - shows you this:
-//
-//     function log(target: any, key: string, descriptor: PropertyDescriptor)
-//
-// That is the **legacy** decorator, it requires `"experimentalDecorators": true`
-// in tsconfig, and it is built on a TC39 proposal that was abandoned. It also
-// has `any` in it twice, which Chapter 3 had opinions about.
-//
-// TypeScript 5.0 ships the **standard** decorator - Stage 3, on its way into
-// JavaScript itself, no compiler flag required, and properly typed. That is what
-// this file uses. It reads a little stranger and it is worth it: the signature
-// below has no `any` anywhere, and the compiler checks that a decorator is
-// applied to a method whose shape it can actually handle.
+export class FakeClient extends BaseClient {
+  // Every message the server tried to send this client, in order. A socket, if
+  // you like, that only ever writes to an array.
+  readonly outbox: ServerMessage[] = [];
 
-// What a class must provide before it may be @timed.
-//
-// This is the awkward truth about decorators, and the chapter does not mention
-// it: a decorator runs at *class definition* time, when no instance exists, so it
-// cannot be handed a dependency. It has three options - reach for a global, take
-// the dependency as an argument (and then it is not really a decorator), or
-// require the instance to carry it.
-//
-// We require the instance to carry it. `T extends Measured` is the compiler
-// enforcing that: put `@timed` on a class with no `metrics` field and it does not
-// compile. The dependency is still injected - Chapter 11's rule holds, no
-// singletons - the decorator simply reads it off `this`.
-export interface Measured {
-  readonly metrics: Metrics;
-}
+  constructor(sequence = 1) {
+    super(clientId(`f${sequence}`), "tcp", ConnectionState.Connected);
+    this.markConnected();
+  }
 
-export function timed<T extends Measured, A extends unknown[], R>(subject: string) {
-  return function decorate(
-    original: (this: T, ...args: A) => R,
-    context: ClassMethodDecoratorContext<T, (this: T, ...args: A) => R>,
-  ): (this: T, ...args: A) => R {
-    // `context.name` is the method's own name, supplied by the runtime. No
-    // stringly-typed duplication: rename the method and the metric renames itself.
-    const label = `${subject}.${String(context.name)}`;
+  send(message: ServerMessage): void {
+    this.outbox.push(message);
+  }
 
-    return function timedMethod(this: T, ...args: A): R {
-      const started = performance.now();
-      const elapsed = (): number => performance.now() - started;
+  end(message: ServerMessage): void {
+    this.outbox.push(message);
+    this.markClosing();
+  }
 
-      let result: R;
-      try {
-        result = original.apply(this, args);
-      } catch (thrown: unknown) {
-        // Threw synchronously.
-        this.metrics.record(label, elapsed(), false);
-        throw thrown;
+  // Never behind, because there is no wire to be behind on.
+  get backlog(): number {
+    return 0;
+  }
+
+  protected destroy(): void {
+    this.markClosed();
+  }
+
+  // --- Reading what happened ---------------------------------------------
+
+  // The last message of a given type, or undefined. Tests should assert on what
+  // the server *said*, not on how it said it - this is the whole vocabulary they
+  // need.
+  last<K extends ServerMessageType>(type: K): Extract<ServerMessage, { type: K }> | undefined {
+    for (let i = this.outbox.length - 1; i >= 0; i--) {
+      const message = this.outbox[i];
+      if (message?.type === type) {
+        return message as Extract<ServerMessage, { type: K }>;
       }
+    }
+    return undefined;
+  }
 
-      // And here is the part every decorator tutorial quietly skips.
-      //
-      // If the method is `async`, it has not finished - it has handed back a
-      // Promise, and `elapsed()` right now would measure how long it took to
-      // *start*, which is approximately zero and completely useless. Almost every
-      // hand-rolled @timed decorator in the wild has this bug, and it reports
-      // beautiful sub-millisecond timings for operations that take a second.
-      //
-      // So: if we got a Promise, measure when it settles.
-      if (result instanceof Promise) {
-        const measured = result.then(
-          (value: unknown) => {
-            this.metrics.record(label, elapsed(), true);
-            return value;
-          },
-          (thrown: unknown) => {
-            this.metrics.record(label, elapsed(), false);
-            throw thrown;
-          },
-        );
-        // The one assertion. `R` is known to be a Promise inside this branch, but
-        // TypeScript cannot narrow a *generic* type parameter by an instanceof on
-        // its value - R is still R. The cast restates what the branch just proved.
-        return measured as R;
-      }
+  all<K extends ServerMessageType>(type: K): Extract<ServerMessage, { type: K }>[] {
+    return this.outbox.filter((m): m is Extract<ServerMessage, { type: K }> => m.type === type);
+  }
 
-      this.metrics.record(label, elapsed(), true);
-      return result;
-    };
-  };
+  get errorCodes(): string[] {
+    return this.all("error").map((m) => m.code);
+  }
+
+  clear(): void {
+    this.outbox.length = 0;
+  }
 }
 ```
+
+`src/handler.test.ts` - the chat rules, with no socket.
+
+```typescript
+// The chat rules, driven with no socket, no port, and no waiting.
+//
+// This is Chapter 11's promise collected. Every test in this file runs the code
+// that actually ships - the real handler, the real state machine, the real
+// registry - against a client whose only unusual property is that it writes to an
+// array instead of a wire.
+import { describe, it, expect, beforeEach, afterEach } from "vitest";
+import { rm } from "node:fs/promises";
+import { MessageHandler } from "./handler.js";
+import { Registry } from "./state.js";
+import { createBus } from "./bus.js";
+import { FileHistory } from "./history.js";
+import { Accounts, Sessions } from "./auth.js";
+import { Metrics } from "./runtime.js";
+import { configure, DEFAULTS } from "./config.js";
+import { FakeClient } from "./testing.js";
+import { ErrorCode } from "./errors.js";
+
+const DATA = "data-test-handler";
+
+async function build() {
+  const config = configure(DEFAULTS, { dataDir: DATA, historyLimit: 10 });
+  const registry = new Registry(config);
+  const metrics = new Metrics();
+  const history = new FileHistory(config.dataDir, metrics);
+  await history.open();
+  const accounts = new Accounts(metrics);
+  await accounts.seedDefaults();
+  const sessions = new Sessions();
+  const bus = createBus(registry, history);
+  const handler = new MessageHandler(registry, bus, history, accounts, sessions, config);
+  return { handler, registry, sessions, config };
+}
+
+// Drive the client the way a socket would: one JSON line at a time.
+const say = (h: MessageHandler, c: FakeClient, m: unknown) => h.handleLine(c, JSON.stringify(m));
+
+// What ChatServer does on accept(). A client the handler has not been introduced
+// to is not in the registry - so it receives no broadcasts and cannot be
+// whispered to, which is exactly right and exactly what the first draft of this
+// file forgot.
+function arrive(h: MessageHandler, sequence: number): FakeClient {
+  const client = new FakeClient(sequence);
+  h.welcome(client);
+  client.clear();
+  return client;
+}
+
+async function loggedIn(h: MessageHandler, c: FakeClient, name: string, password: string) {
+  await say(h, c, { type: "login", name, password });
+  const token = c.last("token");
+  if (token === undefined) throw new Error("no token issued");
+  await say(h, c, { type: "auth", token: token.token });
+}
+
+describe("MessageHandler", () => {
+  let ctx: Awaited<ReturnType<typeof build>>;
+  beforeEach(async () => { ctx = await build(); });
+  afterEach(async () => { await rm(DATA, { recursive: true, force: true }); });
+
+  it("refuses everything before you have proved who you are", async () => {
+    const { handler } = ctx;
+    const alice = arrive(handler, 1);
+    await say(handler, alice, { type: "join", room: "general" });
+    await say(handler, alice, { type: "chat", text: "let me in" });
+    expect(alice.errorCodes).toEqual([ErrorCode.Unauthenticated, ErrorCode.Unauthenticated]);
+  });
+
+  it("logs in, joins, and chats", async () => {
+    const { handler } = ctx;
+    const alice = arrive(handler, 1);
+    await loggedIn(handler, alice, "alice", "correct-horse");
+    expect(alice.last("authenticated")?.admin).toBe(true);
+
+    await say(handler, alice, { type: "join", room: "general" });
+    expect(alice.last("joined")?.room).toBe("general");
+  });
+
+  it("gives the same answer for a wrong password and an unknown user", async () => {
+    const { handler } = ctx;
+    const a = arrive(handler, 1);
+    const b = arrive(handler, 2);
+    await say(handler, a, { type: "login", name: "alice", password: "wrong" });
+    await say(handler, b, { type: "login", name: "mallory", password: "wrong" });
+    expect(a.last("error")?.message).toBe(b.last("error")?.message);
+    expect(a.last("error")?.code).toBe(ErrorCode.BadCredentials);
+  });
+
+  // -------------------------------------------------------------------
+  // REGRESSION: the membership leak (Chapter 16).
+  //
+  // Rooms used to store membership under client.label - a nickname, which
+  // changes. Join, rename, leave, and the room kept a member who was not there,
+  // permanently. This is the test that would have caught it in Chapter 5.
+  // -------------------------------------------------------------------
+  it("does not leak room membership when a client renames", async () => {
+    const { handler, registry } = ctx;
+    const client = arrive(handler, 1);
+
+    await loggedIn(handler, client, "bob", "hunter2");
+    await say(handler, client, { type: "join", room: "general" });
+    expect(registry.rooms.get("general")?.memberCount).toBe(1);
+
+    // Rename to a different account, in place. The id does not change.
+    await loggedIn(handler, client, "alice", "correct-horse");
+    expect(registry.rooms.get("general")?.memberCount).toBe(1);   // not 2
+
+    await say(handler, client, { type: "leave" });
+    expect(registry.rooms.get("general")?.memberCount).toBe(0);   // not 1
+  });
+
+  it("delivers a message from one client to another", async () => {
+    const { handler } = ctx;
+    const alice = arrive(handler, 1);
+    const bob = arrive(handler, 2);
+    await loggedIn(handler, alice, "alice", "correct-horse");
+    await loggedIn(handler, bob, "bob", "hunter2");
+    await say(handler, alice, { type: "join", room: "general" });
+    await say(handler, bob, { type: "join", room: "general" });
+    bob.clear();
+
+    await say(handler, alice, { type: "chat", text: "hello everyone" });
+
+    const heard = bob.last("chat");
+    expect(heard?.sender).toBe("alice");
+    expect(heard?.text).toBe("hello everyone");
+  });
+
+  it("lets an admin kick, and refuses everyone else", async () => {
+    const { handler } = ctx;
+    const alice = arrive(handler, 1);   // admin
+    const bob = arrive(handler, 2);     // not
+    await loggedIn(handler, alice, "alice", "correct-horse");
+    await loggedIn(handler, bob, "bob", "hunter2");
+    await say(handler, alice, { type: "join", room: "general" });
+    await say(handler, bob, { type: "join", room: "general" });
+
+    await say(handler, bob, { type: "kick", target: "alice", reason: "no" });
+    expect(bob.last("error")?.code).toBe(ErrorCode.NotPermitted);
+
+    await say(handler, alice, { type: "kick", target: "bob", reason: "spam" });
+    expect(bob.last("kicked")?.by).toBe("alice");
+  });
+
+  it("rate-limits a flood", async () => {
+    const { handler } = ctx;
+    const alice = arrive(handler, 1);
+    await loggedIn(handler, alice, "alice", "correct-horse");
+    await say(handler, alice, { type: "join", room: "general" });
+    alice.clear();
+
+    for (let i = 0; i < 40; i++) await say(handler, alice, { type: "chat", text: `flood ${i}` });
+
+    expect(alice.errorCodes.filter((c) => c === ErrorCode.RateLimited).length).toBeGreaterThan(0);
+  });
+
+  it("creates a room on demand and reaps it when the last person leaves", async () => {
+    const { handler, registry } = ctx;
+    const alice = arrive(handler, 1);
+    await loggedIn(handler, alice, "alice", "correct-horse");
+
+    expect(registry.rooms.has("standup")).toBe(false);
+    await say(handler, alice, { type: "join", room: "standup" });
+    expect(registry.rooms.has("standup")).toBe(true);
+
+    await say(handler, alice, { type: "leave" });
+    expect(registry.rooms.has("standup")).toBe(false);   // reaped
+    expect(registry.rooms.has("general")).toBe(true);    // permanent: kept
+  });
+});
+```
+
+`src/jwt.test.ts` - the tests that stop a breach.
+
+```typescript
+// The security tests. These are the ones that would actually stop a breach.
+import { describe, it, expect } from "vitest";
+import { issue, verify } from "./jwt.js";
+import { ErrorCode } from "./errors.js";
+
+const SECRET = "a-test-secret-that-is-long-enough";
+const b64 = (o: unknown) => Buffer.from(JSON.stringify(o)).toString("base64url");
+
+describe("jwt", () => {
+  it("round-trips the claims it was given", () => {
+    const { token } = issue({ sub: "u1", name: "alice", admin: true }, SECRET, 60);
+    const result = verify(token, SECRET);
+    expect(result.ok).toBe(true);
+    if (result.ok) {
+      expect(result.value.sub).toBe("u1");
+      expect(result.value.name).toBe("alice");
+      expect(result.value.admin).toBe(true);
+    }
+  });
+
+  it("is not encrypted - anyone holding it can read every claim", () => {
+    const { token } = issue({ sub: "u1", name: "alice", admin: true }, SECRET, 60);
+    const payload = JSON.parse(Buffer.from(token.split(".")[1]!, "base64url").toString());
+    expect(payload.name).toBe("alice");   // this is the point, not a bug
+  });
+
+  // THE attack. A library that reads `alg` out of the attacker-supplied header
+  // and trusts it will accept this, and the attacker is now an admin.
+  it("refuses the alg:none forgery", () => {
+    const forged =
+      b64({ alg: "none", typ: "JWT" }) + "." +
+      b64({ sub: "u1", name: "alice", admin: true, iat: 0, exp: 9999999999 }) + ".";
+    const result = verify(forged, SECRET);
+    expect(result.ok).toBe(false);
+    if (!result.ok) expect(result.error.code).toBe(ErrorCode.BadToken);
+  });
+
+  it("refuses a tampered payload with a reused signature", () => {
+    const { token } = issue({ sub: "u2", name: "bob", admin: false }, SECRET, 60);
+    const signature = token.split(".")[2]!;
+    const tampered =
+      b64({ alg: "HS256", typ: "JWT" }) + "." +
+      b64({ sub: "u2", name: "bob", admin: true, iat: 0, exp: 9999999999 }) + "." + signature;
+    expect(verify(tampered, SECRET).ok).toBe(false);
+  });
+
+  it("refuses a token signed with a different secret", () => {
+    const { token } = issue({ sub: "u1", name: "alice", admin: true }, "some-other-secret", 60);
+    expect(verify(token, SECRET).ok).toBe(false);
+  });
+
+  it("refuses an expired token, and says so distinctly", () => {
+    const { token } = issue({ sub: "u1", name: "alice", admin: true }, SECRET, -1);
+    const result = verify(token, SECRET);
+    expect(result.ok).toBe(false);
+    // A distinct code: "expired" means log in again; "forged" means something else.
+    if (!result.ok) expect(result.error.code).toBe(ErrorCode.TokenExpired);
+  });
+
+  it.each(["", "not.a.token", "a.b", "a.b.c.d"])("refuses malformed %o", (bad) => {
+    expect(verify(bad, SECRET).ok).toBe(false);
+  });
+});
+```
+
+`src/protocol.test.ts`, `src/state.test.ts`, `src/async.test.ts` and `src/router.test.ts` cover the decoder's error-code contract, rooms and reaping, ordering and timeouts, and the typed router.
 
 ## Try It
 
 ```bash
-npm run build && npm start
+npm test          # once
+npm run test:watch # on every save
 ```
 
-```json
-{"type":"login","name":"alice","password":"correct-horse"}
-{"type":"auth","token":"..."}
-{"type":"join","room":"general"}
-{"type":"chat","text":"hello"}
+```
+ ✓ src/async.test.ts     (6 tests)
+ ✓ src/router.test.ts    (5 tests)
+ ✓ src/state.test.ts     (8 tests)
+ ✓ src/jwt.test.ts       (10 tests)
+ ✓ src/protocol.test.ts  (19 tests)
+ ✓ src/handler.test.ts   (8 tests)
+
+ Test Files  6 passed (6)
+      Tests  56 passed (56)
 ```
 
-```bash
-curl -s http://127.0.0.1:8080/api/health | jq .operations
-```
-
-Then break the decorator on purpose. Delete the `instanceof Promise` branch, restart, and watch `history.append` report `0.01ms` for a disk write. That is the number you would have shipped, and the dashboard would have looked wonderful.
+Then break something on purpose and watch the right test go red. That is the only way to know you have a test suite rather than a decoration.
 
 ## Exercise
 
-1. Delete the `result instanceof Promise` branch and compare `/api/health` before and after. Which of the two numbers would you have believed?
-2. `@timed` reports `failures: 0` for a rejected login, because `login()` returns a `Result`. Fix it. Now ask whether `@timed` is still a general-purpose decorator, and what you gave up.
-3. Write `@retry(3)` for `FileHistory.append`. Then work out how it interacts with the `Serializer` (Chapter 12) that guarantees ordering - does a retried write still land in the right place?
-4. Put `@timed` on a class with no `metrics` field. Read the error. That is `T extends Measured` doing its job.
-5. Reimplement `requireAuth` from Chapter 17 as a decorator on `handleMessage`. You will need the session store - which is on the instance, so it works. Now try to reorder it relative to `rateLimit` without editing the source. That is the whole chapter in one exercise.
+1. Replace `timingSafeEqual` with `===` in `jwt.ts`. All 56 tests pass. Now write a test that catches it. How many samples do you need, and would you trust the result on a laptop with a browser open?
+2. `handler.test.ts` writes real files to `data-test-handler/`. Make `FileHistory` an interface and write an `InMemoryHistory`. The tests get faster - what did you stop testing?
+3. Add a test for the Chapter 15 backpressure eviction. You will need a `FakeClient` whose `backlog` you can control. Notice that the *design* - `backlog` on the interface - is what makes it testable at all.
+4. Run `npx vitest --coverage`. Find the line with the lowest coverage that you would be most upset to have wrong. Test that one. Ignore the percentage.
+5. Delete `vitest.config.ts` and read the error. You now know something about your toolchain that most people find out at the worst possible moment.
 
 ## What's Next
 
-Every chapter of this tutorial has ended with me running the server, opening `nc`, typing JSON at it, and reading what came back. That worked, and it does not scale, and - as Chapter 17 exercise 2 pointed out - it would never have caught a timing side channel anyway.
+The chat server has a test suite: 56 tests, no sockets, running in under a second - covering the decoder's error contract, the room lifecycle, async ordering, the typed router, both JWT forgeries, and regressions for every bug this tutorial shipped and fixed.
 
-Chapter 11 promised this. `MessageHandler` takes a `ChatClient`, which is an interface; `Registry` is a class you can construct; the whole chat rule set can be driven by a fake client that pushes onto an array. We have been building toward being able to test this thing without a socket for eight chapters.
+More importantly, it has a test suite that has been **watched to fail**, and an honest account of the vulnerability class it cannot see.
 
-Next: **testing** - and collecting on that promise.
+The server as it stands runs: one port, three protocols, a validated wire format, an error boundary that has never once let a stranger's typo take the process down, history that survives a restart, a bounded runtime, real passwords, and a door that is shut.
+
+Next: **structured logging, config and a real command line** - because the server is now good enough to run somewhere you cannot watch it, and `console.log` is not.
 
 ---
 
-Source: <https://purphoros.com/howto/typescript/decorators>
+Source: <https://purphoros.com/howto/typescript/testing>
