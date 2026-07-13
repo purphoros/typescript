@@ -15,6 +15,9 @@ export type ServerConfig = Readonly<{
   // Rooms are created on demand (Chapter 16), which means a stranger can create
   // them. Chapter 15's rule applies: anything a stranger can grow, bound.
   maxRooms: number;
+  // The HMAC key every token is signed with. Anyone who has it can mint an admin.
+  jwtSecret: string;
+  tokenTtlSeconds: number;
 }>;
 
 // `as const` gives every field its literal type and makes the object readonly:
@@ -28,6 +31,11 @@ export const DEFAULTS = {
   historyLimit: 50,
   dataDir: "data",
   maxRooms: 100,
+  // A default that is safe only because it is obviously not a secret, and because
+  // fromEnvironment() refuses to start with it in production. A "sensible
+  // default" for a signing key is a backdoor with good manners.
+  jwtSecret: "development-secret-not-for-production",
+  tokenTtlSeconds: 60 * 60 * 24,   // 24 hours
 } as const;
 
 // A client that connects and says nothing is assumed to be a human at a
@@ -87,12 +95,32 @@ export function fromEnvironment(env: NodeJS.ProcessEnv, argv: readonly string[])
 
   const e = parsed.data;
 
+  // The one setting the server will not guess at.
+  //
+  // A signing secret with a default is not a default, it is a published private
+  // key: every deployment that forgets to set it shares one, and anyone who has
+  // read this file can mint themselves an admin token for any of them. So in
+  // production, its absence is fatal - the server does not start, and says why.
+  //
+  // In development it falls back, loudly. The noise is the feature: a warning you
+  // see every single time you start the server is a warning you will eventually
+  // act on, and a silent fallback is one you will ship.
+  if (e.NODE_ENV === "production" && e.JWT_SECRET === undefined) {
+    console.error("JWT_SECRET is required in production. Refusing to start with a public default.");
+    process.exit(1);
+  }
+  if (e.JWT_SECRET === undefined) {
+    console.warn("⚠  JWT_SECRET is not set. Using the development default - do not deploy this.");
+  }
+
   return configure(DEFAULTS, {
     ...(e.HOST !== undefined ? { host: e.HOST } : {}),
     ...(e.PORT !== undefined ? { port: e.PORT } : {}),
     ...(e.DATA_DIR !== undefined ? { dataDir: e.DATA_DIR } : {}),
     ...(e.HISTORY_LIMIT !== undefined ? { historyLimit: e.HISTORY_LIMIT } : {}),
     ...(e.ROOMS !== undefined ? { rooms: e.ROOMS } : {}),
+    ...(e.JWT_SECRET !== undefined ? { jwtSecret: e.JWT_SECRET } : {}),
+    ...(e.TOKEN_TTL_SECONDS !== undefined ? { tokenTtlSeconds: e.TOKEN_TTL_SECONDS } : {}),
     // argv last: it beats everything, because you typed it thirty seconds ago.
     ...(argv[2] !== undefined ? { port: resolvePort(argv[2]) } : {}),
   });

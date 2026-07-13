@@ -128,6 +128,7 @@ export interface ChatClient extends Identifiable {
   identifyAs(user: User): void;
   enterRoom(name: RoomName): void;
   exitRoom(): void;
+  forget(): void;
 }
 
 // A custom type guard. AdminUser is the only variant carrying `adminLevel`, so

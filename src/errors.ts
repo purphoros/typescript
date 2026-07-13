@@ -58,6 +58,11 @@ export enum ErrorCode {
   NotIdentified = "not_identified",
   NoSuchTarget = "no_such_target",
   NotPermitted = "not_permitted",
+  Unauthenticated = "unauthenticated",
+  BadCredentials = "bad_credentials",
+  BadToken = "bad_token",
+  TokenExpired = "token_expired",
+  RateLimited = "rate_limited",
   Timeout = "timeout",
   Internal = "internal",
 }
@@ -119,6 +124,23 @@ export class PermissionError extends ChatError {
 export class StateError extends ChatError {
   constructor(message: string, code: ErrorCode = ErrorCode.NotInRoom) {
     super(message, code, 409);
+  }
+}
+
+// You are not who you say you are, or you have not said. 401, not 403: the
+// difference is "I do not know who you are" versus "I know exactly who you are
+// and the answer is still no", and conflating them is why so many APIs return
+// 403 to a logged-out user and confuse everybody.
+export class AuthError extends ChatError {
+  constructor(message: string, code: ErrorCode = ErrorCode.Unauthenticated) {
+    super(message, code, 401);
+  }
+}
+
+// Too much, too fast.
+export class RateLimitError extends ChatError {
+  constructor(message: string) {
+    super(message, ErrorCode.RateLimited, 429);
   }
 }
 

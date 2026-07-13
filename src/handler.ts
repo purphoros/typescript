@@ -10,8 +10,10 @@
 // handler cannot tell the difference. You do not test a chat rule by opening a
 // TCP port, and if you have to, the rule is in the wrong file.
 
-import { HISTORY_ON_JOIN } from "./config.js";
+import { HISTORY_ON_JOIN, type ServerConfig } from "./config.js";
 import { asError, ChatError, NotFoundError, PermissionError, toSafeError, ErrorCode } from "./errors.js";
+import { authenticate, resume, type Accounts, type Sessions } from "./auth.js";
+import { chain, rateLimit, requireAuth, type Middleware } from "./middleware.js";
 import {
   assertNever,
   CATALOG,
@@ -42,15 +44,30 @@ export function toErrorMessage(thrown: unknown): ServerMessage {
 }
 
 export class MessageHandler {
-  // The registry, the bus and the history arrive as constructor arguments rather
-  // than imports. That one change is what makes this class a unit: give it a
-  // different registry and it manages a different world, which is precisely what
-  // a test wants to do.
+  private readonly pipeline: Middleware;
+
+  // Everything arrives as a constructor argument rather than an import. That one
+  // change is what makes this class a unit: give it a different registry and it
+  // manages a different world, which is precisely what a test wants to do.
   constructor(
     private readonly registry: Registry,
     private readonly bus: Bus,
     private readonly history: FileHistory,
-  ) {}
+    private readonly accounts: Accounts,
+    private readonly sessions: Sessions,
+    private readonly config: ServerConfig,
+  ) {
+    // Order matters, and it is an argument about cost.
+    //
+    // rateLimit first, because it is the cheapest check in the building - one
+    // subtraction - and refusing a flood should not require us to first do the
+    // expensive thing. Put auth first and a flood of unauthenticated messages
+    // makes the server do a map lookup per message before declining; put
+    // rateLimit first and it does arithmetic.
+    //
+    // Then requireAuth. Then, only then, the handler.
+    this.pipeline = chain(rateLimit(20, 10), requireAuth(this.sessions));
+  }
 
   // The error boundary. Every line from every client, on either transport,
   // passes through exactly here, and nothing thrown below it escapes.
@@ -76,7 +93,12 @@ export class MessageHandler {
         client.send(toErrorMessage(decoded.error));
         return;
       }
-      await this.handleMessage(client, decoded.value);
+      // The message goes through the chain, and the chain decides whether the
+      // handler ever sees it. A middleware that refuses simply throws - and the
+      // catch below, which has been here since Chapter 10, turns it into an
+      // error message without knowing or caring that middleware exists.
+      const message = decoded.value;
+      await this.pipeline(client, message, () => this.handleMessage(client, message));
     } catch (thrown: unknown) {
       if (!(thrown instanceof ChatError)) {
         this.bus.emit("failure", client.label, asError(thrown));
@@ -177,39 +199,68 @@ export class MessageHandler {
         return;
       }
 
-      case "nick": {
-        // `message.name` is already known to be a well-formed nickname - 1-20
-        // characters, letters, digits, _ or - - because the schema said so before
-        // this function was ever called. Chapter 10 checked that here, with
-        // validateNickname; the check has not disappeared, it has moved to the
-        // field it constrains, which is the only place it can never be forgotten.
+      case "login": {
+        // The only place in the server that ever sees a password.
         //
-        // What is left is the one question a schema cannot answer: is there a
-        // person by that name? A ValidationError means the name is not a name.
-        // This is a NotFoundError, and it means the name is fine and nobody has it.
-        const user = registry.knownUsers.get(message.name);
-        if (user === undefined) {
-          throw new NotFoundError(
-            `Unknown user "${message.name}". Try: ${[...registry.knownUsers.keys()].join(", ")}`,
-            ErrorCode.UnknownUser,
-          );
+        // Note that this does NOT log you in. It hands back a token, and the
+        // client presents that token with `auth`. Two steps, deliberately: the
+        // password is used once and forgotten, and everything afterwards -
+        // including reconnecting tomorrow - happens with a credential that can
+        // expire on its own.
+        const result = await authenticate(
+          this.accounts,
+          message.name,
+          message.password,
+          this.config.jwtSecret,
+          this.config.tokenTtlSeconds,
+        );
+        if (!result.ok) {
+          // The log knows it was `alice` who failed. The client is told only
+          // "wrong name or password" - see Accounts.login.
+          bus.emit("notice", `failed login for "${message.name}" from ${client.id}`);
+          throw result.error;
         }
-        // Who they were a moment ago - before identifyAs overwrites it. A rename
-        // is only interesting if the name actually changed *and* somebody was
-        // there to see it.
+        client.send({ type: "token", token: result.value.token, expiresAt: result.value.expiresAt });
+        return;
+      }
+
+      case "auth": {
+        const session = resume(this.accounts, message.token, this.config.jwtSecret);
+        if (!session.ok) {
+          throw session.error;
+        }
+
         const before = client.label;
+        this.sessions.establish(client.id, session.value);
+        client.identifyAs(session.value.user);
 
-        client.identifyAs(user);
+        const user = session.value.user;
+        client.send({
+          type: "authenticated",
+          user: user.name,
+          admin: isAdmin(user),
+          expiresAt: session.value.expiresAt,
+        });
 
-        const role = isAdmin(user) ? ` You are an admin (level ${user.adminLevel}).` : "";
-        client.send({ type: "system", text: `You are now ${user.name}.${role}` });
-
-        // The room membership does not have to be touched. It is keyed by id, and
-        // the id did not change - which is the entire point of Chapter 16, visible
-        // in the code that is *not* here.
         if (client.room !== undefined && before !== user.name) {
           bus.emit("rename", client, before, user.name);
         }
+        return;
+      }
+
+      case "logout": {
+        // Leave the room first - the state machine will not let a client be in
+        // one without an identity, and we are about to take the identity away.
+        const room = client.room;
+        if (room !== undefined) {
+          registry.rooms.get(room)?.leave(client.id);
+          client.exitRoom();
+          bus.emit("leave", client, room);
+          this.reap(room);
+        }
+        this.sessions.revoke(client.id);
+        client.forget();
+        client.send({ type: "system", text: "Logged out." });
         return;
       }
 

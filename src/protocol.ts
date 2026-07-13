@@ -131,6 +131,8 @@ export interface CommandInfo {
 // handles the whole protocol - there is no thirteenth thing it might be sent.
 export type ServerMessage =
   | { type: "welcome"; id: string; transport: Transport; text: string }
+  | { type: "token"; token: string; expiresAt: Timestamp }
+  | { type: "authenticated"; user: UserId; admin: boolean; expiresAt: Timestamp }
   | { type: "system"; text: string }
   | { type: "chat"; sender: UserId; text: string; room: RoomName; at: Timestamp }
   | { type: "whisper"; from: UserId; to: UserId; text: string; at: Timestamp }
@@ -199,10 +201,20 @@ export const CATALOG: Record<ClientMessageType, CommandInfo> = {
     example: '{"type":"leave"}',
     description: "Leave your current room",
   },
-  nick: {
-    type: "nick",
-    example: '{"type":"nick","name":"alice"}',
-    description: "Claim an identity",
+  login: {
+    type: "login",
+    example: '{"type":"login","name":"alice","password":"correct-horse"}',
+    description: "Prove who you are. Returns a token.",
+  },
+  auth: {
+    type: "auth",
+    example: '{"type":"auth","token":"eyJhbGciOiJIUzI1NiJ9..."}',
+    description: "Present a token from a previous login",
+  },
+  logout: {
+    type: "logout",
+    example: '{"type":"logout"}',
+    description: "End this session",
   },
   who: {
     type: "who",

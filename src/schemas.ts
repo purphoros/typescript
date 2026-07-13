@@ -58,7 +58,10 @@ export const ClientMessageSchema = z.discriminatedUnion("type", [
   message({ type: z.literal("whisper"), to: nickname, text: chatText }),
   message({ type: z.literal("join"), room: roomName }),
   message({ type: z.literal("leave") }),
-  message({ type: z.literal("nick"), name: nickname }),
+  // `nick` is gone. It announced an identity; these two *prove* one.
+  message({ type: z.literal("login"), name: nickname, password: z.string().min(1).max(200) }),
+  message({ type: z.literal("auth"), token: z.string().min(1).max(4096) }),
+  message({ type: z.literal("logout") }),
   message({ type: z.literal("who") }),
   message({ type: z.literal("rooms") }),
   message({ type: z.literal("history"), limit: z.number().int().positive().max(500).optional() }),
@@ -92,6 +95,11 @@ export const PortSchema = z.coerce.number().int().min(1).max(65535);
 // and leaving you to find out later.
 export const EnvSchema = z.object({
   HOST: z.string().min(1).optional(),
+  // The signing secret. Optional here, and checked hard at startup - see
+  // config.ts, which refuses to run in production without it.
+  JWT_SECRET: z.string().min(16).optional(),
+  TOKEN_TTL_SECONDS: z.coerce.number().int().positive().max(60 * 60 * 24 * 30).optional(),
+  NODE_ENV: z.enum(["development", "production", "test"]).optional(),
   PORT: z.coerce.number().int().min(1).max(65535).optional(),
   DATA_DIR: z.string().min(1).optional(),
   HISTORY_LIMIT: z.coerce.number().int().positive().max(10_000).optional(),

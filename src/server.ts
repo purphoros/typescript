@@ -23,6 +23,7 @@ import { FileHistory } from "./history.js";
 import { HttpService, HTTP_REQUEST_LINE } from "./http.js";
 import { MessageHandler } from "./handler.js";
 import { ChatMessage } from "./model.js";
+import { Accounts, Sessions } from "./auth.js";
 import { Registry } from "./state.js";
 import { Runtime } from "./runtime.js";
 import { TcpClient, WsClient } from "./clients.js";
@@ -33,7 +34,11 @@ export class ChatServer {
   readonly bus: Bus;
   readonly history: FileHistory;
   readonly runtime = new Runtime();
+  readonly sessions = new Sessions();
 
+  // Populated in load(), because hashing passwords is deliberately slow and a
+  // constructor cannot await. See Accounts.seedDefaults.
+  readonly accounts = new Accounts();
   private readonly handler: MessageHandler;
   private readonly http: HttpService;
   private readonly wss: WebSocketServer;
@@ -43,7 +48,14 @@ export class ChatServer {
     this.registry = new Registry(config);
     this.history = new FileHistory(config.dataDir);
     this.bus = createBus(this.registry, this.history);
-    this.handler = new MessageHandler(this.registry, this.bus, this.history);
+    this.handler = new MessageHandler(
+      this.registry,
+      this.bus,
+      this.history,
+      this.accounts,
+      this.sessions,
+      config,
+    );
     this.http = new HttpService(this.registry, this.bus, this.history, this.runtime);
 
     // noServer: `ws` opens no port and does no listening. It only ever receives
@@ -75,6 +87,10 @@ export class ChatServer {
   // every result and decide. Which is exactly the decision being made here.
   async load(): Promise<void> {
     await this.history.open();
+
+    // Hashing passwords with scrypt costs real milliseconds - on purpose. Doing
+    // it here, once, means no user ever waits for it during a login.
+    await this.accounts.seedDefaults();
 
     const rooms = [...this.registry.rooms.values()];
     const results = await Promise.allSettled(

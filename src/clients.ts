@@ -142,7 +142,7 @@ export abstract class BaseClient implements ChatClient {
   enterRoom(name: RoomName): void {
     if (this.presence.status === "anonymous") {
       throw new StateError(
-        `Say who you are first, e.g. ${CATALOG.nick.example}`,
+        `Log in first, e.g. ${CATALOG.login.example}`,
         ErrorCode.NotIdentified,
       );
     }
@@ -154,6 +154,13 @@ export abstract class BaseClient implements ChatClient {
       throw new StateError("You are not in a room.");
     }
     this.presence = { status: "identified", user: this.presence.user };
+  }
+
+  // Back to being nobody. Logging out is a state transition like any other, and
+  // the machine makes it exactly one line - there is no scattered set of fields
+  // to remember to clear.
+  forget(): void {
+    this.presence = { status: "anonymous" };
   }
 
   // The transitions the server can drive. A connection walks Connecting →

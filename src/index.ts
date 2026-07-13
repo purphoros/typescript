@@ -35,6 +35,9 @@ export { Runtime } from "./runtime.js";
 export { isAdmin, clientId } from "./types.js";
 export { chatPage } from "./page.js";
 export { Router } from "./router.js";
+export { Accounts, Sessions, authenticate, resume, hashPassword, checkPassword } from "./auth.js";
+export { issue, verify } from "./jwt.js";
+export { chain, requireAuth, rateLimit } from "./middleware.js";
 export { ClientMessageSchema, PortSchema, EnvSchema } from "./schemas.js";
 
 export {
@@ -44,6 +47,8 @@ export {
   NotFoundError,
   PermissionError,
   StateError,
+  AuthError,
+  RateLimitError,
   TimeoutError,
   ErrorCode,
   ok,
@@ -65,6 +70,9 @@ export {
 } from "./protocol.js";
 
 export type { Result, SafeError } from "./errors.js";
+export type { Account, Session } from "./auth.js";
+export type { JwtPayload } from "./jwt.js";
+export type { Middleware } from "./middleware.js";
 export type { ServerConfig } from "./config.js";
 export type { RuntimeSnapshot } from "./runtime.js";
 export type { Bus, ChatEvent, ServerEvents } from "./bus.js";

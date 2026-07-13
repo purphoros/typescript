@@ -17,8 +17,8 @@ export function chatPage(clientCount: number, roomCount: number): string {
 <title>Chat</title>
 <h1>Chat server</h1>
 <p>${clientCount} client(s) connected across ${roomCount} rooms.</p>
-<p><small>Type a message, or /join general, /nick alice, /who, /rooms, /history,
-/w bob hello, /leave, /status, /help</small></p>
+<p><small>Start with <code>/login alice correct-horse</code>, then /join general.
+Also: /who, /rooms, /history, /w bob hello, /leave, /logout, /status, /help</small></p>
 <div id="log" style="font-family:monospace;white-space:pre-wrap"></div>
 <input id="input" style="width:30em" placeholder="/join general" autofocus>
 <script>
@@ -37,7 +37,9 @@ export function chatPage(clientCount: number, roomCount: number): string {
     const [command, ...rest] = input.slice(1).split(" ");
     switch (command) {
       case "join":    return { type: "join", room: rest[0] ?? "" };
-      case "nick":    return { type: "nick", name: rest[0] ?? "" };
+      case "login":   return { type: "login", name: rest[0] ?? "", password: rest.slice(1).join(" ") };
+      case "auth":    return { type: "auth", token: rest[0] ?? "" };
+      case "logout":  return { type: "logout" };
       case "leave":   return { type: "leave" };
       case "who":     return { type: "who" };
       case "rooms":   return { type: "rooms" };
@@ -58,6 +60,16 @@ export function chatPage(clientCount: number, roomCount: number): string {
     const time = (at) => new Date(at).toLocaleTimeString();
     switch (msg.type) {
       case "welcome":  return msg.text;
+      case "token":
+        // Keep it, so a reload does not mean typing the password again. This is
+        // localStorage, which is readable by any script on the page - the honest
+        // trade-off is discussed in the chapter, and an httpOnly cookie is the
+        // answer when you have one.
+        localStorage.setItem("chat-token", msg.token);
+        return "[got a token - sending it]";
+      case "authenticated":
+        return "You are " + msg.user + (msg.admin ? " (admin)" : "") +
+               ", until " + new Date(msg.expiresAt).toLocaleString();
       case "system":   return "[system] " + msg.text;
       case "chat":     return "[" + time(msg.at) + "] " + msg.sender + ": " + msg.text;
       case "whisper":  return "(private) " + msg.from + " → " + msg.to + ": " + msg.text;
@@ -89,11 +101,18 @@ export function chatPage(clientCount: number, roomCount: number): string {
     ws.onopen = () => {
       if (state === "reconnecting") log("[reconnected]");
       state = "connected";
+      // Reconnect without re-authenticating: this is what the token is *for*.
+      const saved = localStorage.getItem("chat-token");
+      if (saved) ws.send(JSON.stringify({ type: "auth", token: saved }));
     };
 
     ws.onmessage = (event) => {
       try {
-        log(render(JSON.parse(event.data)));
+        const msg = JSON.parse(event.data);
+        log(render(msg));
+        // A fresh token is immediately presented. login -> token -> auth, without
+        // the human doing the second step.
+        if (msg.type === "token") ws.send(JSON.stringify({ type: "auth", token: msg.token }));
       } catch {
         log("[unparseable] " + event.data);
       }
