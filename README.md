@@ -1,212 +1,323 @@
-# Chapter 01 - Hello, TypeScript
+# Chapter 02 - TypeScript Fundamentals
 
-Installing the toolchain, creating your first project, and understanding how TypeScript compiles to JavaScript.
+Variables, types, functions, arrays, tuples, and control flow - the core language you need before writing any real code.
 
-> **Note**
->
-> This guide teaches TypeScript to people who can already program in another language. It assumes you are comfortable using a terminal and understand basic ideas like variables, functions, and loops. It does not teach programming from scratch - if you are completely new to programming, learn the basics of JavaScript first, then come back here.
+## Variables: let, const, and Type Annotations
 
-## Installing the Toolchain
+TypeScript has three ways to declare variables: `const`, `let`, and `var`. Forget `var` exists - it has scoping bugs from JavaScript's early days. Use `const` by default, `let` only when you need reassignment.
 
-TypeScript runs on Node.js. You need two things: the Node.js runtime (which includes `npm`, the package manager) and the TypeScript compiler (`tsc`). We'll also install `tsx`, a tool that compiles and runs TypeScript files in one step - no separate build needed during development.
+```typescript
+// const - cannot be reassigned (like Rust's let)
+const port: number = 8080;
+// port = 3000; // ERROR: Cannot assign to 'port' because it is a constant
 
-Install Node.js from [nodejs.org](https://nodejs.org) (LTS version). Verify it's installed:
+// let - can be reassigned (like Rust's let mut)
+let connectionCount: number = 0;
+connectionCount += 1; // fine
 
-```bash
-node --version    # v22.x or later
-npm --version     # 10.x or later
+// Type annotations are optional when the type can be inferred
+const host = "127.0.0.1";      // inferred as string
+let isRunning = true;           // inferred as boolean
+const maxClients = 100;         // inferred as number
 ```
-
-Now create a project directory and initialize it:
-
-```bash
-mkdir chat-server
-cd chat-server
-npm init -y
-```
-
-`npm init -y` creates a `package.json` with defaults. This is your project manifest - it tracks dependencies, scripts, and metadata. Every npm command reads it.
-
-Install TypeScript and tsx as dev dependencies:
-
-```bash
-npm install --save-dev typescript tsx @types/node
-```
-
-Three packages:
-
-- `typescript` - the compiler (`tsc`). Checks types and compiles `.ts` files to `.js`.
-- `tsx` - runs TypeScript directly. No compile step needed during development: one command takes you from source to running program.
-- `@types/node` - type definitions for Node.js APIs (filesystem, networking, etc.). Without these, TypeScript doesn't know about `process`, `Buffer`, or any Node.js built-ins.
-
-> **Warning**
->
-> Installing `@types/node` is necessary but not sufficient. Current TypeScript does not pick the package up automatically - you must also list it in `tsconfig.json` under `"types": ["node"]`, which we do below. Skip that and `process` fails to compile with `TS2591: Cannot find name 'process'` even though the types are sitting in `node_modules`.
 
 > **Tip**
 >
-> `--save-dev` (or `-D`) installs packages as development dependencies. They're needed for building but not for running in production. The compiled JavaScript doesn't need the TypeScript compiler.
+> Prefer `const` everywhere. Only use `let` when you actually need to reassign the variable. This makes your code easier to reason about - if you see `const`, you know the value never changes.
 
-## Understanding tsconfig.json
+## Primitive Types
 
-Create a `tsconfig.json` - the TypeScript compiler configuration. This file controls how TypeScript checks and compiles your code:
-
-```bash
-npx tsc --init
-```
-
-This generates a `tsconfig.json` with many commented-out options. Here's what matters for our project:
-
-`tsconfig.json`
-
-```json
-{
-  "compilerOptions": {
-    "target": "ES2022",
-    "module": "Node16",
-    "moduleResolution": "Node16",
-    "strict": true,
-    "types": ["node"],
-    "esModuleInterop": true,
-    "skipLibCheck": true,
-    "forceConsistentCasingInFileNames": true,
-    "outDir": "dist",
-    "rootDir": "src",
-    "declaration": true
-  },
-  "include": ["src/**/*"]
-}
-```
-
-Key settings:
-
-- `target: "ES2022"` - compile to modern JavaScript. Determines which JS features are available in the output.
-- `module: "Node16"` - use Node.js's module system. Supports both CommonJS (`require`) and ES modules (`import`).
-- `strict: true` - enables all strict type checking. This is the most important setting. It catches bugs that loose mode ignores: implicit `any`, null safety, and more. Always keep this on.
-- `types: ["node"]` - loads the Node.js global declarations from `@types/node`. Without this, `process`, `Buffer`, and `setTimeout` are unknown to the compiler even though the package is installed, and any use of them fails with `TS2591: Cannot find name 'process'`. You don't need it for the first program, but every chapter from Chapter 5 onward touches Node's built-ins.
-- `outDir: "dist"` - compiled JavaScript goes here. Source TypeScript stays in `src/`.
-- `rootDir: "src"` - tells the compiler where to find source files. The directory structure under `src/` is mirrored in `dist/`.
-
-> **Warning**
->
-> Never turn off `strict`. It's the reason TypeScript exists. Without strict mode, TypeScript is just JavaScript with optional annotations - you lose most of the safety guarantees. Every example in this guide assumes strict mode is on.
-
-## Your First Program
-
-Create a `src` directory and your first TypeScript file:
-
-```bash
-mkdir src
-```
-
-`src/index.ts`
+TypeScript has six primitive types. Unlike Rust (which has `i8`, `u16`, `f64`, etc.), TypeScript keeps it simple:
 
 ```typescript
-const name: string = "TypeScript";
+// string - text
+const username: string = "alice";
+const greeting: string = `Hello, ${username}!`;  // template literal
+
+// number - all numbers (integer and float, always 64-bit)
 const port: number = 8080;
+const pi: number = 3.14159;
+const negative: number = -42;
 
-console.log(`Starting chat server...`);
-console.log(`Server: ${name} on port ${port}`);
+// boolean - true or false
+const isConnected: boolean = true;
+const isAdmin: boolean = false;
+
+// null - explicitly empty ("I know this is nothing")
+const noValue: null = null;
+
+// undefined - not yet assigned ("this hasn't been set")
+let uninitialized: undefined = undefined;
+
+// symbol - unique identifier (rarely used directly)
+const id: symbol = Symbol("connection-id");
+
+// bigint - integers beyond number's safe range (note the n suffix)
+const huge: bigint = 9007199254740993n;
 ```
-
-A few things to notice:
-
-- `const name: string` - a type annotation. The `: string` after the variable name declares its type. TypeScript checks that only strings are assigned to it.
-- `const port: number` - numbers in TypeScript are always 64-bit floats, exactly as in JavaScript. There is one numeric type: no separate integer and float types, and no fixed widths to choose between.
-- ``Template ${literals}`` - backtick strings with `${expr}` interpolation. Any expression inside `${}` is evaluated and spliced into the string.
-- `console.log` - prints a line to stdout.
-
-## Compiling and Running
-
-There are two ways to run TypeScript: compile first then run the JavaScript, or use `tsx` to do both at once.
-
-### Option 1: tsx (development)
-
-```bash
-npx tsx src/index.ts
-```
-
-`tsx` compiles and runs in one step. No `dist/` directory created. This is what you use during development - fast feedback, no build step.
-
-### Option 2: tsc + node (production)
-
-```bash
-npx tsc
-node dist/index.js
-```
-
-`tsc` compiles all `.ts` files in `src/` to `.js` files in `dist/`. Then `node` runs the JavaScript. This is what you use for production - the compiled JS doesn't need TypeScript at runtime.
 
 > **Note**
 >
-> TypeScript is erased at runtime. Type annotations, interfaces, and generics exist only during compilation - the output JavaScript has no trace of them. This means TypeScript has zero runtime overhead. The types are a development-time safety net, not a runtime cost.
+> `null` vs `undefined`: use `null` when you explicitly want "no value." Use `undefined` for "not yet set." In practice, most TypeScript code uses `undefined` (it's what you get when a property is missing). With `strict: true`, the compiler forces you to handle both.
 
-## A Tour of Commands
+## Arrays and Tuples
 
-Add these scripts to `package.json`:
+Arrays hold multiple values of the same type. Tuples hold a fixed number of values with specific types at each position.
 
-`package.json (scripts section)`
+```typescript
+// Arrays - all elements must be the same type
+const rooms: string[] = ["general", "random", "dev"];
+const codes: number[] = [200, 404, 500];
+const flags: Array<boolean> = [true, false, true]; // alternate syntax
 
-```json
-{
-  "scripts": {
-    "dev": "tsx watch src/index.ts",
-    "build": "tsc",
-    "start": "node dist/index.js",
-    "typecheck": "tsc --noEmit"
+// Array methods
+rooms.push("help");           // add to end
+const first = rooms[0];       // access by index: "general"
+const count = rooms.length;   // 4
+rooms.includes("dev");        // true
+
+// Tuples - fixed length, typed at each position
+const entry: [string, number] = ["alice", 8080];
+const name = entry[0];  // string
+const port = entry[1];  // number
+// entry[2];            // ERROR: Tuple type has no element at index '2'
+
+// Tuples are useful for functions that return multiple values
+function parseAddress(addr: string): [string, number] {
+  const parts = addr.split(":");
+  return [parts[0], parseInt(parts[1], 10)];
+}
+
+const [host, portNum] = parseAddress("127.0.0.1:8080");
+// Destructuring: host = "127.0.0.1", portNum = 8080
+```
+
+> **Tip**
+>
+> Destructuring (`const [host, port] =...`) unpacks arrays and tuples into individual variables. It's used everywhere in TypeScript - function returns, imports, event handlers.
+
+## Functions, Parameter Types, and Return Types
+
+Functions in TypeScript require parameter type annotations. Return types can be inferred but are good practice to annotate explicitly.
+
+```typescript
+// Named function with explicit types
+function formatMessage(sender: string, text: string): string {
+  return `[${sender}]: ${text}`;
+}
+
+// Arrow function - the preferred syntax for short functions
+const add = (a: number, b: number): number => a + b;
+
+// Arrow function with block body
+const greet = (name: string): string => {
+  const greeting = `Welcome to the chat, ${name}!`;
+  return greeting;
+};
+
+// Optional parameters - marked with ?
+function connect(host: string, port: number, timeout?: number): void {
+  const t = timeout ?? 5000;  // ?? is "nullish coalescing" - use right if left is null/undefined
+  console.log(`Connecting to ${host}:${port} (timeout: ${t}ms)`);
+}
+
+connect("localhost", 8080);        // timeout is undefined, defaults to 5000
+connect("localhost", 8080, 3000);  // timeout is 3000
+
+// Default parameters
+function createRoom(name: string, maxUsers: number = 50): void {
+  console.log(`Room "${name}" created (max: ${maxUsers})`);
+}
+
+createRoom("general");       // maxUsers = 50
+createRoom("vip", 10);       // maxUsers = 10
+
+// void - function returns nothing (like Rust's () unit type)
+function logMessage(msg: string): void {
+  console.log(msg);
+}
+```
+
+### Arrow Functions vs Named Functions
+
+Arrow functions (`const fn = () =>...`) and named functions (`function fn()...`) are almost identical. The main difference: arrow functions capture `this` from their enclosing scope (important for callbacks and event handlers, which we'll use heavily in the chat server). Prefer arrow functions for short expressions and callbacks.
+
+## Control Flow
+
+### if / else
+
+```typescript
+const status = 404;
+
+if (status === 200) {
+  console.log("OK");
+} else if (status === 404) {
+  console.log("Not Found");
+} else {
+  console.log(`Status: ${status}`);
+}
+
+// Ternary - inline if/else for expressions
+const statusText = status === 200 ? "OK" : "Error";
+```
+
+> **Warning**
+>
+> Always use `===` (strict equality), never `==` (loose equality). `==` does type coercion: `0 == ""` is `true`, `0 === ""` is `false`. The strict version compares both value and type.
+
+### for loops
+
+```typescript
+const rooms = ["general", "random", "dev"];
+
+// for...of - iterate over values (preferred)
+for (const room of rooms) {
+  console.log(`Room: ${room}`);
+}
+
+// for...of with index using entries()
+for (const [index, room] of rooms.entries()) {
+  console.log(`[${index}] ${room}`);
+}
+
+// Classic for loop (when you need the index directly)
+for (let i = 0; i < rooms.length; i++) {
+  console.log(`Room ${i}: ${rooms[i]}`);
+}
+
+// while
+let attempts = 0;
+while (attempts < 3) {
+  console.log(`Attempt ${attempts + 1}`);
+  attempts++;
+}
+```
+
+### switch
+
+`switch` is TypeScript's closest thing to Rust's `match`. It compares a value against multiple cases:
+
+```typescript
+function handleCommand(command: string): string {
+  switch (command) {
+    case "/join":
+      return "Joining room...";
+    case "/leave":
+      return "Leaving room...";
+    case "/help":
+      return "Available commands: /join, /leave, /msg, /help";
+    case "/msg":
+      return "Sending message...";
+    default:
+      return `Unknown command: ${command}`;
   }
 }
 ```
 
-### npm run dev
-
-Runs with `tsx watch` - compiles, runs, and **watches for changes**. Every time you save a file, it restarts automatically. Your main development loop.
-
-### npm run build
-
-Compiles TypeScript to JavaScript in `dist/`. Type checks everything. Fails if there are type errors.
-
-### npm start
-
-Runs the compiled JavaScript. For production - no TypeScript tooling needed at runtime.
-
-### npm run typecheck
-
-Type-checks without producing output (`--noEmit`). The fast way to verify your code has no type errors - ideal in CI or a pre-commit hook.
-
-## Project Structure
-
-Here's what your project looks like now:
-
-```
-chat-server/
-├── package.json        ← project manifest: dependencies and scripts
-├── package-lock.json   ← exact dependency versions, commit this
-├── tsconfig.json       ← TypeScript compiler config
-├── node_modules/       ← installed dependencies (auto-managed by npm)
-├── src/
-│   └── index.ts        ← your TypeScript source code
-└── dist/               ← compiled JavaScript (created by tsc)
-```
-
-> **Tip**
+> **Note**
 >
-> Add `node_modules/` and `dist/` to your `.gitignore`. `node_modules` is recreated by `npm install`. `dist` is recreated by `npm run build`. Neither belongs in version control.
+> Unlike Rust's `match`, TypeScript's `switch` doesn't enforce exhaustiveness by default. You can miss cases without a compiler error. In Chapter 9, we'll learn discriminated unions which DO enforce exhaustive handling - TypeScript's answer to Rust's `match`.
+
+## Putting It Together
+
+Let's update our chat server's entry point to use everything from this chapter:
+
+`src/index.ts`
+
+```typescript
+// Chat server - startup.
+//
+// Nothing here listens on a socket yet; that arrives in Chapter 5. For now the
+// server parses its configuration, reports what it would do, and prints the
+// command set it intends to support.
+
+const DEFAULT_HOST = "127.0.0.1";
+const DEFAULT_PORT = 8080;
+
+// Parse a port from a string, falling back when it is missing or out of range.
+function parsePort(input: string, fallback: number = DEFAULT_PORT): number {
+  const parsed = parseInt(input, 10);
+  if (isNaN(parsed) || parsed <= 0 || parsed > 65535) {
+    return fallback;
+  }
+  return parsed;
+}
+
+// The reason phrase for an HTTP status code. The chat server speaks HTTP before
+// it upgrades to a WebSocket (Chapter 7), so it needs these.
+function statusLine(code: number): string {
+  switch (code) {
+    case 200: return "OK";
+    case 201: return "Created";
+    case 204: return "No Content";
+    case 301: return "Moved Permanently";
+    case 400: return "Bad Request";
+    case 401: return "Unauthorized";
+    case 403: return "Forbidden";
+    case 404: return "Not Found";
+    case 500: return "Internal Server Error";
+    default:  return "Unknown";
+  }
+}
+
+// The port is optional: `??` supplies the default when it is null or undefined.
+function address(host: string, port?: number): string {
+  return `${host}:${port ?? DEFAULT_PORT}`;
+}
+
+// A connected user: name, port, isAdmin.
+type User = [string, number, boolean];
+
+// The commands the server will accept, as [command, description] pairs.
+const commands: [string, string][] = [
+  ["/join", "Join a chat room"],
+  ["/leave", "Leave the current room"],
+  ["/msg", "Send a direct message"],
+  ["/help", "Show available commands"],
+];
+
+const port = parsePort("3000");
+const host = DEFAULT_HOST;
+
+console.log(`Starting chat server on ${address(host, port)}`);
+
+const users: User[] = [
+  ["alice", 49152, true],
+  ["bob", 49153, false],
+];
+
+console.log(`\n${users.length} user(s) seeded:`);
+for (const [userName, userPort, isAdmin] of users) {
+  const role = isAdmin ? "admin" : "member";
+  console.log(`  ${userName.padEnd(8)} ${address(host, userPort)}  (${role})`);
+}
+
+console.log("\nSupported commands:");
+for (const [index, [cmd, description]] of commands.entries()) {
+  console.log(`  [${index}] ${cmd.padEnd(8)} - ${description}`);
+}
+
+const codes: number[] = [200, 201, 204, 301, 400, 401, 403, 404, 500];
+console.log("\nStatus codes understood:");
+for (const code of codes) {
+  console.log(`  ${code} → ${statusLine(code)}`);
+}
+```
 
 ## Exercise
 
-1. Run `npx tsx src/index.ts` and verify you see the output.
-2. Run `npx tsc` and find the compiled JavaScript in `dist/index.js`. Open it - notice the type annotations are gone. Run it with `node dist/index.js`.
-3. Try assigning a number to the `name` variable. Read the compiler error - TypeScript tells you exactly what's wrong.
-4. Run `npm run typecheck` to verify your code without compiling. Try introducing a type error and see it caught.
-5. Set up `npm run dev` with `tsx watch`. Edit your file and watch it restart automatically.
+1. Add a `reasonPhrase` function that takes a `number` and returns a `string` for HTTP status codes. Use a `switch` statement. Add codes 201, 204, 301, 403.
+2. Create a tuple type `[string, number, boolean]` representing a user: name, port, isAdmin. Destructure it into individual variables.
+3. Write a function with an optional parameter: `connect(host: string, port?: number)`. Default the port to 8080 using `??`.
+4. Use `for...of` with `.entries()` to print each command with its index: `[0] /join`, `[1] /leave`, etc.
+5. Try using `==` instead of `===` somewhere. Does TypeScript warn you? (Hint: enable the ESLint rule `eqeqeq` to catch this.)
 
 ## What's Next
 
-You have a working TypeScript project with a compiler, a runner, and a type checker. The toolchain is in place and you know how to build, run, and check code.
+You now know how to declare variables, choose types, write functions, and control program flow. These are the basic building blocks for everything that follows.
 
-In the next chapter, we'll cover the language fundamentals - variables, types, functions, and control flow - the building blocks you'll need before we start writing any networking code.
+In the next chapter, we dive into TypeScript's **type system** - union types, narrowing, type guards, and the tools that make TypeScript more than just "JavaScript with annotations."
 
 ---
 
-Source: <https://purphoros.com/howto/typescript/hello-typescript>
+Source: <https://purphoros.com/howto/typescript/fundamentals>
