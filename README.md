@@ -1,245 +1,248 @@
-# Chapter 19 - Testing
+# Chapter 20 - Logging, Config & CLI
 
-Every chapter of this tutorial has ended the same way: run the server, open `nc`, type JSON at it, read what came back. That works. It does not scale, it is not repeatable, and it only ever tests what I remembered to type.
+Nineteen chapters of `console.log`, and it was fine, because I was the only one reading it and I was reading it in a terminal. That stops being true the moment the server runs somewhere you cannot see.
 
-Chapter 11 made a promise about this, and it is time to collect.
-
-```bash
-npm install --save-dev vitest
-npm test
-```
-
-```
- Test Files  6 passed (6)
-      Tests  56 passed (56)
-```
-
-## The test double that fakes only the wire
-
-`MessageHandler` accepts a `ChatClient` - an **interface**. It has no `node:net`, no `ws`, no Buffer. That was Chapter 11's whole argument, and this is what it was for:
+And nineteen chapters of this, which is worse:
 
 ```typescript
-export class FakeClient extends BaseClient {
-  readonly outbox: ServerMessage[] = [];
+const config = fromEnvironment(process.env, process.argv);
+// ...argv[2] !== undefined ? { port: resolvePort(argv[2]) } : {}
+```
 
-  send(message: ServerMessage): void { this.outbox.push(message); }
-  end(message: ServerMessage): void  { this.outbox.push(message); this.markClosing(); }
-  get backlog(): number { return 0; }        // never behind: there is no wire
-  protected destroy(): void { this.markClosed(); }
+One positional argument, undocumented, discoverable only by reading the source. `npm start --port 9000` did **nothing at all** - silently, because `argv[2]` was the string `"--port"`, which is not a number, so it fell back to the default and said nothing about it. **A flag that is ignored without complaint is worse than a flag that does not exist.**
+
+## A log line is a record, not a sentence
+
+```
+[general] alice: hello
+{"level":"info","time":"2026-07-13T15:52:30.015Z","msg":"→ alice joined general","client":"c1","user":"alice","room":"general"}
+```
+
+The first one you *read*. The second one you can filter by room, count by user, alert on, and find six months from now at 3am when the person searching does not know what they are looking for.
+
+So: **both**, and nobody has to choose.
+
+```typescript
+export function defaultFormat(): LogFormat {
+  return process.stdout.isTTY === true ? "pretty" : "json";
 }
 ```
 
-**Look at what it extends.** `FakeClient` is a subclass of the real `BaseClient`, so it inherits the real state machine, the real `label`, the real transitions - everything from Chapter 16 that decides whether you may enter a room. Only the two methods that put bytes on a wire are replaced.
+A TTY means a person is watching, so make it readable. Anything else - a pipe, a file, a container's stdout - means a machine, so make it parseable. The one thing you must never do is make somebody *remember* to pass `--log-format json` in production, because one day they will not.
 
-That distinction is the difference between a useful test double and a useless one. **Reimplement the logic in your fake and you are testing your fake.** Fake only the *edge*, and everything above it is the code that actually ships.
+`msg` is for the person. Everything after it is for the machine.
+
+## Levels are a decision about privacy, not just volume
 
 ```typescript
-it("delivers a message from one client to another", async () => {
-  const alice = arrive(handler, 1);
-  const bob = arrive(handler, 2);
-  await loggedIn(handler, alice, "alice", "correct-horse");
-  await loggedIn(handler, bob, "bob", "hunter2");
-  await say(handler, alice, { type: "join", room: "general" });
-  await say(handler, bob, { type: "join", room: "general" });
-  bob.clear();
-
-  await say(handler, alice, { type: "chat", text: "hello everyone" });
-
-  expect(bob.last("chat")?.sender).toBe("alice");
-});
+bus.on("message", (message) =>
+  logger.debug(formatEvent(...), { user: message.sender, room: message.room, bytes: message.text.length }));
 ```
 
-Real login. Real scrypt. Real JWT. Real rooms, real broadcast, real middleware chain. **No port.** The whole file runs in 600ms.
+A chat message is logged at **debug**, and that is deliberate. It is the highest-volume event on the server *and* it is the one thing a chat server exists to keep private. At `--log-level info` - the default - the operator sees who joined what, and **nothing they said**:
+
+```
+  occurrences of a message body in the log: 0
+```
+
+Note `bytes` rather than `text`. You can still answer "is someone flooding us" without keeping a transcript of everyone's conversation on a disk in Virginia.
+
+And the level check happens **before any formatting**:
+
+```typescript
+private emit(level: LogLevel, msg: string, fields?: Fields): void {
+  if (!this.enabled(level)) {
+    return;                    // no JSON.stringify, no concatenation, no cost
+  }
+```
+
+That is what makes it reasonable to leave debug logging in the code *permanently*, instead of deleting it and rewriting it from scratch every time something breaks.
+
+## Redaction belongs at the sink
+
+Here is the most natural debugging line in the world, typed at 2am by someone chasing a login bug:
+
+```typescript
+log.debug("client said", { message });
+```
+
+`message` is a `{"type":"login","name":"alice","password":"correct-horse"}`. That line writes **every password on the server** into a file which is, by design, kept forever and shipped somewhere central. Every large credential leak you have read about had a step that looked exactly like that.
+
+```typescript
+const SECRET_KEYS = new Set(["password", "token", "secret", "authorization", "jwtsecret", "passwordhash"]);
+```
+
+The redaction is in the **sink**, not at the call site - not somewhere a person has to remember it, but at the one place nothing gets past:
+
+```json
+{"level":"debug","msg":"client said","message":{"type":"login","name":"alice","password":"[redacted]"}}
+{"level":"info","msg":"issued","token":"[redacted]","user":"alice"}
+{"level":"info","msg":"config","jwtSecret":"[redacted]","port":8080}
+```
+
+The name survives. The password does not. **Nobody had to remember anything.**
+
+## I measured the thing I was about to be confident about
+
+`process.stdout.write` is **synchronous** when stdout is a file or a TTY. Node documents it, and it is easy to read past. So `npm start > server.log` turns every log line into a blocking write, on the one thread that is also serving every client.
+
+I was about to write a paragraph about how alarming that is. Then I measured it:
+
+```
+  stdout redirected to a FILE (synchronous writes):
+     10,000 lines     12ms blocked    1.17µs/line
+    100,000 lines     53ms blocked    0.53µs/line
+    500,000 lines    267ms blocked    0.53µs/line
+```
+
+**Half a microsecond a line.** A chat server logs roughly one line per message, so at a thousand messages a second that is about 0.5ms of blocking per second: real, measurable, and not worth a moment's thought. At a hundred thousand lines a second it is 53ms per second - five percent of the thread, gone - and *then* it matters.
+
+So it is a trade with a threshold, not a bug:
+
+- **Synchronous** means the last line before a crash is *on the disk*. That is precisely the line you will want.
+- **Asynchronous** (what pino does, via `sonic-boom`) is much faster and can lose exactly that line.
+
+Sync is right here. `--log-level warn` is the escape hatch. If you are logging per-request at scale, reach for pino and mean it.
+
+The point is not the answer. **I did not know until I measured, and neither did you.**
+
+## A command line, taken seriously
+
+`node:util` has shipped `parseArgs` since Node 18. No dependency, no yargs, no commander.
+
+```typescript
+({ values } = parseArgs({
+  args: [...argv],
+  options: {
+    port: { type: "string", short: "p" },
+    "log-level": { type: "string" },
+    help: { type: "boolean", short: "h" },
+    version: { type: "boolean", short: "v" },
+    // ...
+  },
+  strict: true,            // unknown flags are an error, not a shrug
+  allowPositionals: false,
+}));
+```
+
+The result is a discriminated union, because a parse has **three** outcomes and the caller must not be able to forget one:
+
+```typescript
+export type CliResult =
+  | { kind: "run"; options: CliOptions }
+  | { kind: "exit"; message: string; code: number };
+```
 
 > **Tip**
 >
-> The first draft of that test failed, and it was right to. I built `FakeClient` directly instead of calling `handler.welcome(client)` - so the client was never in the registry, received no broadcasts, and could not be whispered to. Which is *exactly* what would happen to a real socket the server had not been introduced to. The fake was faithful enough to reproduce a bug in my test setup, which is a good sign about the fake.
-
-## The tests worth having are regressions for bugs you shipped
-
-Anyone can write `expect(2 + 2).toBe(4)`. The tests that earn their keep are the ones that would have caught the bugs this tutorial **actually shipped and had to fix**.
-
-**Chapter 16 - the membership leak.** Rooms keyed membership on `client.label`, which is a nickname, which changes:
-
-```typescript
-it("does not leak room membership when a client renames", async () => {
-  const client = arrive(handler, 1);
-
-  await loggedIn(handler, client, "bob", "hunter2");
-  await say(handler, client, { type: "join", room: "general" });
-  expect(registry.rooms.get("general")?.memberCount).toBe(1);
-
-  await loggedIn(handler, client, "alice", "correct-horse");   // rename, in place
-  expect(registry.rooms.get("general")?.memberCount).toBe(1);  // not 2
-
-  await say(handler, client, { type: "leave" });
-  expect(registry.rooms.get("general")?.memberCount).toBe(0);  // not 1
-});
-```
-
-**Chapter 12 - the restamped archive.** `load()` rebuilt history with `new ChatMessage(...)`, whose constructor stamps `Date.now()`, so every restart relabelled the entire archive with the boot time:
-
-```typescript
-it("restores a message with its ORIGINAL timestamp", () => {
-  const then = 1_600_000_000_000;
-  const restored = ChatMessage.restore({ sender: "alice", text: "old", room: "general", at: then });
-  expect(restored.at).toBe(then);
-});
-```
-
-**Chapter 12 - ordering.** `await` took away what a `for` loop gave for free:
-
-```typescript
-it("runs tasks strictly in the order they were submitted", async () => {
-  const queue = new Serializer();
-  const order: number[] = [];
-  const results = [30, 5, 20, 1].map((ms, i) =>
-    queue.run(async () => { await delay(ms); order.push(i); }),
-  );
-  await Promise.all(results);
-  expect(order).toEqual([0, 1, 2, 3]);   // NOT [3, 1, 2, 0]
-});
-```
-
-And a test for a fact that surprises people:
-
-```typescript
-it("does NOT cancel the loser - a Promise cannot be un-started", async () => {
-  let finished = false;
-  const work = delay(60).then(() => { finished = true; return "done"; });
-  await expect(withTimeout(work, 10, "x")).rejects.toThrow(TimeoutError);
-  expect(finished).toBe(false);   // not yet
-  await delay(80);
-  expect(finished).toBe(true);    // it kept running. Nobody was listening.
-});
-```
-
-> **Note**
+> **`--help` exits 0.** It is not the program failing to run; it is the program doing exactly what was asked and having nothing left to do. Print it to *stdout*, not stderr. A CI script that runs `chat-server --version` should not fail, and `chat-server --help | less` should work.
 >
-> **Prove your regression tests can fail.** I reintroduced both bugs - put `client.label` back into `room.leave`, took `ChatMessage.restore` back out - and re-ran the suite:
->
-> ```
-> × MessageHandler > does not leak room membership when a client renames
-> × ChatRoom > restores a message with its ORIGINAL timestamp
-> ```
->
-> Then restored the fixes and got 56 green. A regression test you have never watched fail is a test you are trusting on faith. It takes ninety seconds to check, and the alternative is a suite full of assertions that were quietly rewritten into tautologies during a refactor.
+> Errors go to stderr with code 1. The distinction is not pedantry - it is the difference between a pipeline that works and one that mysteriously does not.
 
-## The security tests
-
-These are the ones that would actually stop a breach:
+And `--version` reads from `package.json`:
 
 ```typescript
-it("refuses the alg:none forgery", () => {
-  const forged =
-    b64({ alg: "none", typ: "JWT" }) + "." +
-    b64({ sub: "u1", name: "alice", admin: true, iat: 0, exp: 9999999999 }) + ".";
-  expect(verify(forged, SECRET).ok).toBe(false);
-});
-
-it("gives the same answer for a wrong password and an unknown user", async () => {
-  await say(handler, a, { type: "login", name: "alice",   password: "wrong" });
-  await say(handler, b, { type: "login", name: "mallory", password: "wrong" });
-  expect(a.last("error")?.message).toBe(b.last("error")?.message);
-});
-
-it("is not encrypted - anyone holding it can read every claim", () => {
-  const payload = JSON.parse(Buffer.from(token.split(".")[1]!, "base64url").toString());
-  expect(payload.name).toBe("alice");   // this is the point, not a bug
-});
+const version = (createRequire(import.meta.url)("../package.json") as { version: string }).version;
 ```
 
-That last one is a test asserting a **weakness**, on purpose. It is executable documentation: it will fail the day somebody "fixes" it by encrypting the payload, and the failure will make them read the comment explaining why it is not encrypted.
+A version string typed into a source file is wrong the moment somebody runs `npm version patch` - and **`--version` lying is worse than `--version` not existing**, because somebody will use it to decide whether a bug is fixed.
 
-## What tests cannot do
-
-Chapter 17 built a constant-time signature comparison. Now go and replace it:
-
-```typescript
-if (signature === expected) { ... }   // instead of timingSafeEqual
-```
-
-**Every test in this suite still passes.** All 56.
-
-You have reintroduced a timing side channel - a real, exploitable vulnerability - and the test suite is bright green, because a test asserts *what* a function returns and this bug is about *how long it took*. No assertion you are likely to write will ever catch it.
-
-This is not an argument against testing. It is an argument against believing a green suite means the code is correct. **A test suite tells you the things you thought to check are still true.** It does not tell you the code is safe. Some properties - timing, memory growth, what a stranger can make your server hold - are simply not in the shape a test has.
-
-## Interlude: the test runner does not compile your code the way your compiler does
-
-Adding the tests broke the tests, and the failure said this:
+## Precedence
 
 ```
-SyntaxError: Invalid or unexpected token
+  command line   →   environment   →   defaults
 ```
 
-No file. No line. No clue. It took bisecting the import graph to find that the offending token was `@timed` - the decorator added one chapter ago.
+Specific beats general; immediate beats standing. That is not a convention to memorise, it is the order of how **deliberate** each source is: you typed the flag thirty seconds ago, the environment was set by a deploy last March, and the default was chosen by me for a laptop.
 
-Vitest transforms TypeScript with **esbuild**, whose default target is `esnext`. `esnext` is assumed to support decorators *natively*, so esbuild helpfully left `@timed` exactly where it found it - and Node 22 does not support decorators natively. Meanwhile `tsc`, which does `npm run build`, had been compiling them away all along.
-
-```typescript
-// vitest.config.ts
-export default defineConfig({
-  esbuild: { target: "es2022" },   // a target WITHOUT decorators, so they get lowered
-  test: { include: ["src/**/*.test.ts"] },
-});
+```bash
+PORT=7777 chat-server --port 8099
+#   listening on port 8099 (env said 7777, CLI said 8099)
 ```
-
-The build and the tests now agree about what the language is. That is the actual lesson, and it is worth more than the fix: **your test runner has its own compiler, and it does not necessarily agree with yours.**
-
-(Worth knowing: newer Vite builds on rolldown/oxc rather than esbuild, and that pipeline does not lower standard decorators at all. This project pins the esbuild line for exactly that reason.)
 
 ## Putting It Together
 
-The test double is the whole point: it fakes only the wire. Everything above it is the code that ships. It is on the `chapter19` branch.
+`src/logger.ts` and `src/cli.ts` are on the `chapter20` branch. The line that matters most is the one that keeps secrets out of the log.
 
-`FakeClient` subclasses the real `BaseClient`, so it inherits the real state machine - only the two methods that touch a wire are replaced, and they push onto an array:
+Redaction at the sink, so `log.debug("msg", { message })` cannot leak a password no matter who wrote the call:
 
 ```typescript
-export class FakeClient extends BaseClient {
-  // Every message the server tried to send this client, in order. A socket, if
-  // you like, that only ever writes to an array.
-  readonly outbox: ServerMessage[] = [];
-
-  constructor(sequence = 1) {
-    super(clientId(`f${sequence}`), "tcp", ConnectionState.Connected);
-    this.markConnected();
+function redact(value: unknown, depth = 0): unknown {
+  if (depth > 4 || value === null || typeof value !== "object") {
+    return value;
   }
-
-  send(message: ServerMessage): void {
-    this.outbox.push(message);
+  if (Array.isArray(value)) {
+    return value.map((item) => redact(item, depth + 1));
   }
-
-  end(message: ServerMessage): void {
-    this.outbox.push(message);
-    this.markClosing();
+  const out: Fields = {};
+  for (const [key, item] of Object.entries(value as Fields)) {
+    out[key] = SECRET_KEYS.has(key.toLowerCase()) ? "[redacted]" : redact(item, depth + 1);
   }
-
-  // Never behind, because there is no wire to be behind on.
+  return out;
+}
 ```
 
 > **Tip**
 >
-> The complete, runnable file is `src/testing.ts` on the `chapter19` branch. You are not meant to paste it wholesale - build your own as you follow along, and use the reference to check yourself.
+> The full `cli.ts` uses `node:util`'s `parseArgs` - no dependency - with `strict: true`, so an unknown flag is an error rather than a shrug.
+## Try It
+
+```bash
+npm run build
+node dist/main.js --help
+```
+
+```
+chat-server - one port, three protocols.
+
+Usage:
+  chat-server [options]
+
+Options:
+  -p, --port <n>          Port to listen on            (default 8080)
+  ...
+```
+
+Now get it wrong on purpose, which is the part that used to be silent:
+
+```bash
+node dist/main.js --pORT 9000       # Unknown option '--pORT'          exit 1
+node dist/main.js --port banana     # --port: "banana" is not a port   exit 1
+node dist/main.js --log-level shouting
+```
+
+Human logs when a human is watching, machine logs when one is not:
+
+```bash
+npm start                           # pretty, coloured, a TTY
+npm start > server.log              # JSON, one object per line
+cat server.log | jq 'select(.room == "general")'
+```
+
+And the one that should make you nervous until you check it:
+
+```bash
+node dist/main.js --log-level debug > server.log
+# ...log in as alice...
+grep correct-horse server.log       # nothing. The sink caught it.
+```
 
 ## Exercise
 
-1. Replace `timingSafeEqual` with `===` in `jwt.ts`. All 56 tests pass. Now write a test that catches it. How many samples do you need, and would you trust the result on a laptop with a browser open?
-2. `handler.test.ts` writes real files to `data-test-handler/`. Make `FileHistory` an interface and write an `InMemoryHistory`. The tests get faster - what did you stop testing?
-3. Add a test for the Chapter 15 backpressure eviction. You will need a `FakeClient` whose `backlog` you can control. Notice that the *design* - `backlog` on the interface - is what makes it testable at all.
-4. Run `npx vitest --coverage`. Find the line with the lowest coverage that you would be most upset to have wrong. Test that one. Ignore the percentage.
-5. Delete `vitest.config.ts` and read the error. You now know something about your toolchain that most people find out at the worst possible moment.
+1. Add a `password` field to a log call somewhere. Grep the output for it. Now add a field called `userPassword` - does the redactor catch it? Should it? What is the cost of making `SECRET_KEYS` a substring match instead of an exact one?
+2. `--log-level debug` logs message bodies. That is a privacy decision made in one line of `bus.ts`. Find it, and decide whether *anyone* should be able to turn it on in production.
+3. Point `write` at an array and assert on the lines - that is what `logger.test.ts` does. Now do the same in `handler.test.ts`, and assert that logging in with a bad password produces a `warn` and no password.
+4. Measure the blocking yourself, on your machine, with your disk. Do you get 0.53µs? Now try it over NFS.
+5. Add `--config <path>` reading a JSON file, and slot it into the precedence chain. Where does it go - above the environment or below it? Defend your answer.
 
 ## What's Next
 
-The chat server has a test suite: 56 tests, no sockets, running in under a second - covering the decoder's error contract, the room lifecycle, async ordering, the typed router, both JWT forgeries, and regressions for every bug this tutorial shipped and fixed.
+The server can be operated: a real command line, a config whose precedence is written down, and logs that a machine can query and that do not contain anybody's password.
 
-More importantly, it has a test suite that has been **watched to fail**, and an honest account of the vulnerability class it cannot see.
+What it still has is `data/general.jsonl` - an append-only text file, read entirely into memory to answer a query, with no index, no transactions, and a `Map` of two hard-coded accounts. It has worked, and it has been honest about what it was.
 
-The server as it stands runs: one port, three protocols, a validated wire format, an error boundary that has never once let a stranger's typo take the process down, history that survives a restart, a bounded runtime, real passwords, and a door that is shut.
-
-Next: **structured logging, config and a real command line** - because the server is now good enough to run somewhere you cannot watch it, and `console.log` is not.
+Next: **database persistence.**
 
 ---
 
-Source: <https://purphoros.com/howto/typescript/testing>
+Written for this repository. Upstream: <https://purphoros.com/howto/typescript/logging-config>
