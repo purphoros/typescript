@@ -7,11 +7,11 @@ Variables, types, functions, arrays, tuples, and control flow - the core languag
 TypeScript has three ways to declare variables: `const`, `let`, and `var`. Forget `var` exists - it has scoping bugs from JavaScript's early days. Use `const` by default, `let` only when you need reassignment.
 
 ```typescript
-// const - cannot be reassigned (like Rust's let)
+// const - the binding cannot be reassigned
 const port: number = 8080;
 // port = 3000; // ERROR: Cannot assign to 'port' because it is a constant
 
-// let - can be reassigned (like Rust's let mut)
+// let - the binding can be reassigned
 let connectionCount: number = 0;
 connectionCount += 1; // fine
 
@@ -27,7 +27,7 @@ const maxClients = 100;         // inferred as number
 
 ## Primitive Types
 
-TypeScript has six primitive types. Unlike Rust (which has `i8`, `u16`, `f64`, etc.), TypeScript keeps it simple:
+TypeScript has seven primitive types. `number` is a single type - no widths, no signedness, nothing to choose between - with one exception: `bigint`, for integers too large for `number` to hold exactly.
 
 ```typescript
 // string - text
@@ -132,7 +132,7 @@ function createRoom(name: string, maxUsers: number = 50): void {
 createRoom("general");       // maxUsers = 50
 createRoom("vip", 10);       // maxUsers = 10
 
-// void - function returns nothing (like Rust's () unit type)
+// void - function returns nothing
 function logMessage(msg: string): void {
   console.log(msg);
 }
@@ -195,7 +195,7 @@ while (attempts < 3) {
 
 ### switch
 
-`switch` is TypeScript's closest thing to Rust's `match`. It compares a value against multiple cases:
+`switch` compares a value against a list of cases and runs the first that matches:
 
 ```typescript
 function handleCommand(command: string): string {
@@ -216,7 +216,7 @@ function handleCommand(command: string): string {
 
 > **Note**
 >
-> Unlike Rust's `match`, TypeScript's `switch` doesn't enforce exhaustiveness by default. You can miss cases without a compiler error. In Chapter 9, we'll learn discriminated unions which DO enforce exhaustive handling - TypeScript's answer to Rust's `match`.
+> A `switch` does not enforce exhaustiveness by default: forget a case and the compiler stays silent. In Chapter 9 we'll use discriminated unions, which do force every case to be handled - a missing one becomes a compile error.
 
 ## Putting It Together
 
