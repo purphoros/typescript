@@ -4,6 +4,10 @@
 
 A hands-on guide to learning TypeScript by incrementally building a WebSocket-based chat server. Each chapter introduces new language concepts through practical features - starting from a raw TCP connection and ending with a fully tested, real-time chat system with rooms, authentication, and message history.
 
+## Who this is for
+
+This guide teaches TypeScript to people who can already program in another language. It assumes you are comfortable using a terminal and understand basic ideas like variables, functions, and loops. It does not teach programming from scratch - if you are completely new to programming, learn the basics of JavaScript first, then come back here.
+
 ## Contents
 
 | # | Chapter | Topic |
@@ -35,8 +39,6 @@ A hands-on guide to learning TypeScript by incrementally building a WebSocket-ba
 | 25 | [Packaging & Deployment](https://github.com/purphoros/typescript/blob/chapter25/README.md) | Multi-stage Docker, non-root, CI, and what npm was about to publish |
 
 Each chapter lives on its own branch, built on the one before it - `chapter1` through `chapter25` - so you can check one out and run exactly the code that chapter describes. The chapter text is that branch's `README.md`.
-
-Chapters 20-25 have not been published upstream. They were written for this repository from the chapter titles; the code is real and verified, and each says so at the top.
 
 ---
 
